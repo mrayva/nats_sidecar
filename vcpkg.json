@@ -1,0 +1,21 @@
+{
+  "name": "nats-sidecar",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "asio",
+    "concurrentqueue",
+    "cxxopts",
+    "fmt",
+    "gtest",
+    "gtl",
+    "libzip",
+    "magic-enum",
+    "nlohmann-json",
+    "openssl",
+    "simdjson",
+    "spdlog",
+    "stringzilla",
+    "yaml-cpp",
+    "zstd"
+  ]
+}

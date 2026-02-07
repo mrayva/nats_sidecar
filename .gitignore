@@ -1,0 +1,7 @@
+build/
+cmake-build-*/
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+vcpkg_installed/

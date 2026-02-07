@@ -1,0 +1,41 @@
+# nats_sidecar configuration example
+
+nats_address: "127.0.0.1"
+nats_port: 4222
+
+# Input: core NATS subject carrying binary-encoded messages
+input_subject: "sensor.data"
+format: msgpack          # msgpack | cbor | flexbuffers | zera
+# input_queue_group: "sidecar-group"  # uncomment to load-balance across instances
+
+# Output: matched messages published to <output_prefix>.<BE-ID>
+output_prefix: "sensor.filtered"
+
+# Subscription management endpoints
+subscribe_subject: "sidecar.subscribe"
+unsubscribe_subject: "sidecar.unsubscribe"
+
+# Soft-state lease settings (NATS KV)
+lease_bucket: "sidecar-leases"
+lease_ttl_seconds: 3600           # 1 hour default
+lease_check_interval_seconds: 60  # how often to scan for expired leases
+
+# A-Tree attribute schema - defines the fields available for boolean expressions
+# Clients write expressions like: temperature > 30.0 AND location = "warehouse-A"
+attributes:
+  - name: temperature
+    type: float
+  - name: humidity
+    type: float
+  - name: location
+    type: string
+  - name: severity
+    type: integer
+  - name: active
+    type: boolean
+  - name: tags
+    type: string_list
+
+# Operational
+stats_interval_seconds: 10
+log_level: info
