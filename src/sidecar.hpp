@@ -4,6 +4,7 @@
 #include "event_bridge.hpp"
 #include "subscription_manager.hpp"
 #include "lease_manager.hpp"
+#include "worker_pool.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/io_context.hpp>
@@ -23,6 +24,9 @@ public:
     // Called once the NATS connection is established.
     // Sets up subscriptions (input + control) and starts the lease manager.
     asio::awaitable<void> start(nats_asio::iconnection_sptr conn);
+
+    // Stop the worker pool. Called during shutdown before ioc cleanup.
+    void stop_workers();
 
 private:
     // Callback: incoming data message on the input subject
@@ -54,12 +58,11 @@ private:
     subscription_manager m_sub_mgr;
     attribute_schema m_schema;
     std::unique_ptr<lease_manager> m_lease_mgr;
+    std::unique_ptr<worker_pool> m_worker_pool;
 
-    // Stats
+    // Only m_messages_received is tracked here (at enqueue time).
+    // All other stats come from worker_pool::get_stats().
     std::atomic<uint64_t> m_messages_received{0};
-    std::atomic<uint64_t> m_messages_matched{0};
-    std::atomic<uint64_t> m_messages_published{0};
-    std::atomic<uint64_t> m_match_failures{0};
 };
 
 } // namespace sidecar

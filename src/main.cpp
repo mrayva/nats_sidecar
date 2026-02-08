@@ -10,6 +10,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <iostream>
 #include <memory>
+#include <thread>
 
 int main(int argc, char* argv[]) {
     cxxopts::Options options("nats_sidecar",
@@ -52,14 +53,21 @@ int main(int argc, char* argv[]) {
     else if (cfg.log_level == "error") spdlog::set_level(spdlog::level::err);
     else                               spdlog::set_level(spdlog::level::info);
 
+    // Resolve effective worker thread count for logging
+    unsigned int effective_workers = cfg.worker_threads > 0
+        ? cfg.worker_threads
+        : std::thread::hardware_concurrency();
+    if (effective_workers == 0) effective_workers = 1;
+
     console->info("nats_sidecar starting");
     console->info("  server: {}:{}", cfg.nats_address, cfg.nats_port);
     console->info("  input:  {} (format={})", cfg.input_subject, static_cast<int>(cfg.format));
     console->info("  output: {}.<ID>", cfg.output_prefix);
     console->info("  attributes: {}", cfg.attributes.size());
+    console->info("  worker threads: {}", effective_workers);
     console->info("  lease bucket: {} (TTL={}s)", cfg.lease_bucket, cfg.lease_ttl_seconds);
 
-    // Single-threaded io_context
+    // Single-threaded io_context (NATS I/O + publish coroutines)
     asio::io_context ioc(1);
 
     // Graceful shutdown
@@ -123,6 +131,14 @@ int main(int argc, char* argv[]) {
     );
 
     // Run the event loop (single thread)
+    ioc.run();
+
+    // Shutdown ordering:
+    // 1. Stop worker threads (drain queue + join)
+    engine->stop_workers();
+
+    // 2. Flush any remaining co_spawn'd publish coroutines
+    ioc.restart();
     ioc.run();
 
     console->info("nats_sidecar stopped");

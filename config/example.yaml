@@ -39,3 +39,7 @@ attributes:
 # Operational
 stats_interval_seconds: 10
 log_level: info
+
+# Worker threads for parallel message processing
+# 0 = use std::thread::hardware_concurrency()
+# worker_threads: 4

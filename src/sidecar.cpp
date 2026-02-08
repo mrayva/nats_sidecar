@@ -9,7 +9,7 @@ namespace sidecar {
 sidecar_engine::sidecar_engine(asio::io_context& ioc, const config& cfg,
                                std::shared_ptr<spdlog::logger> log)
     : m_ioc(ioc), m_cfg(cfg), m_log(std::move(log)),
-      m_sub_mgr(cfg.attributes, m_log),
+      m_sub_mgr(cfg.attributes, cfg.output_prefix, m_log),
       m_schema(cfg.attributes)
 {}
 
@@ -80,11 +80,22 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
         m_log->warn("Lease manager failed to start - soft-state cleanup disabled");
     }
 
+    // Start the worker pool
+    m_worker_pool = std::make_unique<worker_pool>(
+        m_ioc, m_cfg, m_schema, m_sub_mgr, m_conn, m_log);
+    m_worker_pool->start();
+
     // Start stats reporting
     asio::co_spawn(m_ioc, stats_loop(), asio::detached);
 
     m_log->info("Sidecar engine started (format={}, {} attributes, output={}.<ID>)",
                static_cast<int>(m_cfg.format), m_cfg.attributes.size(), m_cfg.output_prefix);
+}
+
+void sidecar_engine::stop_workers() {
+    if (m_worker_pool) {
+        m_worker_pool->stop();
+    }
 }
 
 asio::awaitable<void> sidecar_engine::on_data_message(
@@ -97,31 +108,9 @@ asio::awaitable<void> sidecar_engine::on_data_message(
     // Skip empty payloads
     if (payload.empty()) co_return;
 
-    // Deserialize and match against all active boolean expressions
-    auto matches = deserialize_and_match(
-        m_sub_mgr.tree(), m_schema, m_cfg.format, payload, m_log);
-
-    if (!matches) {
-        m_match_failures++;
-        co_return;
-    }
-
-    if (matches->empty()) co_return;
-
-    m_messages_matched++;
-
-    // Fan-out: publish original binary payload to each matching subscription's topic
-    for (uint64_t sub_id : *matches) {
-        std::string out_subject = m_cfg.output_prefix + "." + std::to_string(sub_id);
-        auto s = co_await m_conn->publish(
-            out_subject, payload, std::nullopt);
-
-        if (s.failed()) {
-            m_log->warn("Failed to publish to '{}': {}", out_subject, s.error());
-        } else {
-            m_messages_published++;
-        }
-    }
+    // Copy payload and enqueue for worker processing
+    std::vector<char> payload_copy(payload.begin(), payload.end());
+    m_worker_pool->enqueue(std::move(payload_copy));
 }
 
 asio::awaitable<void> sidecar_engine::on_subscribe_request(
@@ -213,12 +202,16 @@ asio::awaitable<void> sidecar_engine::stats_loop() {
         timer.expires_after(std::chrono::seconds(m_cfg.stats_interval_seconds));
         co_await timer.async_wait(asio::use_awaitable);
 
-        m_log->info("stats: received={} matched={} published={} failures={} subscriptions={}",
+        auto ws = m_worker_pool ? m_worker_pool->get_stats() : worker_pool::stats{};
+
+        m_log->info("stats: received={} processed={} matched={} published={} failures={} subscriptions={} queue_depth={}",
                    m_messages_received.load(),
-                   m_messages_matched.load(),
-                   m_messages_published.load(),
-                   m_match_failures.load(),
-                   m_sub_mgr.active_count());
+                   ws.processed,
+                   ws.matched,
+                   ws.published,
+                   ws.match_failures,
+                   m_sub_mgr.active_count(),
+                   ws.queue_depth);
     }
 }
 

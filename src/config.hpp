@@ -61,6 +61,9 @@ struct config {
     // Operational
     int stats_interval_seconds = 10;
     std::string log_level = "info";
+
+    // Worker threads for parallel message processing (0 = hardware_concurrency)
+    unsigned int worker_threads = 0;
 };
 
 // Parse config from YAML file. Throws on error.

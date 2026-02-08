@@ -1,9 +1,12 @@
 #pragma once
 
 #include "config.hpp"
+#include "tree_snapshot.hpp"
 #include <atree.hpp>
 #include <spdlog/spdlog.h>
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -21,11 +24,12 @@ struct subscription_info {
 };
 
 // Manages boolean expression subscriptions in the A-Tree.
-// Thread-safe: all public methods are internally synchronized (for future
-// multi-threaded use), but designed for single-threaded asio usage today.
+// Uses RCU-style snapshot swapping: readers get a lock-free shared_ptr<const tree_snapshot>,
+// writers serialize via mutex and atomically publish new snapshots.
 class subscription_manager {
 public:
     subscription_manager(const std::vector<attribute_def>& attributes,
+                         const std::string& output_prefix,
                          std::shared_ptr<spdlog::logger> log);
 
     // Subscribe with a boolean expression. Returns the subscription ID
@@ -45,22 +49,32 @@ public:
     // Look up subscription ID by expression string
     std::optional<uint64_t> find_by_expression(const std::string& expression) const;
 
-    // Get the A-Tree (for searching). Caller must not modify.
-    const atree::Tree& tree() const { return m_tree; }
+    // Get an immutable snapshot for lock-free concurrent reads.
+    std::shared_ptr<const tree_snapshot> snapshot() const;
 
     // Stats
     std::size_t active_count() const;
 
 private:
-    atree::Tree m_tree;
+    // Rebuild tree from all current expressions and publish a new snapshot.
+    void publish_snapshot();
+
     std::shared_ptr<spdlog::logger> m_log;
 
+    // Serializes all write operations (subscribe/remove).
+    // Near-zero contention: all writers run on the ASIO thread.
+    std::mutex m_write_mutex;
+
+    // Needed to rebuild tree from scratch on expression changes.
+    std::vector<attribute_def> m_attributes;
+    std::string m_output_prefix;
+
+    // Current snapshot — atomic load/store for lock-free reader access.
+    std::shared_ptr<const tree_snapshot> m_snapshot;
+
+    // Writer-only state (protected by m_write_mutex)
     uint64_t m_next_id = 1;
-
-    // expression string -> subscription_id
     std::unordered_map<std::string, uint64_t> m_expr_to_id;
-
-    // subscription_id -> subscription_info
     std::unordered_map<uint64_t, subscription_info> m_subscriptions;
 };
 

@@ -86,6 +86,7 @@ config load_config(const std::string& path) {
     // Operational
     if (auto n = root["stats_interval_seconds"]) cfg.stats_interval_seconds = n.as<int>();
     if (auto n = root["log_level"])              cfg.log_level = n.as<std::string>();
+    if (auto n = root["worker_threads"])         cfg.worker_threads = n.as<unsigned int>();
 
     return cfg;
 }

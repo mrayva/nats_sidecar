@@ -27,6 +27,7 @@ find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(libzip CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
+find_package(Threads REQUIRED)
 
 # --- FetchContent: nats_asio (header-only, brings zerialize) ---
 include(FetchContent)
@@ -51,6 +52,7 @@ add_library(sidecar_lib STATIC
     src/event_bridge.cpp
     src/subscription_manager.cpp
     src/lease_manager.cpp
+    src/worker_pool.cpp
     src/sidecar.cpp
 )
 
@@ -68,6 +70,7 @@ target_link_libraries(sidecar_lib
         fmt::fmt
         asio::asio
         cxxopts::cxxopts
+        Threads::Threads
 )
 
 target_compile_definitions(sidecar_lib PUBLIC FLATBUFFERS_LOCALE_INDEPENDENT=0)
