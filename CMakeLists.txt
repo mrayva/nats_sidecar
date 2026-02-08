@@ -50,6 +50,7 @@ include(cmake/BuildAtree.cmake)
 add_library(sidecar_lib STATIC
     src/config.cpp
     src/event_bridge.cpp
+    src/schema_generator.cpp
     src/subscription_manager.cpp
     src/lease_manager.cpp
     src/worker_pool.cpp
