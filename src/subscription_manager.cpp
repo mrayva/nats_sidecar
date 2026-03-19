@@ -128,12 +128,14 @@ bool subscription_manager::remove_subscription(uint64_t subscription_id) {
 }
 
 std::optional<subscription_info> subscription_manager::get_subscription(uint64_t id) const {
+    std::lock_guard<std::mutex> lock(m_write_mutex);
     auto it = m_subscriptions.find(id);
     if (it != m_subscriptions.end()) return it->second;
     return std::nullopt;
 }
 
 std::optional<uint64_t> subscription_manager::find_by_expression(const std::string& expression) const {
+    std::lock_guard<std::mutex> lock(m_write_mutex);
     auto it = m_expr_to_id.find(expression);
     if (it != m_expr_to_id.end()) return it->second;
     return std::nullopt;

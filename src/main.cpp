@@ -172,7 +172,16 @@ int main(int argc, char* argv[]) {
     });
 
     // Build the sidecar engine
-    auto engine = std::make_shared<sidecar::sidecar_engine>(ioc, cfg, console);
+    std::shared_ptr<sidecar::sidecar_engine> engine;
+    try {
+        engine = std::make_shared<sidecar::sidecar_engine>(ioc, cfg, console);
+    } catch (const atree::Error& e) {
+        console->error("Failed to initialize sidecar engine: {}", e.what());
+        return 1;
+    } catch (const std::exception& e) {
+        console->error("Failed to initialize sidecar engine: {}", e.what());
+        return 1;
+    }
 
     // Build NATS connect config
     nats_asio::connect_config nats_cfg;

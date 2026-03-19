@@ -63,7 +63,7 @@ private:
 
     // Serializes all write operations (subscribe/remove).
     // Near-zero contention: all writers run on the ASIO thread.
-    std::mutex m_write_mutex;
+    mutable std::mutex m_write_mutex;
 
     // Needed to rebuild tree from scratch on expression changes.
     std::vector<attribute_def> m_attributes;
