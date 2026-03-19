@@ -16,6 +16,8 @@
 
 namespace sidecar {
 
+struct sidecar_engine_test_access;
+
 class sidecar_engine {
 public:
     sidecar_engine(asio::io_context& ioc, const config& cfg,
@@ -29,6 +31,8 @@ public:
     void stop_workers();
 
 private:
+    friend struct sidecar_engine_test_access;
+
     // Callback: incoming data message on the input subject
     asio::awaitable<void> on_data_message(
         std::string_view subject,
@@ -59,10 +63,12 @@ private:
     attribute_schema m_schema;
     std::unique_ptr<lease_manager> m_lease_mgr;
     std::unique_ptr<worker_pool> m_worker_pool;
+    std::unique_ptr<asio::steady_timer> m_stats_timer;
 
     // Only m_messages_received is tracked here (at enqueue time).
     // All other stats come from worker_pool::get_stats().
     std::atomic<uint64_t> m_messages_received{0};
+    std::atomic<bool> m_shutting_down{false};
 };
 
 } // namespace sidecar

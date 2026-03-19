@@ -91,6 +91,7 @@ if(SIDECAR_BUILD_TESTS)
 
     add_executable(sidecar_test
         tests/test_event_bridge.cpp
+        tests/test_sidecar_lifecycle.cpp
         tests/test_subscription_manager.cpp
     )
     target_link_libraries(sidecar_test

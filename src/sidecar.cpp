@@ -1,6 +1,7 @@
 #include "sidecar.hpp"
 #include <nlohmann/json.hpp>
 #include <asio/detached.hpp>
+#include <asio/redirect_error.hpp>
 #include <asio/use_awaitable.hpp>
 #include <charconv>
 
@@ -15,6 +16,13 @@ sidecar_engine::sidecar_engine(asio::io_context& ioc, const config& cfg,
 
 asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
     m_conn = std::move(conn);
+    m_shutting_down.store(false, std::memory_order_relaxed);
+
+    // Start the worker pool before installing the input subscription so early
+    // messages always have a live queue target.
+    m_worker_pool = std::make_unique<worker_pool>(
+        m_ioc, m_cfg, m_schema, m_sub_mgr, m_conn, m_log);
+    m_worker_pool->start();
 
     // Subscribe to the input data subject
     nats_asio::subscribe_options data_opts;
@@ -80,12 +88,8 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
         m_log->warn("Lease manager failed to start - soft-state cleanup disabled");
     }
 
-    // Start the worker pool
-    m_worker_pool = std::make_unique<worker_pool>(
-        m_ioc, m_cfg, m_schema, m_sub_mgr, m_conn, m_log);
-    m_worker_pool->start();
-
     // Start stats reporting
+    m_stats_timer = std::make_unique<asio::steady_timer>(m_ioc);
     asio::co_spawn(m_ioc, stats_loop(), asio::detached);
 
     m_log->info("Sidecar engine started (format={}, {} attributes, output={}.<ID>)",
@@ -93,6 +97,14 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
 }
 
 void sidecar_engine::stop_workers() {
+    m_shutting_down.store(true, std::memory_order_relaxed);
+    if (m_stats_timer) {
+        std::error_code ec;
+        m_stats_timer->cancel(ec);
+        if (ec) {
+            m_log->debug("Failed to cancel stats timer: {}", ec.message());
+        }
+    }
     if (m_worker_pool) {
         m_worker_pool->stop();
     }
@@ -107,6 +119,11 @@ asio::awaitable<void> sidecar_engine::on_data_message(
 
     // Skip empty payloads
     if (payload.empty()) co_return;
+
+    if (!m_worker_pool) {
+        m_log->warn("Received data before worker pool initialization; dropping payload");
+        co_return;
+    }
 
     // Copy payload and enqueue for worker processing
     std::vector<char> payload_copy(payload.begin(), payload.end());
@@ -196,11 +213,18 @@ asio::awaitable<void> sidecar_engine::on_unsubscribe_request(
 }
 
 asio::awaitable<void> sidecar_engine::stats_loop() {
-    asio::steady_timer timer(co_await asio::this_coro::executor);
-
-    while (true) {
-        timer.expires_after(std::chrono::seconds(m_cfg.stats_interval_seconds));
-        co_await timer.async_wait(asio::use_awaitable);
+    while (!m_shutting_down.load(std::memory_order_relaxed)) {
+        m_stats_timer->expires_after(std::chrono::seconds(m_cfg.stats_interval_seconds));
+        std::error_code ec;
+        co_await m_stats_timer->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        if (m_shutting_down.load(std::memory_order_relaxed) ||
+            ec == asio::error::operation_aborted) {
+            co_return;
+        }
+        if (ec) {
+            m_log->debug("stats loop timer error: {}", ec.message());
+            co_return;
+        }
 
         auto ws = m_worker_pool ? m_worker_pool->get_stats() : worker_pool::stats{};
 
