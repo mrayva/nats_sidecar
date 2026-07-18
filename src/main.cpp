@@ -29,9 +29,13 @@ int main(int argc, char* argv[]) {
         ("unsubscribe-subject", "Unsubscription request subject", cxxopts::value<std::string>())
         ("lease-bucket", "NATS KV lease bucket name", cxxopts::value<std::string>())
         ("lease-ttl", "Lease TTL in seconds", cxxopts::value<uint32_t>())
-        ("lease-check-interval", "Lease check interval in seconds", cxxopts::value<uint32_t>())
+        ("lease-check-interval", "Lease reconciliation interval in seconds", cxxopts::value<uint32_t>())
         ("attr", "Attribute as name:type (repeatable)", cxxopts::value<std::vector<std::string>>())
         ("workers", "Worker thread count (0 = auto)", cxxopts::value<unsigned int>())
+        ("input-queue-max-messages", "Maximum queued input messages", cxxopts::value<std::size_t>())
+        ("input-queue-max-bytes", "Maximum queued input bytes", cxxopts::value<std::size_t>())
+        ("publish-max-inflight", "Maximum in-flight publication tasks", cxxopts::value<std::size_t>())
+        ("publish-backpressure-timeout-ms", "NATS publish backpressure timeout", cxxopts::value<uint32_t>())
         ("tls-cert", "TLS certificate path", cxxopts::value<std::string>())
         ("tls-key", "TLS key path", cxxopts::value<std::string>())
         ("tls-ca", "TLS CA certificate path", cxxopts::value<std::string>())
@@ -93,6 +97,10 @@ int main(int argc, char* argv[]) {
     if (result.count("lease-ttl"))            cfg.lease_ttl_seconds = result["lease-ttl"].as<uint32_t>();
     if (result.count("lease-check-interval")) cfg.lease_check_interval_seconds = result["lease-check-interval"].as<uint32_t>();
     if (result.count("workers"))              cfg.worker_threads = result["workers"].as<unsigned int>();
+    if (result.count("input-queue-max-messages")) cfg.input_queue_max_messages = result["input-queue-max-messages"].as<std::size_t>();
+    if (result.count("input-queue-max-bytes")) cfg.input_queue_max_bytes = result["input-queue-max-bytes"].as<std::size_t>();
+    if (result.count("publish-max-inflight")) cfg.publish_max_inflight = result["publish-max-inflight"].as<std::size_t>();
+    if (result.count("publish-backpressure-timeout-ms")) cfg.publish_backpressure_timeout_ms = result["publish-backpressure-timeout-ms"].as<uint32_t>();
     if (result.count("tls-cert"))             cfg.tls_cert = result["tls-cert"].as<std::string>();
     if (result.count("tls-key"))              cfg.tls_key = result["tls-key"].as<std::string>();
     if (result.count("tls-ca"))               cfg.tls_ca = result["tls-ca"].as<std::string>();
@@ -140,6 +148,13 @@ int main(int argc, char* argv[]) {
         console->error("At least one attribute is required (via config file or --attr)");
         return 1;
     }
+    if (cfg.lease_ttl_seconds == 0 || cfg.lease_check_interval_seconds == 0 ||
+        cfg.input_queue_max_messages == 0 ||
+        cfg.input_queue_max_bytes == 0 || cfg.publish_max_inflight == 0 ||
+        cfg.publish_backpressure_timeout_ms == 0) {
+        console->error("Lease TTL and all queue/publication limits must be greater than zero");
+        return 1;
+    }
 
     // Set log level
     if (cfg.log_level == "debug")      spdlog::set_level(spdlog::level::debug);
@@ -160,6 +175,10 @@ int main(int argc, char* argv[]) {
     console->info("  attributes: {}", cfg.attributes.size());
     console->info("  worker threads: {}", effective_workers);
     console->info("  lease bucket: {} (TTL={}s)", cfg.lease_bucket, cfg.lease_ttl_seconds);
+    console->info("  input queue: {} messages / {} bytes",
+                  cfg.input_queue_max_messages, cfg.input_queue_max_bytes);
+    console->info("  publication tasks: {} max in-flight",
+                  cfg.publish_max_inflight);
 
     // Single-threaded io_context (NATS I/O + publish coroutines)
     asio::io_context ioc(1);
@@ -240,8 +259,22 @@ int main(int argc, char* argv[]) {
     // 1. Stop worker threads (drain queue + join)
     engine->stop_workers();
 
-    // 2. Flush any remaining co_spawn'd publish coroutines
+    // 2. Resume queued publish coroutines and wait for every accepted task.
+    // 3. Drain NATS writes and close the connection deterministically.
     ioc.restart();
+    asio::co_spawn(ioc,
+        [engine, c = conn, console, &ioc]() -> asio::awaitable<void> {
+            if (!co_await engine->wait_for_publications(std::chrono::seconds(30))) {
+                console->warn("Timed out waiting for publication tasks to finish");
+            }
+            auto status = co_await c->drain(std::chrono::seconds(30));
+            if (status.failed()) {
+                console->warn("NATS connection drain failed: {}", status.error());
+            }
+            ioc.stop();
+        },
+        asio::detached
+    );
     ioc.run();
 
     console->info("nats_sidecar stopped");

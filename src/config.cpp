@@ -87,6 +87,12 @@ config load_config(const std::string& path) {
     if (auto n = root["stats_interval_seconds"]) cfg.stats_interval_seconds = n.as<int>();
     if (auto n = root["log_level"])              cfg.log_level = n.as<std::string>();
     if (auto n = root["worker_threads"])         cfg.worker_threads = n.as<unsigned int>();
+    if (auto n = root["input_queue_max_messages"]) cfg.input_queue_max_messages = n.as<std::size_t>();
+    if (auto n = root["input_queue_max_bytes"])    cfg.input_queue_max_bytes = n.as<std::size_t>();
+    if (auto n = root["publish_max_inflight"])     cfg.publish_max_inflight = n.as<std::size_t>();
+    if (auto n = root["publish_backpressure_timeout_ms"]) {
+        cfg.publish_backpressure_timeout_ms = n.as<uint32_t>();
+    }
 
     return cfg;
 }

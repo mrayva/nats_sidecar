@@ -30,6 +30,9 @@ public:
     // Stop the worker pool. Called during shutdown before ioc cleanup.
     void stop_workers();
 
+    // Wait until every accepted output publication task has completed.
+    asio::awaitable<bool> wait_for_publications(std::chrono::milliseconds timeout);
+
 private:
     friend struct sidecar_engine_test_access;
 
@@ -41,15 +44,15 @@ private:
 
     // Callback: subscription request from a client (request/reply pattern)
     asio::awaitable<void> on_subscribe_request(
-        std::string_view subject,
-        std::optional<std::string_view> reply_to,
-        std::span<const char> payload);
+        std::string subject,
+        std::optional<std::string> reply_to,
+        std::vector<char> payload);
 
     // Callback: unsubscribe request from a client
     asio::awaitable<void> on_unsubscribe_request(
-        std::string_view subject,
-        std::optional<std::string_view> reply_to,
-        std::span<const char> payload);
+        std::string subject,
+        std::optional<std::string> reply_to,
+        std::vector<char> payload);
 
     // Periodic stats logging
     asio::awaitable<void> stats_loop();
@@ -59,6 +62,9 @@ private:
     std::shared_ptr<spdlog::logger> m_log;
 
     nats_asio::iconnection_sptr m_conn;
+    nats_asio::isubscription_sptr m_data_sub;
+    nats_asio::isubscription_sptr m_subscribe_sub;
+    nats_asio::isubscription_sptr m_unsubscribe_sub;
     subscription_manager m_sub_mgr;
     attribute_schema m_schema;
     std::unique_ptr<lease_manager> m_lease_mgr;

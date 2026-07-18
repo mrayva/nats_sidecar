@@ -34,7 +34,7 @@ include(FetchContent)
 FetchContent_Declare(
     nats_asio
     GIT_REPOSITORY https://github.com/mrayva/nats_asio.git
-    GIT_TAG        169c3f1e875b9793759f42d89d35c42371251c2d
+    GIT_TAG        36095e5c2ad5488b460d60e424f37be6404453ab
     GIT_SHALLOW    TRUE
 )
 # Disable nats_asio's own samples/tests - we only need the library
@@ -42,6 +42,17 @@ set(NATS_ASIO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(NATS_ASIO_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(NATS_ASIO_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nats_asio)
+
+# zerialize is used directly by the event bridge and schema generator. Newer
+# nats_asio releases intentionally expose it only when their samples are built,
+# so keep it as an explicit, independently pinned dependency here.
+set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
+FetchContent_Declare(
+    zerialize
+    GIT_REPOSITORY https://github.com/colinator/zerialize.git
+    GIT_TAG        aedaaf2e585dbc0a7f239bca33fd2a6595ed47df
+)
+FetchContent_MakeAvailable(zerialize)
 
 # --- a-tree FFI (Rust -> C/C++) ---
 include(cmake/BuildAtree.cmake)
@@ -93,6 +104,7 @@ if(SIDECAR_BUILD_TESTS)
         tests/test_event_bridge.cpp
         tests/test_sidecar_lifecycle.cpp
         tests/test_subscription_manager.cpp
+        tests/test_worker_pool.cpp
     )
     target_link_libraries(sidecar_test
         PRIVATE

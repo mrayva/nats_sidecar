@@ -164,3 +164,26 @@ TEST(subscription_manager, snapshot_empty_on_construction) {
     EXPECT_EQ(snap->active_count, 0u);
     EXPECT_TRUE(snap->output_subjects.empty());
 }
+
+TEST(subscription_manager, restores_stable_id_and_advances_sequence) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
+
+    ASSERT_TRUE(mgr.restore(42, "temperature > 30.0", "client-1"));
+    ASSERT_TRUE(mgr.restore(42, "temperature > 30.0", "client-2"));
+
+    auto restored = mgr.get_subscription(42);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->lease_holders.size(), 2u);
+    EXPECT_EQ(mgr.snapshot()->output_subjects.at(42), "test.output.42");
+
+    EXPECT_EQ(mgr.subscribe("severity = 5", "client-3"), 43u);
+}
+
+TEST(subscription_manager, rejects_conflicting_restored_records) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
+
+    ASSERT_TRUE(mgr.restore(7, "temperature > 30.0", "client-1"));
+    EXPECT_FALSE(mgr.restore(8, "temperature > 30.0", "client-2"));
+    EXPECT_FALSE(mgr.restore(7, "severity = 5", "client-2"));
+    EXPECT_EQ(mgr.active_count(), 1u);
+}

@@ -64,9 +64,13 @@ All configuration parameters can be set via CLI flags. When a config file is als
 | `--unsubscribe-subject SUBJ` | Unsubscription request subject |
 | `--lease-bucket NAME` | NATS KV lease bucket name |
 | `--lease-ttl SECS` | Lease TTL in seconds |
-| `--lease-check-interval SECS` | Lease check interval in seconds |
+| `--lease-check-interval SECS` | Lease reconciliation interval in seconds |
 | `--attr NAME:TYPE` | Attribute definition (repeatable) |
 | `--workers N` | Worker thread count (0 = auto) |
+| `--input-queue-max-messages N` | Maximum queued input messages |
+| `--input-queue-max-bytes N` | Maximum queued input bytes |
+| `--publish-max-inflight N` | Maximum in-flight publication tasks |
+| `--publish-backpressure-timeout-ms MS` | NATS output backpressure timeout |
 | `--tls-cert PATH` | TLS certificate path |
 | `--tls-key PATH` | TLS key path |
 | `--tls-ca PATH` | TLS CA certificate path |
@@ -103,6 +107,7 @@ unsubscribe_subject: "sidecar.unsubscribe"
 # Soft-state leases (NATS KV)
 lease_bucket: "sidecar-leases"
 lease_ttl_seconds: 3600
+lease_check_interval_seconds: 60
 
 # Attribute schema for boolean expressions
 attributes:
@@ -113,6 +118,12 @@ attributes:
 
 # Worker threads (0 = auto-detect via hardware_concurrency)
 worker_threads: 0
+
+# Bounded flow control
+input_queue_max_messages: 10000
+input_queue_max_bytes: 67108864
+publish_max_inflight: 1024
+publish_backpressure_timeout_ms: 5000
 ```
 
 ### Attribute Types
@@ -148,9 +159,17 @@ Response:
 }
 ```
 
-The client should then:
-1. Subscribe to the returned `topic` for filtered messages
-2. Periodically refresh the lease key in the KV bucket before TTL expires
+The sidecar creates the initial KV lease atomically with the subscription. The
+client should then:
+
+1. Subscribe to the returned `topic` for filtered messages.
+2. Repeat the same subscribe request before the TTL expires. This is idempotent
+   and refreshes the server-owned lease record.
+
+The sidecar creates the KV bucket when it is absent and validates its TTL and
+history settings when it already exists. A configuration mismatch fails startup.
+Lease records contain enough metadata to restore active subscriptions with their
+original IDs after a sidecar restart.
 
 ### Unsubscribe
 

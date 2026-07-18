@@ -64,6 +64,14 @@ struct config {
 
     // Worker threads for parallel message processing (0 = hardware_concurrency)
     unsigned int worker_threads = 0;
+
+    // Bounded input queue. Newest messages are dropped when either limit is hit.
+    std::size_t input_queue_max_messages = 10000;
+    std::size_t input_queue_max_bytes = 64ULL * 1024 * 1024;
+
+    // Bounded detached publication work and NATS write backpressure timeout.
+    std::size_t publish_max_inflight = 1024;
+    uint32_t publish_backpressure_timeout_ms = 5000;
 };
 
 // Parse config from YAML file. Throws on error.

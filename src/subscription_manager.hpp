@@ -36,6 +36,11 @@ public:
     // (new or existing). Throws atree::Error on invalid expression.
     uint64_t subscribe(const std::string& expression, const std::string& client_id);
 
+    // Restore a persisted subscription using its original ID. Returns false
+    // if the record conflicts with already-restored state.
+    bool restore(uint64_t subscription_id, const std::string& expression,
+                 const std::string& client_id);
+
     // Remove a specific client's lease from a subscription.
     // Returns true if the subscription was fully removed (no more lease holders).
     bool remove_lease(uint64_t subscription_id, const std::string& client_id);
