@@ -5,11 +5,13 @@
 #include "subscription_manager.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/io_context.hpp>
+#include <asio/awaitable.hpp>
 #include <concurrentqueue/moodycamel/blockingconcurrentqueue.h>
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -22,7 +24,12 @@ public:
         uint64_t matched = 0;
         uint64_t published = 0;
         uint64_t match_failures = 0;
+        uint64_t input_dropped = 0;
+        uint64_t publish_tasks_dropped = 0;
+        uint64_t publish_failures = 0;
         std::size_t queue_depth = 0;
+        std::size_t queue_bytes = 0;
+        std::size_t publish_inflight = 0;
     };
 
     worker_pool(asio::io_context& ioc, const config& cfg,
@@ -39,7 +46,11 @@ public:
     void stop();
 
     // Enqueue a payload for worker processing (move semantics).
-    void enqueue(std::vector<char> payload);
+    // Returns false when shutdown has begun or a queue limit is reached.
+    bool enqueue(std::vector<char> payload);
+
+    // Wait for every accepted publication coroutine to complete.
+    asio::awaitable<bool> wait_for_publications(std::chrono::milliseconds timeout);
 
     // Approximate queue depth.
     std::size_t queue_depth() const;
@@ -59,15 +70,28 @@ private:
 
     unsigned int m_thread_count;
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_accepting{false};
+
+    std::size_t m_queue_max_messages;
+    std::size_t m_queue_max_bytes;
+    std::size_t m_publish_max_inflight;
+    std::chrono::milliseconds m_publish_backpressure_timeout;
 
     moodycamel::BlockingConcurrentQueue<std::vector<char>> m_queue;
     std::vector<std::thread> m_threads;
+    std::mutex m_enqueue_mutex;
+    std::atomic<std::size_t> m_queued_messages{0};
+    std::atomic<std::size_t> m_queued_bytes{0};
+    std::atomic<std::size_t> m_publish_inflight{0};
 
     // Aggregate stats (relaxed atomics)
     std::atomic<uint64_t> m_processed{0};
     std::atomic<uint64_t> m_matched{0};
     std::atomic<uint64_t> m_published{0};
     std::atomic<uint64_t> m_match_failures{0};
+    std::atomic<uint64_t> m_input_dropped{0};
+    std::atomic<uint64_t> m_publish_tasks_dropped{0};
+    std::atomic<uint64_t> m_publish_failures{0};
 };
 
 } // namespace sidecar

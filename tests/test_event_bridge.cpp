@@ -86,4 +86,5 @@ TEST(lease_manager, parse_invalid_lease_key) {
     EXPECT_FALSE(sidecar::lease_manager::parse_lease_key(".leading", id, client));
     EXPECT_FALSE(sidecar::lease_manager::parse_lease_key("trailing.", id, client));
     EXPECT_FALSE(sidecar::lease_manager::parse_lease_key("notanumber.client", id, client));
+    EXPECT_FALSE(sidecar::lease_manager::parse_lease_key("42junk.client", id, client));
 }

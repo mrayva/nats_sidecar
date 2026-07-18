@@ -89,6 +89,41 @@ uint64_t subscription_manager::subscribe(const std::string& expression,
     return id;
 }
 
+bool subscription_manager::restore(uint64_t subscription_id,
+                                   const std::string& expression,
+                                   const std::string& client_id) {
+    std::lock_guard<std::mutex> lock(m_write_mutex);
+
+    auto expr_it = m_expr_to_id.find(expression);
+    if (expr_it != m_expr_to_id.end()) {
+        if (expr_it->second != subscription_id) return false;
+        m_subscriptions.at(subscription_id).lease_holders.insert(client_id);
+        m_next_id = std::max(m_next_id, subscription_id + 1);
+        return true;
+    }
+
+    auto id_it = m_subscriptions.find(subscription_id);
+    if (id_it != m_subscriptions.end()) return false;
+
+    subscription_info info;
+    info.id = subscription_id;
+    info.expression = expression;
+    info.lease_holders.insert(client_id);
+    m_subscriptions.emplace(subscription_id, std::move(info));
+    m_expr_to_id.emplace(expression, subscription_id);
+
+    try {
+        publish_snapshot();
+    } catch (...) {
+        m_subscriptions.erase(subscription_id);
+        m_expr_to_id.erase(expression);
+        throw;
+    }
+
+    m_next_id = std::max(m_next_id, subscription_id + 1);
+    return true;
+}
+
 bool subscription_manager::remove_lease(uint64_t subscription_id,
                                         const std::string& client_id) {
     std::lock_guard<std::mutex> lock(m_write_mutex);
