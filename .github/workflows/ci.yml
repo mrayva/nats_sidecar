@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: gcc-${{ matrix.gcc }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        gcc: [13, 14]
+
+    env:
+      CC: gcc-${{ matrix.gcc }}
+      CXX: g++-${{ matrix.gcc }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          g++-${{ matrix.gcc }} ninja-build
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11.6
+        with:
+          vcpkgGitCommitId: 4e82e29f14eac2b3422f18f72c7524d04f19924e
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_OVERLAY_TRIPLETS="${GITHUB_WORKSPACE}/triplets"
+          -DSIDECAR_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build-ci --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build-ci --output-on-failure
+
+      - name: Smoke-test CLI
+        run: build-ci/bin/nats_sidecar --help
