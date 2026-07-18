@@ -36,6 +36,13 @@ python3 tests/integration_sidecar.py \
   --nats-server /path/to/nats-server \
   --sidecar build/bin/nats_sidecar \
   --config config/example.yaml
+
+# Optional AddressSanitizer + UndefinedBehaviorSanitizer build
+cmake -B build-asan -S . \
+  -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+  -DSIDECAR_SANITIZER=address
+cmake --build build-asan
+ctest --test-dir build-asan --output-on-failure
 ```
 
 The executable is placed at `build/bin/nats_sidecar`.
