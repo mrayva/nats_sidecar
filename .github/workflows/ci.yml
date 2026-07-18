@@ -54,3 +54,26 @@ jobs:
 
       - name: Smoke-test CLI
         run: build-ci/bin/nats_sidecar --help
+
+      - name: Install NATS Server
+        if: matrix.gcc == 14
+        env:
+          NATS_SERVER_VERSION: 2.14.3
+          NATS_SERVER_SHA256: f3d0c820c749f81d717310fb00d4903919e70e3e66b268bd352a088b9788eb93
+        run: |
+          archive="${RUNNER_TEMP}/nats-server.tar.gz"
+          release="nats-server-v${NATS_SERVER_VERSION}-linux-amd64"
+          curl --fail --location --silent --show-error \
+            "https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/${release}.tar.gz" \
+            --output "${archive}"
+          echo "${NATS_SERVER_SHA256}  ${archive}" | sha256sum --check
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}"
+          mv "${RUNNER_TEMP}/${release}/nats-server" "${RUNNER_TEMP}/nats-server"
+
+      - name: Test strict JetStream lifecycle
+        if: matrix.gcc == 14
+        run: >-
+          python3 tests/integration_sidecar.py
+          --nats-server "${RUNNER_TEMP}/nats-server"
+          --sidecar build-ci/bin/nats_sidecar
+          --config config/example.yaml

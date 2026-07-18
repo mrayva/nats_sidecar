@@ -30,6 +30,12 @@ cmake --build build
 
 # Run tests
 ./build/tests/sidecar_test
+
+# Run the strict-JetStream lifecycle integration test
+python3 tests/integration_sidecar.py \
+  --nats-server /path/to/nats-server \
+  --sidecar build/bin/nats_sidecar \
+  --config config/example.yaml
 ```
 
 The executable is placed at `build/bin/nats_sidecar`.
