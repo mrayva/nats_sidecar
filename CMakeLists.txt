@@ -34,7 +34,7 @@ include(FetchContent)
 FetchContent_Declare(
     nats_asio
     GIT_REPOSITORY https://github.com/mrayva/nats_asio.git
-    GIT_TAG        60ceffe437463643447020f1f38c45b456daa9b3
+    GIT_TAG        36095e5c2ad5488b460d60e424f37be6404453ab
     GIT_SHALLOW    TRUE
 )
 # Disable nats_asio's own samples/tests - we only need the library

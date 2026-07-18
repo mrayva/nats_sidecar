@@ -56,12 +56,6 @@ public:
                                 std::string& client_id);
 
 private:
-    struct request_state {
-        bool received = false;
-        nats_asio::message response;
-    };
-
-    asio::awaitable<bool> start_request_mux();
     asio::awaitable<bool> ensure_bucket();
     asio::awaitable<bool> restore_leases();
     asio::awaitable<void> cleanup_loop();
@@ -81,10 +75,6 @@ private:
     uint32_t m_check_interval_seconds;
     std::shared_ptr<spdlog::logger> m_log;
     std::unique_ptr<asio::steady_timer> m_cleanup_timer;
-    nats_asio::isubscription_sptr m_request_subscription;
-    std::string m_request_prefix;
-    uint64_t m_next_request_id = 0;
-    std::unordered_map<std::string, std::shared_ptr<request_state>> m_requests;
     std::unordered_map<std::string, std::chrono::system_clock::time_point> m_expirations;
     std::atomic<bool> m_stopping{false};
 };

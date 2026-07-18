@@ -7,26 +7,6 @@
 
 namespace sidecar {
 
-namespace {
-
-asio::awaitable<nats_asio::status> publish_raw(
-    const nats_asio::iconnection_sptr& conn, const std::string& subject,
-    const std::string& payload) {
-    std::string wire;
-    wire.reserve(subject.size() + payload.size() + 32);
-    wire += "PUB ";
-    wire += subject;
-    wire += " ";
-    wire += std::to_string(payload.size());
-    wire += "\r\n";
-    wire += payload;
-    wire += "\r\n";
-    co_return co_await conn->write_raw(
-        std::span<const char>(wire.data(), wire.size()));
-}
-
-} // namespace
-
 sidecar_engine::sidecar_engine(asio::io_context& ioc, const config& cfg,
                                std::shared_ptr<spdlog::logger> log)
     : m_ioc(ioc), m_cfg(cfg), m_log(std::move(log)),
@@ -234,7 +214,10 @@ asio::awaitable<void> sidecar_engine::on_subscribe_request(
         reply_str = nlohmann::json({{"error", std::string("Bad request: ") + e.what()}}).dump();
     }
 
-    auto s = co_await publish_raw(m_conn, reply_subject, reply_str);
+    auto s = co_await m_conn->publish(
+        reply_subject,
+        std::span<const char>(reply_str.data(), reply_str.size()),
+        std::nullopt);
 
     if (s.failed()) {
         m_log->error("Failed to reply to subscribe request: {}", s.error());
@@ -275,7 +258,10 @@ asio::awaitable<void> sidecar_engine::on_unsubscribe_request(
     }
 
     if (!reply_subject.empty()) {
-        co_await publish_raw(m_conn, reply_subject, reply_str);
+        co_await m_conn->publish(
+            reply_subject,
+            std::span<const char>(reply_str.data(), reply_str.size()),
+            std::nullopt);
     }
 }
 
