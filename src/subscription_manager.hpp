@@ -24,8 +24,8 @@ struct subscription_info {
 };
 
 // Manages boolean expression subscriptions in the A-Tree.
-// Uses RCU-style snapshot swapping: readers get a lock-free shared_ptr<const tree_snapshot>,
-// writers serialize via mutex and atomically publish new snapshots.
+// Uses RCU-style snapshot swapping: readers atomically acquire an immutable snapshot,
+// while writers serialize via mutex and publish replacements atomically.
 class subscription_manager {
 public:
     subscription_manager(const std::vector<attribute_def>& attributes,
@@ -74,8 +74,8 @@ private:
     std::vector<attribute_def> m_attributes;
     std::string m_output_prefix;
 
-    // Current snapshot — atomic load/store for lock-free reader access.
-    std::shared_ptr<const tree_snapshot> m_snapshot;
+    // Current snapshot — atomically published for concurrent reader access.
+    std::atomic<std::shared_ptr<const tree_snapshot>> m_snapshot;
 
     // Writer-only state (protected by m_write_mutex)
     uint64_t m_next_id = 1;

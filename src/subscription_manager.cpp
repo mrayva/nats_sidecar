@@ -44,8 +44,8 @@ void subscription_manager::publish_snapshot() {
         snap->output_subjects[id] = m_output_prefix + "." + std::to_string(id);
     }
 
-    std::atomic_store(&m_snapshot,
-                      std::shared_ptr<const tree_snapshot>(std::move(snap)));
+    m_snapshot.store(std::shared_ptr<const tree_snapshot>(std::move(snap)),
+                     std::memory_order_release);
 }
 
 uint64_t subscription_manager::subscribe(const std::string& expression,
@@ -177,11 +177,11 @@ std::optional<uint64_t> subscription_manager::find_by_expression(const std::stri
 }
 
 std::shared_ptr<const tree_snapshot> subscription_manager::snapshot() const {
-    return std::atomic_load(&m_snapshot);
+    return m_snapshot.load(std::memory_order_acquire);
 }
 
 std::size_t subscription_manager::active_count() const {
-    return std::atomic_load(&m_snapshot)->active_count;
+    return m_snapshot.load(std::memory_order_acquire)->active_count;
 }
 
 } // namespace sidecar
