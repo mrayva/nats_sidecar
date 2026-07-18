@@ -14,6 +14,37 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(SIDECAR_BUILD_TESTS "Build tests" ON)
+set(SIDECAR_SANITIZER "none" CACHE STRING "Sanitizer: none, address, or thread")
+set_property(CACHE SIDECAR_SANITIZER PROPERTY STRINGS none address thread)
+
+add_library(sidecar_sanitizers INTERFACE)
+if(SIDECAR_SANITIZER STREQUAL "address")
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "AddressSanitizer requires GCC or Clang")
+    endif()
+    target_compile_options(sidecar_sanitizers INTERFACE
+        -fsanitize=address,undefined
+        -fno-sanitize=alignment
+        -fno-omit-frame-pointer
+    )
+    target_link_options(sidecar_sanitizers INTERFACE
+        -fsanitize=address,undefined
+        -fno-sanitize=alignment
+    )
+elseif(SIDECAR_SANITIZER STREQUAL "thread")
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "ThreadSanitizer requires GCC or Clang")
+    endif()
+    target_compile_options(sidecar_sanitizers INTERFACE
+        -fsanitize=thread
+        -fno-omit-frame-pointer
+        -Wno-tsan
+    )
+    target_link_options(sidecar_sanitizers INTERFACE -fsanitize=thread)
+elseif(NOT SIDECAR_SANITIZER STREQUAL "none")
+    message(FATAL_ERROR
+        "Invalid SIDECAR_SANITIZER='${SIDECAR_SANITIZER}'; expected none, address, or thread")
+endif()
 
 # --- vcpkg dependencies ---
 find_package(asio CONFIG REQUIRED)
@@ -83,6 +114,7 @@ target_link_libraries(sidecar_lib
         asio::asio
         cxxopts::cxxopts
         Threads::Threads
+        sidecar_sanitizers
 )
 
 target_compile_definitions(sidecar_lib PUBLIC FLATBUFFERS_LOCALE_INDEPENDENT=0)
