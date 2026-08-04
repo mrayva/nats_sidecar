@@ -112,6 +112,7 @@ include(cmake/BuildAtree.cmake)
 
 # --- sidecar library (shared between executable and tests) ---
 add_library(sidecar_lib STATIC
+    src/cli.cpp
     src/config.cpp
     src/event_bridge.cpp
     src/schema_generator.cpp
@@ -158,6 +159,7 @@ if(SIDECAR_BUILD_TESTS)
     find_package(GTest CONFIG REQUIRED)
 
     add_executable(sidecar_test
+        tests/test_cli.cpp
         tests/test_config_loading.cpp
         tests/test_event_bridge.cpp
         tests/test_lease_manager.cpp
