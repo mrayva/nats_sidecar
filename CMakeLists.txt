@@ -161,6 +161,7 @@ if(SIDECAR_BUILD_TESTS)
         tests/test_config_loading.cpp
         tests/test_event_bridge.cpp
         tests/test_lease_manager.cpp
+        tests/test_schema_generator.cpp
         tests/test_sidecar_lifecycle.cpp
         tests/test_subscription_manager.cpp
         tests/test_worker_pool.cpp
