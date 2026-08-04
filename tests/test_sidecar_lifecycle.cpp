@@ -1,5 +1,6 @@
 #include "sidecar.hpp"
 #include "fake_connection.hpp"
+#include "asio_test_helpers.hpp"
 #include <gtest/gtest.h>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -13,6 +14,8 @@
 #include <spdlog/sinks/null_sink.h>
 
 namespace {
+
+using sidecar_test::run_void_to_completion;
 
 auto make_log() {
     return std::make_shared<spdlog::logger>(
@@ -37,23 +40,6 @@ sidecar::config sample_config() {
 std::vector<char> json_payload(const nlohmann::json& j) {
     auto s = j.dump();
     return std::vector<char>(s.begin(), s.end());
-}
-
-// Runs a void awaitable to completion, polling with short run_for() slices
-// (a single run_for() could return immediately if nothing is queued yet on a
-// fresh/restarted io_context).
-void run_void_to_completion(asio::io_context& ioc, asio::awaitable<void> awaitable) {
-    bool done = false;
-    asio::co_spawn(ioc, std::move(awaitable), [&](std::exception_ptr ep) {
-        if (ep) std::rethrow_exception(ep);
-        done = true;
-    });
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!done && std::chrono::steady_clock::now() < deadline) {
-        ioc.restart();
-        ioc.run_for(std::chrono::milliseconds(20));
-    }
-    ASSERT_TRUE(done);
 }
 
 } // namespace
@@ -145,9 +131,9 @@ TEST(sidecar_engine, on_data_message_before_worker_pool_ready_is_a_safe_noop) {
     sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
 
     std::vector<char> payload{'x'};
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_data_message(
-                 engine, std::span<const char>(payload.data(), payload.size())));
+                 engine, std::span<const char>(payload.data(), payload.size()))));
     // Reaching here without throwing/crashing is the assertion.
 }
 
@@ -157,8 +143,8 @@ TEST(sidecar_engine, on_data_message_skips_empty_payload) {
     auto conn = std::make_shared<sidecar_test::fake_connection>();
     sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
 
-    run_void_to_completion(
-        ioc, sidecar::sidecar_engine_test_access::on_data_message(engine, {}));
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_data_message(engine, {})));
 
     ioc.restart();
     ioc.run_for(std::chrono::milliseconds(50));
@@ -174,9 +160,9 @@ TEST(sidecar_engine, on_data_message_enqueues_into_worker_pool) {
     // 0xc1 is reserved/invalid in MessagePack - exercises processing without
     // needing a matching subscription or publish work.
     std::vector<char> payload{static_cast<char>(0xc1)};
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_data_message(
-                 engine, std::span<const char>(payload.data(), payload.size())));
+                 engine, std::span<const char>(payload.data(), payload.size()))));
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (sidecar::sidecar_engine_test_access::worker_stats(engine).processed == 0 &&
@@ -206,9 +192,9 @@ TEST(sidecar_engine, on_subscribe_request_valid_returns_subscription_details) {
     };
 
     auto payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::string("_INBOX.reply"), std::move(payload)));
+                 engine, std::string("_INBOX.reply"), std::move(payload))));
 
     ASSERT_TRUE(captured_subject.has_value());
     EXPECT_EQ(*captured_subject, "_INBOX.reply");
@@ -235,9 +221,9 @@ TEST(sidecar_engine, on_subscribe_request_without_reply_to_is_ignored) {
     };
 
     auto payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::nullopt, std::move(payload)));
+                 engine, std::nullopt, std::move(payload))));
 
     EXPECT_FALSE(publish_called);
     EXPECT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 0u);
@@ -256,9 +242,9 @@ TEST(sidecar_engine, on_subscribe_request_invalid_json_replies_with_error) {
     };
 
     std::vector<char> bad_payload{'n', 'o', 't', ' ', 'j', 's', 'o', 'n'};
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::string("_INBOX.reply"), std::move(bad_payload)));
+                 engine, std::string("_INBOX.reply"), std::move(bad_payload))));
 
     auto reply = nlohmann::json::parse(captured_reply);
     EXPECT_TRUE(reply.contains("error"));
@@ -278,9 +264,9 @@ TEST(sidecar_engine, on_subscribe_request_invalid_expression_replies_with_error)
     };
 
     auto payload = json_payload({{"expression", "not a valid !! expr"}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::string("_INBOX.reply"), std::move(payload)));
+                 engine, std::string("_INBOX.reply"), std::move(payload))));
 
     auto reply = nlohmann::json::parse(captured_reply);
     ASSERT_TRUE(reply.contains("error"));
@@ -302,9 +288,9 @@ TEST(sidecar_engine, on_subscribe_request_rolls_back_new_subscription_on_persist
     };
 
     auto payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::string("_INBOX.reply"), std::move(payload)));
+                 engine, std::string("_INBOX.reply"), std::move(payload))));
 
     auto reply = nlohmann::json::parse(captured_reply);
     EXPECT_TRUE(reply.contains("error"));
@@ -321,9 +307,9 @@ TEST(sidecar_engine, on_subscribe_request_keeps_already_held_lease_on_refresh_fa
     sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
 
     auto first_payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::string("_INBOX.reply1"), std::move(first_payload)));
+                 engine, std::string("_INBOX.reply1"), std::move(first_payload))));
     ASSERT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 1u);
 
     // Now make just this lease's refresh fail.
@@ -336,9 +322,9 @@ TEST(sidecar_engine, on_subscribe_request_keeps_already_held_lease_on_refresh_fa
     };
 
     auto second_payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::string("_INBOX.reply2"), std::move(second_payload)));
+                 engine, std::string("_INBOX.reply2"), std::move(second_payload))));
 
     auto reply = nlohmann::json::parse(captured_reply);
     EXPECT_TRUE(reply.contains("error"));
@@ -356,9 +342,9 @@ TEST(sidecar_engine, on_unsubscribe_request_removes_lease_and_replies_removed) {
     sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
 
     auto sub_payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::string("_INBOX.sub"), std::move(sub_payload)));
+                 engine, std::string("_INBOX.sub"), std::move(sub_payload))));
     ASSERT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 1u);
 
     std::string captured_reply;
@@ -368,9 +354,9 @@ TEST(sidecar_engine, on_unsubscribe_request_removes_lease_and_replies_removed) {
     };
 
     auto unsub_payload = json_payload({{"id", 1}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_unsubscribe_request(
-                 engine, std::string("_INBOX.unsub"), std::move(unsub_payload)));
+                 engine, std::string("_INBOX.unsub"), std::move(unsub_payload))));
 
     auto reply = nlohmann::json::parse(captured_reply);
     EXPECT_EQ(reply.at("id").get<uint64_t>(), 1u);
@@ -385,9 +371,9 @@ TEST(sidecar_engine, on_unsubscribe_request_delete_failure_replies_with_error) {
     sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
 
     auto sub_payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
-                 engine, std::string("_INBOX.sub"), std::move(sub_payload)));
+                 engine, std::string("_INBOX.sub"), std::move(sub_payload))));
     ASSERT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 1u);
 
     conn->fail_kv_delete = [](std::string_view, std::string_view) { return true; };
@@ -399,9 +385,9 @@ TEST(sidecar_engine, on_unsubscribe_request_delete_failure_replies_with_error) {
     };
 
     auto unsub_payload = json_payload({{"id", 1}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_unsubscribe_request(
-                 engine, std::string("_INBOX.unsub"), std::move(unsub_payload)));
+                 engine, std::string("_INBOX.unsub"), std::move(unsub_payload))));
 
     auto reply = nlohmann::json::parse(captured_reply);
     EXPECT_TRUE(reply.contains("error"));
@@ -421,9 +407,9 @@ TEST(sidecar_engine, on_unsubscribe_request_invalid_json_replies_with_error) {
     };
 
     std::vector<char> bad_payload{'n', 'o', 't', ' ', 'j', 's', 'o', 'n'};
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_unsubscribe_request(
-                 engine, std::string("_INBOX.unsub"), std::move(bad_payload)));
+                 engine, std::string("_INBOX.unsub"), std::move(bad_payload))));
 
     auto reply = nlohmann::json::parse(captured_reply);
     EXPECT_TRUE(reply.contains("error"));
@@ -442,9 +428,9 @@ TEST(sidecar_engine, on_unsubscribe_request_without_reply_to_does_not_publish) {
     };
 
     auto payload = json_payload({{"id", 999}, {"client_id", "client-1"}});
-    run_void_to_completion(
+    ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_unsubscribe_request(
-                 engine, std::nullopt, std::move(payload)));
+                 engine, std::nullopt, std::move(payload))));
 
     EXPECT_FALSE(publish_called);
 }

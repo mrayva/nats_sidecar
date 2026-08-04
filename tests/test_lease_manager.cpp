@@ -1,13 +1,13 @@
 #include "lease_manager.hpp"
 #include "subscription_manager.hpp"
 #include "fake_connection.hpp"
+#include "asio_test_helpers.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/io_context.hpp>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/sinks/null_sink.h>
 #include <chrono>
-#include <optional>
 #include <string>
 
 namespace sidecar {
@@ -36,38 +36,8 @@ std::vector<sidecar::attribute_def> sample_attributes() {
     return {{"temperature", sidecar::attribute_type::float_val}};
 }
 
-// Runs `awaitable_fn(...)` to completion on `ioc`, polling with short
-// run_for() slices (a single run_for() could return immediately if nothing
-// is queued yet on a fresh/restarted io_context - see the same pattern in
-// test_worker_pool.cpp's drive_until()).
-template <typename T, typename Awaitable>
-T run_to_completion(asio::io_context& ioc, Awaitable&& awaitable) {
-    std::optional<T> result;
-    asio::co_spawn(ioc, std::forward<Awaitable>(awaitable), [&](std::exception_ptr ep, T value) {
-        if (ep) std::rethrow_exception(ep);
-        result = std::move(value);
-    });
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!result.has_value() && std::chrono::steady_clock::now() < deadline) {
-        ioc.restart();
-        ioc.run_for(std::chrono::milliseconds(20));
-    }
-    return std::move(result).value();
-}
-
-void run_void_to_completion(asio::io_context& ioc, asio::awaitable<void> awaitable) {
-    bool done = false;
-    asio::co_spawn(ioc, std::move(awaitable), [&](std::exception_ptr ep) {
-        if (ep) std::rethrow_exception(ep);
-        done = true;
-    });
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!done && std::chrono::steady_clock::now() < deadline) {
-        ioc.restart();
-        ioc.run_for(std::chrono::milliseconds(20));
-    }
-    ASSERT_TRUE(done);
-}
+using sidecar_test::run_to_completion;
+using sidecar_test::run_void_to_completion;
 
 nats_asio::message json_message(const nlohmann::json& body) {
     nats_asio::message msg;
@@ -128,7 +98,7 @@ TEST(lease_manager, reconcile_removes_subscription_when_lease_expired_on_server)
     // Simulate server-side TTL expiry: the KV entry is just gone.
     conn->kv_store.erase(sidecar_test::fake_connection::kv_key("leases", "1.client-1"));
 
-    run_void_to_completion(ioc, sidecar::lease_manager_test_access::reconcile_once(lm));
+    ASSERT_TRUE(run_void_to_completion(ioc, sidecar::lease_manager_test_access::reconcile_once(lm)));
 
     EXPECT_EQ(sub_mgr.active_count(), 0u);
 }
@@ -145,7 +115,7 @@ TEST(lease_manager, reconcile_keeps_subscription_when_lease_still_present) {
     ASSERT_EQ(sub_mgr.active_count(), 1u);
 
     // Lease is still present server-side - reconciliation must not remove it.
-    run_void_to_completion(ioc, sidecar::lease_manager_test_access::reconcile_once(lm));
+    ASSERT_TRUE(run_void_to_completion(ioc, sidecar::lease_manager_test_access::reconcile_once(lm)));
 
     EXPECT_EQ(sub_mgr.active_count(), 1u);
 }

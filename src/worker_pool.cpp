@@ -8,6 +8,30 @@
 
 namespace sidecar {
 
+pub_frames build_pub_frames(const std::vector<uint64_t>& matched_ids,
+                            const std::unordered_map<uint64_t, std::string>& output_subjects,
+                            std::span<const char> payload) {
+    pub_frames frames;
+    // Rough upper-bound estimate (subject/size overhead is small relative to
+    // the payload for most workloads) to avoid repeated reallocation while
+    // appending one frame per matched subscription.
+    frames.wire.reserve(matched_ids.size() * (payload.size() + 64));
+
+    for (uint64_t sub_id : matched_ids) {
+        auto subj_it = output_subjects.find(sub_id);
+        if (subj_it == output_subjects.end()) continue;
+        frames.wire += "PUB ";
+        frames.wire += subj_it->second;
+        frames.wire += " ";
+        frames.wire += std::to_string(payload.size());
+        frames.wire += "\r\n";
+        frames.wire.append(payload.data(), payload.size());
+        frames.wire += "\r\n";
+        ++frames.count;
+    }
+    return frames;
+}
+
 worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
                          const attribute_schema& schema,
                          subscription_manager& sub_mgr,
@@ -184,21 +208,9 @@ void worker_pool::worker_loop(unsigned int worker_id) {
              backpressure_timeout]() mutable -> asio::awaitable<void> {
                 std::span<const char> pub_payload(payload_copy.data(), payload_copy.size());
                 try {
-                    std::string wire;
-                    std::size_t output_count = 0;
-                    for (uint64_t sub_id : matched_ids) {
-                        auto subj_it = snap_copy->output_subjects.find(sub_id);
-                        if (subj_it == snap_copy->output_subjects.end()) continue;
-                        wire += "PUB ";
-                        wire += subj_it->second;
-                        wire += " ";
-                        wire += std::to_string(pub_payload.size());
-                        wire += "\r\n";
-                        wire.append(pub_payload.data(), pub_payload.size());
-                        wire += "\r\n";
-                        ++output_count;
-                    }
-                    if (!wire.empty()) {
+                    auto frames = build_pub_frames(
+                        matched_ids, snap_copy->output_subjects, pub_payload);
+                    if (!frames.wire.empty()) {
                         if (conn->is_backpressure_active()) {
                             auto drain_status = co_await conn->wait_for_drain(
                                 backpressure_timeout);
@@ -211,13 +223,13 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                             }
                         }
                         auto write_status = co_await conn->write_raw(
-                            std::span<const char>(wire.data(), wire.size()));
+                            std::span<const char>(frames.wire.data(), frames.wire.size()));
                         if (write_status.failed()) {
                             counters->publish_failures.fetch_add(1, std::memory_order_relaxed);
                             log->warn("Failed to write matched publications: {}",
                                       write_status.error());
                         } else {
-                            counters->published.fetch_add(output_count,
+                            counters->published.fetch_add(frames.count,
                                                           std::memory_order_relaxed);
                         }
                     }

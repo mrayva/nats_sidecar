@@ -1,5 +1,6 @@
 #include "worker_pool.hpp"
 #include "fake_connection.hpp"
+#include "asio_test_helpers.hpp"
 #include <asio/io_context.hpp>
 #include <gtest/gtest.h>
 #include <spdlog/sinks/null_sink.h>
@@ -8,9 +9,10 @@
 #include <zerialize/protocols/msgpack.hpp>
 #include <atomic>
 #include <chrono>
-#include <thread>
 
 namespace {
+
+using sidecar_test::drive_until;
 
 auto worker_log() {
     return std::make_shared<spdlog::logger>(
@@ -35,23 +37,47 @@ std::vector<char> matching_payload(int value) {
                              reinterpret_cast<const char*>(buf.data()) + buf.size());
 }
 
-// The publish coroutine worker_loop() posts onto `ioc` only runs once
-// something drives ioc's event loop; the worker thread races that post
-// against this driving loop, so poll with a bounded deadline instead of a
-// single run_for() (which could return immediately if nothing is queued yet).
-template <typename Pred>
-bool drive_until(asio::io_context& ioc, Pred&& done, std::chrono::milliseconds timeout) {
-    auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (done()) return true;
-        ioc.restart();
-        ioc.run_for(std::chrono::milliseconds(10));
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    return done();
+} // namespace
+
+TEST(worker_pool, build_pub_frames_exact_wire_for_single_subscriber) {
+    std::string payload = "hello";
+    auto frames = sidecar::build_pub_frames(
+        {1}, {{1, "output.1"}}, std::span<const char>(payload.data(), payload.size()));
+
+    EXPECT_EQ(frames.count, 1u);
+    EXPECT_EQ(frames.wire, "PUB output.1 5\r\nhello\r\n");
 }
 
-} // namespace
+TEST(worker_pool, build_pub_frames_exact_wire_for_multiple_subscribers) {
+    std::string payload = "hi";
+    auto frames = sidecar::build_pub_frames(
+        {1, 2}, {{1, "output.1"}, {2, "output.2"}},
+        std::span<const char>(payload.data(), payload.size()));
+
+    EXPECT_EQ(frames.count, 2u);
+    EXPECT_EQ(frames.wire, "PUB output.1 2\r\nhi\r\nPUB output.2 2\r\nhi\r\n");
+}
+
+TEST(worker_pool, build_pub_frames_skips_ids_missing_from_output_subjects) {
+    std::string payload = "x";
+    // id 2 matched but has no known output subject (e.g. removed between
+    // search and publish) - it must be silently skipped, not crash or emit
+    // a malformed frame.
+    auto frames = sidecar::build_pub_frames(
+        {1, 2}, {{1, "output.1"}}, std::span<const char>(payload.data(), payload.size()));
+
+    EXPECT_EQ(frames.count, 1u);
+    EXPECT_EQ(frames.wire, "PUB output.1 1\r\nx\r\n");
+}
+
+TEST(worker_pool, build_pub_frames_empty_when_no_ids_match) {
+    std::string payload = "x";
+    auto frames = sidecar::build_pub_frames(
+        {}, {}, std::span<const char>(payload.data(), payload.size()));
+
+    EXPECT_EQ(frames.count, 0u);
+    EXPECT_TRUE(frames.wire.empty());
+}
 
 TEST(worker_pool, rejects_payload_larger_than_byte_limit) {
     asio::io_context ioc(1);

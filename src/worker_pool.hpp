@@ -12,10 +12,26 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace sidecar {
+
+// One NATS PUB frame per id in `matched_ids` that has an entry in
+// `output_subjects` (ids missing from the map - e.g. a subscription removed
+// between search and publish - are silently skipped), all sharing the same
+// payload. Exposed as a free function (rather than kept inline in the
+// publish coroutine) so its exact wire output is directly testable.
+struct pub_frames {
+    std::string wire;
+    std::size_t count = 0;
+};
+pub_frames build_pub_frames(const std::vector<uint64_t>& matched_ids,
+                            const std::unordered_map<uint64_t, std::string>& output_subjects,
+                            std::span<const char> payload);
 
 class worker_pool {
 public:
