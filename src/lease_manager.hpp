@@ -5,6 +5,7 @@
 #include <asio/awaitable.hpp>
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <chrono>
@@ -61,6 +62,12 @@ private:
     friend struct lease_manager_test_access;
 
     asio::awaitable<bool> ensure_bucket();
+    // ensure_bucket()'s two branches, factored out for readability: check an
+    // existing bucket's config against what this process expects, or create
+    // a missing one from scratch.
+    bool validate_existing_bucket(const nlohmann::json& info) const;
+    asio::awaitable<bool> create_bucket(const std::string& stream_name,
+                                        std::chrono::milliseconds timeout);
     asio::awaitable<bool> restore_leases();
     asio::awaitable<void> cleanup_loop();
     // One reconciliation pass over m_expirations, factored out of

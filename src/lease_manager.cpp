@@ -64,64 +64,69 @@ bool lease_manager::parse_lease_key(const std::string& key,
 }
 
 asio::awaitable<bool> lease_manager::ensure_bucket() {
-    using nlohmann::json;
     constexpr auto timeout = std::chrono::seconds(5);
 
     const std::string stream_name = "KV_" + m_bucket;
     const std::string info_subject = "$JS.API.STREAM.INFO." + stream_name;
-    const std::string request_body = "{}";
-    auto [info_reply, info_status] = co_await request_plain(
-        info_subject, request_body, timeout);
+    auto [info_reply, info_status] = co_await request_plain(info_subject, "{}", timeout);
 
-    bool missing = false;
-    json info;
     if (info_status.failed()) {
         m_log->error("lease_manager: failed to inspect KV bucket '{}': {}",
                      m_bucket, info_status.error());
         co_return false;
     }
 
+    nlohmann::json info;
+    bool missing = false;
     try {
-        info = json::parse(std::string_view(info_reply.payload.data(), info_reply.payload.size()));
+        info = nlohmann::json::parse(
+            std::string_view(info_reply.payload.data(), info_reply.payload.size()));
         missing = info.contains("error") && info["error"].value("code", 0) == 404;
     } catch (const std::exception& e) {
         m_log->error("lease_manager: invalid stream info response: {}", e.what());
         co_return false;
     }
 
+    if (!missing) co_return validate_existing_bucket(info);
+    co_return co_await create_bucket(stream_name, timeout);
+}
+
+bool lease_manager::validate_existing_bucket(const nlohmann::json& info) const {
+    if (info.contains("error") || !info.contains("config")) {
+        auto description = info.contains("error")
+            ? info["error"].value("description", "stream info failed")
+            : std::string("missing stream config");
+        m_log->error("lease_manager: failed to inspect bucket '{}': {}", m_bucket, description);
+        return false;
+    }
+
     const uint64_t expected_max_age = static_cast<uint64_t>(m_ttl_seconds) * 1'000'000'000ULL;
     const std::string expected_subject = "$KV." + m_bucket + ".>";
 
-    if (!missing) {
-        if (info.contains("error") || !info.contains("config")) {
-            auto description = info.contains("error")
-                ? info["error"].value("description", "stream info failed")
-                : std::string("missing stream config");
-            m_log->error("lease_manager: failed to inspect bucket '{}': {}",
-                         m_bucket, description);
-            co_return false;
-        }
-
-        const auto& cfg = info["config"];
-        const auto max_age = cfg.value("max_age", uint64_t{0});
-        const auto history = cfg.value("max_msgs_per_subject", int64_t{0});
-        const auto subjects = cfg.value("subjects", std::vector<std::string>{});
-        const bool subject_ok = std::find(subjects.begin(), subjects.end(),
-                                          expected_subject) != subjects.end();
-        if (max_age != expected_max_age || history != 1 || !subject_ok) {
-            m_log->error(
-                "lease_manager: bucket '{}' configuration mismatch "
-                "(expected ttl={}s, history=1, subject='{}')",
-                m_bucket, m_ttl_seconds, expected_subject);
-            co_return false;
-        }
-
-        m_log->info("lease_manager: validated KV bucket '{}' (TTL={}s)",
-                    m_bucket, m_ttl_seconds);
-        co_return true;
+    const auto& cfg = info["config"];
+    const auto max_age = cfg.value("max_age", uint64_t{0});
+    const auto history = cfg.value("max_msgs_per_subject", int64_t{0});
+    const auto subjects = cfg.value("subjects", std::vector<std::string>{});
+    const bool subject_ok = std::find(subjects.begin(), subjects.end(),
+                                      expected_subject) != subjects.end();
+    if (max_age != expected_max_age || history != 1 || !subject_ok) {
+        m_log->error(
+            "lease_manager: bucket '{}' configuration mismatch "
+            "(expected ttl={}s, history=1, subject='{}')",
+            m_bucket, m_ttl_seconds, expected_subject);
+        return false;
     }
 
-    json stream_config = {
+    m_log->info("lease_manager: validated KV bucket '{}' (TTL={}s)", m_bucket, m_ttl_seconds);
+    return true;
+}
+
+asio::awaitable<bool> lease_manager::create_bucket(const std::string& stream_name,
+                                                    std::chrono::milliseconds timeout) {
+    const uint64_t expected_max_age = static_cast<uint64_t>(m_ttl_seconds) * 1'000'000'000ULL;
+    const std::string expected_subject = "$KV." + m_bucket + ".>";
+
+    nlohmann::json stream_config = {
         {"name", stream_name},
         {"subjects", {expected_subject}},
         {"retention", "limits"},
@@ -137,9 +142,8 @@ asio::awaitable<bool> lease_manager::ensure_bucket() {
         {"deny_delete", true},
         {"allow_direct", true}
     };
-    const std::string create_payload = stream_config.dump();
     auto [create_reply, create_status] = co_await request_plain(
-        "$JS.API.STREAM.CREATE." + stream_name, create_payload, timeout);
+        "$JS.API.STREAM.CREATE." + stream_name, stream_config.dump(), timeout);
     if (create_status.failed()) {
         m_log->error("lease_manager: failed to create KV bucket '{}': {}",
                      m_bucket, create_status.error());
@@ -147,7 +151,7 @@ asio::awaitable<bool> lease_manager::ensure_bucket() {
     }
 
     try {
-        auto response = json::parse(
+        auto response = nlohmann::json::parse(
             std::string_view(create_reply.payload.data(), create_reply.payload.size()));
         if (response.contains("error")) {
             m_log->error("lease_manager: failed to create KV bucket '{}': {}",
