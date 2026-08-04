@@ -25,6 +25,8 @@ public:
     std::function<asio::awaitable<std::pair<nats_asio::message, nats_asio::status>>(
         std::string_view, std::span<const char>, std::chrono::milliseconds)>
         on_request;
+    std::function<asio::awaitable<nats_asio::status>(std::string_view, std::span<const char>)>
+        on_publish;
 
     // --- in-memory KV store backing kv_put/kv_get/kv_delete/kv_keys ---
     struct kv_record {
@@ -35,6 +37,12 @@ public:
     };
     std::map<std::string, kv_record> kv_store;  // key: "<bucket>/<key>"
     uint64_t next_revision = 1;
+
+    // Predicates letting a test force kv_put/kv_delete to fail for a
+    // specific key without touching kv_store, e.g. to simulate a lease
+    // persist/delete failure.
+    std::function<bool(std::string_view bucket, std::string_view key)> fail_kv_put;
+    std::function<bool(std::string_view bucket, std::string_view key)> fail_kv_delete;
 
     static std::string kv_key(std::string_view bucket, std::string_view key) {
         return std::string(bucket) + "/" + std::string(key);
@@ -56,7 +64,9 @@ public:
     void reset_circuit_breaker() noexcept override {}
 
     asio::awaitable<nats_asio::status> publish(
-        std::string_view, std::span<const char>, nats_asio::optional<std::string_view>) override {
+        std::string_view subject, std::span<const char> payload,
+        nats_asio::optional<std::string_view>) override {
+        if (on_publish) co_return co_await on_publish(subject, payload);
         co_return nats_asio::status{};
     }
     asio::awaitable<nats_asio::status> publish(
@@ -162,6 +172,10 @@ public:
     asio::awaitable<std::pair<uint64_t, nats_asio::status>> kv_put(
         std::string_view bucket, std::string_view key, std::span<const char> value,
         std::chrono::milliseconds) override {
+        if (fail_kv_put && fail_kv_put(bucket, key)) {
+            co_return std::pair<uint64_t, nats_asio::status>{
+                0, nats_asio::status(nats_asio::error_code::operation_failed)};
+        }
         kv_record rec;
         rec.value.assign(value.begin(), value.end());
         rec.revision = next_revision++;
@@ -191,6 +205,10 @@ public:
 
     asio::awaitable<std::pair<uint64_t, nats_asio::status>> kv_delete(
         std::string_view bucket, std::string_view key, std::chrono::milliseconds) override {
+        if (fail_kv_delete && fail_kv_delete(bucket, key)) {
+            co_return std::pair<uint64_t, nats_asio::status>{
+                0, nats_asio::status(nats_asio::error_code::operation_failed)};
+        }
         auto it = kv_store.find(kv_key(bucket, key));
         if (it == kv_store.end()) {
             co_return std::pair<uint64_t, nats_asio::status>{

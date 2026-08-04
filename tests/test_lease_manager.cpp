@@ -4,9 +4,11 @@
 #include <asio/co_spawn.hpp>
 #include <asio/io_context.hpp>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/sinks/null_sink.h>
 #include <chrono>
 #include <optional>
+#include <string>
 
 namespace sidecar {
 
@@ -65,6 +67,13 @@ void run_void_to_completion(asio::io_context& ioc, asio::awaitable<void> awaitab
         ioc.run_for(std::chrono::milliseconds(20));
     }
     ASSERT_TRUE(done);
+}
+
+nats_asio::message json_message(const nlohmann::json& body) {
+    nats_asio::message msg;
+    auto s = body.dump();
+    msg.payload.assign(s.begin(), s.end());
+    return msg;
 }
 
 } // namespace
@@ -139,4 +148,73 @@ TEST(lease_manager, reconcile_keeps_subscription_when_lease_still_present) {
     run_void_to_completion(ioc, sidecar::lease_manager_test_access::reconcile_once(lm));
 
     EXPECT_EQ(sub_mgr.active_count(), 1u);
+}
+
+// --- start() / ensure_bucket() ---
+
+TEST(lease_manager, start_creates_bucket_when_stream_is_missing) {
+    asio::io_context ioc(1);
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::subscription_manager sub_mgr(sample_attributes(), "test.output", make_log());
+    sidecar::lease_manager lm(ioc, conn, sub_mgr, "test-leases", 60, 60, make_log());
+
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.KV_test-leases") {
+            co_return std::pair{json_message({{"error", {{"code", 404}}}}), nats_asio::status{}};
+        }
+        if (subject == "$JS.API.STREAM.CREATE.KV_test-leases") {
+            co_return std::pair{json_message(nlohmann::json::object()), nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_TRUE(run_to_completion<bool>(ioc, lm.start()));
+}
+
+TEST(lease_manager, start_accepts_existing_bucket_with_matching_config) {
+    asio::io_context ioc(1);
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::subscription_manager sub_mgr(sample_attributes(), "test.output", make_log());
+    sidecar::lease_manager lm(ioc, conn, sub_mgr, "test-leases", /*ttl=*/60, 60, make_log());
+
+    const uint64_t expected_max_age = 60ULL * 1'000'000'000ULL;  // ttl_seconds -> ns
+    conn->on_request = [expected_max_age](
+                           std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.KV_test-leases") {
+            co_return std::pair{
+                json_message({{"config", {{"max_age", expected_max_age},
+                                          {"max_msgs_per_subject", 1},
+                                          {"subjects", {"$KV.test-leases.>"}}}}}),
+                nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_TRUE(run_to_completion<bool>(ioc, lm.start()));
+}
+
+TEST(lease_manager, start_refuses_existing_bucket_with_mismatched_ttl) {
+    asio::io_context ioc(1);
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::subscription_manager sub_mgr(sample_attributes(), "test.output", make_log());
+    sidecar::lease_manager lm(ioc, conn, sub_mgr, "test-leases", /*ttl=*/60, 60, make_log());
+
+    // Bucket exists, but its max_age (a prior, different TTL) doesn't match
+    // this process's configured lease_ttl_seconds - startup must refuse
+    // rather than silently operating against a mismatched bucket.
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.KV_test-leases") {
+            co_return std::pair{
+                json_message({{"config", {{"max_age", 1},
+                                          {"max_msgs_per_subject", 1},
+                                          {"subjects", {"$KV.test-leases.>"}}}}}),
+                nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_FALSE(run_to_completion<bool>(ioc, lm.start()));
 }
