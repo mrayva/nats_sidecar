@@ -59,6 +59,19 @@ public:
     stats get_stats() const;
 
 private:
+    // Published/publish_failures/publish_inflight are touched from inside the
+    // publish coroutine posted onto m_ioc via asio::co_spawn(..., detached).
+    // That coroutine can outlive any particular worker_pool instance (e.g. if
+    // it's still suspended when the pool is destroyed), so it captures a
+    // shared_ptr to this block by value rather than references into the pool
+    // itself - a dangling reference there would be a use-after-free the type
+    // system can't catch.
+    struct publish_counters {
+        std::atomic<uint64_t> published{0};
+        std::atomic<uint64_t> publish_failures{0};
+        std::atomic<std::size_t> publish_inflight{0};
+    };
+
     void worker_loop(unsigned int worker_id);
 
     asio::io_context& m_ioc;
@@ -82,16 +95,14 @@ private:
     std::mutex m_enqueue_mutex;
     std::atomic<std::size_t> m_queued_messages{0};
     std::atomic<std::size_t> m_queued_bytes{0};
-    std::atomic<std::size_t> m_publish_inflight{0};
+    std::shared_ptr<publish_counters> m_publish_counters = std::make_shared<publish_counters>();
 
     // Aggregate stats (relaxed atomics)
     std::atomic<uint64_t> m_processed{0};
     std::atomic<uint64_t> m_matched{0};
-    std::atomic<uint64_t> m_published{0};
     std::atomic<uint64_t> m_match_failures{0};
     std::atomic<uint64_t> m_input_dropped{0};
     std::atomic<uint64_t> m_publish_tasks_dropped{0};
-    std::atomic<uint64_t> m_publish_failures{0};
 };
 
 } // namespace sidecar

@@ -84,14 +84,14 @@ worker_pool::stats worker_pool::get_stats() const {
     return {
         m_processed.load(std::memory_order_relaxed),
         m_matched.load(std::memory_order_relaxed),
-        m_published.load(std::memory_order_relaxed),
+        m_publish_counters->published.load(std::memory_order_relaxed),
         m_match_failures.load(std::memory_order_relaxed),
         m_input_dropped.load(std::memory_order_relaxed),
         m_publish_tasks_dropped.load(std::memory_order_relaxed),
-        m_publish_failures.load(std::memory_order_relaxed),
+        m_publish_counters->publish_failures.load(std::memory_order_relaxed),
         m_queued_messages.load(std::memory_order_relaxed),
         m_queued_bytes.load(std::memory_order_relaxed),
-        m_publish_inflight.load(std::memory_order_relaxed)
+        m_publish_counters->publish_inflight.load(std::memory_order_relaxed)
     };
 }
 
@@ -99,7 +99,7 @@ asio::awaitable<bool> worker_pool::wait_for_publications(
     std::chrono::milliseconds timeout) {
     asio::steady_timer timer(co_await asio::this_coro::executor);
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (m_publish_inflight.load(std::memory_order_acquire) != 0) {
+    while (m_publish_counters->publish_inflight.load(std::memory_order_acquire) != 0) {
         if (std::chrono::steady_clock::now() >= deadline) co_return false;
         timer.expires_after(std::chrono::milliseconds(10));
         std::error_code ec;
@@ -151,24 +151,26 @@ void worker_pool::worker_loop(unsigned int worker_id) {
 
         m_matched.fetch_add(1, std::memory_order_relaxed);
 
-        const auto previous_inflight = m_publish_inflight.fetch_add(
+        const auto previous_inflight = m_publish_counters->publish_inflight.fetch_add(
             1, std::memory_order_acq_rel);
         if (previous_inflight >= m_publish_max_inflight) {
-            m_publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
+            m_publish_counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
             m_publish_tasks_dropped.fetch_add(1, std::memory_order_relaxed);
             payload.clear();
             continue;
         }
 
-        // Capture what we need for the publish coroutine
+        // Capture what we need for the publish coroutine. counters is a
+        // shared_ptr copy (not a reference to this worker_pool) so the
+        // coroutine - which asio::co_spawn detaches onto m_ioc and which may
+        // still be suspended after this worker_pool is destroyed - keeps its
+        // target alive for as long as it needs it.
         auto matched_ids = std::move(*matches);
         auto payload_copy = std::move(payload);
         auto snap_copy = std::move(snap);
         auto conn = m_conn;
         auto log = m_log;
-        auto& published_counter = m_published;
-        auto& failure_counter = m_publish_failures;
-        auto& inflight_counter = m_publish_inflight;
+        auto counters = m_publish_counters;
         auto backpressure_timeout = m_publish_backpressure_timeout;
 
         // Post publish work to the ASIO I/O thread
@@ -178,9 +180,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
              snap_copy = std::move(snap_copy),
              conn = std::move(conn),
              log,
-             &published_counter,
-             &failure_counter,
-             &inflight_counter,
+             counters,
              backpressure_timeout]() mutable -> asio::awaitable<void> {
                 std::span<const char> pub_payload(payload_copy.data(), payload_copy.size());
                 try {
@@ -203,29 +203,29 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                             auto drain_status = co_await conn->wait_for_drain(
                                 backpressure_timeout);
                             if (drain_status.failed()) {
-                                failure_counter.fetch_add(1, std::memory_order_relaxed);
+                                counters->publish_failures.fetch_add(1, std::memory_order_relaxed);
                                 log->warn("Output backpressure wait failed: {}",
                                           drain_status.error());
-                                inflight_counter.fetch_sub(1, std::memory_order_acq_rel);
+                                counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
                                 co_return;
                             }
                         }
                         auto write_status = co_await conn->write_raw(
                             std::span<const char>(wire.data(), wire.size()));
                         if (write_status.failed()) {
-                            failure_counter.fetch_add(1, std::memory_order_relaxed);
+                            counters->publish_failures.fetch_add(1, std::memory_order_relaxed);
                             log->warn("Failed to write matched publications: {}",
                                       write_status.error());
                         } else {
-                            published_counter.fetch_add(output_count,
-                                                        std::memory_order_relaxed);
+                            counters->published.fetch_add(output_count,
+                                                          std::memory_order_relaxed);
                         }
                     }
                 } catch (const std::exception& e) {
-                    failure_counter.fetch_add(1, std::memory_order_relaxed);
+                    counters->publish_failures.fetch_add(1, std::memory_order_relaxed);
                     log->error("Publication task failed: {}", e.what());
                 }
-                inflight_counter.fetch_sub(1, std::memory_order_acq_rel);
+                counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
             },
             asio::detached
         );
