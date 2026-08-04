@@ -15,6 +15,8 @@
 
 namespace sidecar {
 
+struct lease_manager_test_access;
+
 // Lease key format: <subscription-id>.<client-id>. The JSON value contains the
 // complete subscription record, and NATS KV max_age enforces its TTL. Periodic
 // reconciliation removes subscriptions whose records have expired.
@@ -56,9 +58,15 @@ public:
                                 std::string& client_id);
 
 private:
+    friend struct lease_manager_test_access;
+
     asio::awaitable<bool> ensure_bucket();
     asio::awaitable<bool> restore_leases();
     asio::awaitable<void> cleanup_loop();
+    // One reconciliation pass over m_expirations, factored out of
+    // cleanup_loop's timer-wait loop so it can be driven directly in tests
+    // without waiting on a real check-interval timer.
+    asio::awaitable<void> reconcile_once();
     asio::awaitable<std::pair<nats_asio::message, nats_asio::status>>
     request_plain(const std::string& subject, const std::string& payload,
                   std::chrono::milliseconds timeout);

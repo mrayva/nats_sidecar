@@ -262,6 +262,36 @@ asio::awaitable<bool> lease_manager::restore_leases() {
     co_return true;
 }
 
+asio::awaitable<void> lease_manager::reconcile_once() {
+    std::vector<std::string> keys;
+    keys.reserve(m_expirations.size());
+    for (const auto& [key, expiry] : m_expirations) keys.push_back(key);
+
+    for (const auto& key : keys) {
+        auto [entry, status] = co_await get_lease(key);
+        if (!status.failed()) {
+            const auto created = entry.created == std::chrono::system_clock::time_point{}
+                ? std::chrono::system_clock::now() : entry.created;
+            m_expirations[key] = created + std::chrono::seconds(m_ttl_seconds);
+            continue;
+        }
+        if (status.code() != nats_asio::error_code::key_not_found) {
+            m_log->warn("lease_manager: failed to reconcile lease '{}': {}",
+                        key, status.error());
+            continue;
+        }
+
+        uint64_t subscription_id = 0;
+        std::string client_id;
+        if (parse_lease_key(key, subscription_id, client_id)) {
+            m_log->info("lease_manager: lease expired/deleted for subscription {}, client '{}'",
+                        subscription_id, client_id);
+            m_sub_mgr.remove_lease(subscription_id, client_id);
+        }
+        m_expirations.erase(key);
+    }
+}
+
 asio::awaitable<void> lease_manager::cleanup_loop() {
     while (!m_stopping.load(std::memory_order_acquire)) {
         m_cleanup_timer->expires_after(
@@ -278,33 +308,7 @@ asio::awaitable<void> lease_manager::cleanup_loop() {
             continue;
         }
 
-        std::vector<std::string> keys;
-        keys.reserve(m_expirations.size());
-        for (const auto& [key, expiry] : m_expirations) keys.push_back(key);
-
-        for (const auto& key : keys) {
-            auto [entry, status] = co_await get_lease(key);
-            if (!status.failed()) {
-                const auto created = entry.created == std::chrono::system_clock::time_point{}
-                    ? std::chrono::system_clock::now() : entry.created;
-                m_expirations[key] = created + std::chrono::seconds(m_ttl_seconds);
-                continue;
-            }
-            if (status.code() != nats_asio::error_code::key_not_found) {
-                m_log->warn("lease_manager: failed to reconcile lease '{}': {}",
-                            key, status.error());
-                continue;
-            }
-
-            uint64_t subscription_id = 0;
-            std::string client_id;
-            if (parse_lease_key(key, subscription_id, client_id)) {
-                m_log->info("lease_manager: lease expired/deleted for subscription {}, client '{}'",
-                            subscription_id, client_id);
-                m_sub_mgr.remove_lease(subscription_id, client_id);
-            }
-            m_expirations.erase(key);
-        }
+        co_await reconcile_once();
     }
 }
 
