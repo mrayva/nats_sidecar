@@ -124,12 +124,12 @@ bool subscription_manager::restore(uint64_t subscription_id,
     return true;
 }
 
-bool subscription_manager::remove_lease(uint64_t subscription_id,
-                                        const std::string& client_id) {
+lease_removal subscription_manager::remove_lease(uint64_t subscription_id,
+                                                 const std::string& client_id) {
     std::lock_guard<std::mutex> lock(m_write_mutex);
 
     auto it = m_subscriptions.find(subscription_id);
-    if (it == m_subscriptions.end()) return false;
+    if (it == m_subscriptions.end()) return lease_removal::not_found;
 
     it->second.lease_holders.erase(client_id);
 
@@ -140,12 +140,12 @@ bool subscription_manager::remove_lease(uint64_t subscription_id,
                    subscription_id, it->second.expression);
         m_subscriptions.erase(it);
         publish_snapshot();
-        return true;
+        return lease_removal::fully_removed;
     }
 
     m_log->debug("Removed lease for client '{}' on subscription {}, {} leases remain",
                 client_id, subscription_id, it->second.lease_holders.size());
-    return false;
+    return lease_removal::still_active;
 }
 
 bool subscription_manager::remove_subscription(uint64_t subscription_id) {

@@ -244,14 +244,11 @@ asio::awaitable<void> sidecar_engine::on_unsubscribe_request(
             throw std::runtime_error("failed to delete lease");
         }
 
-        bool fully_removed = m_sub_mgr.remove_lease(sub_id, client_id);
-        if (!fully_removed && !m_sub_mgr.get_subscription(sub_id)) {
-            // remove_lease() returns false both when the subscription still has
-            // other lease holders and when subscription_id doesn't exist at all
-            // (e.g. already removed by lease_manager's reconciliation loop
-            // expiring it concurrently). Disambiguate the latter case here.
-            fully_removed = true;
-        }
+        // not_found also reports removed=true: it means the subscription is
+        // already gone (e.g. lease_manager's reconciliation loop expired it
+        // concurrently), which is the outcome the caller asked for.
+        auto removal = m_sub_mgr.remove_lease(sub_id, client_id);
+        bool fully_removed = removal != lease_removal::still_active;
 
         reply_str = nlohmann::json({{"id", sub_id}, {"removed", fully_removed}}).dump();
 

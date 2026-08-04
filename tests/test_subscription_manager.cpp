@@ -60,8 +60,8 @@ TEST(subscription_manager, remove_lease_partial) {
     mgr.subscribe("temperature > 30.0", "client-2");
 
     // Remove one lease - subscription should remain
-    bool fully_removed = mgr.remove_lease(id, "client-1");
-    EXPECT_FALSE(fully_removed);
+    auto removal = mgr.remove_lease(id, "client-1");
+    EXPECT_EQ(removal, sidecar::lease_removal::still_active);
     EXPECT_EQ(mgr.active_count(), 1u);
 }
 
@@ -70,9 +70,16 @@ TEST(subscription_manager, remove_lease_complete) {
 
     uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
 
-    bool fully_removed = mgr.remove_lease(id, "client-1");
-    EXPECT_TRUE(fully_removed);
+    auto removal = mgr.remove_lease(id, "client-1");
+    EXPECT_EQ(removal, sidecar::lease_removal::fully_removed);
     EXPECT_EQ(mgr.active_count(), 0u);
+}
+
+TEST(subscription_manager, remove_lease_not_found) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
+
+    auto removal = mgr.remove_lease(999, "client-1");
+    EXPECT_EQ(removal, sidecar::lease_removal::not_found);
 }
 
 TEST(subscription_manager, find_by_expression) {

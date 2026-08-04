@@ -16,6 +16,13 @@
 
 namespace sidecar {
 
+// Result of removing a single client's lease from a subscription.
+enum class lease_removal {
+    not_found,      // subscription_id doesn't exist (already gone)
+    still_active,   // other clients still hold a lease on it
+    fully_removed   // this was the last lease holder; subscription is gone
+};
+
 struct subscription_info {
     uint64_t id;
     std::string expression;
@@ -42,8 +49,7 @@ public:
                  const std::string& client_id);
 
     // Remove a specific client's lease from a subscription.
-    // Returns true if the subscription was fully removed (no more lease holders).
-    bool remove_lease(uint64_t subscription_id, const std::string& client_id);
+    lease_removal remove_lease(uint64_t subscription_id, const std::string& client_id);
 
     // Remove all leases for a subscription. Returns true if it existed.
     bool remove_subscription(uint64_t subscription_id);
