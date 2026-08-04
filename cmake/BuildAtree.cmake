@@ -8,8 +8,9 @@ include(FetchContent)
 FetchContent_Declare(
     atree
     GIT_REPOSITORY https://github.com/mrayva/a-tree.git
-    GIT_TAG        bb2270f16ef70a30b1cbb378541b1e431e90039e
+    GIT_TAG        0f8da723a0b7275520f772658a41039bfe8802bb
     GIT_SHALLOW    TRUE
+    SYSTEM
 )
 FetchContent_MakeAvailable(atree)
 
@@ -44,6 +45,7 @@ add_library(atree_ffi STATIC IMPORTED GLOBAL)
 set_target_properties(atree_ffi PROPERTIES
     IMPORTED_LOCATION ${ATREE_STATIC_LIB}
     INTERFACE_INCLUDE_DIRECTORIES ${ATREE_FFI_DIR}
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${ATREE_FFI_DIR}
 )
 add_dependencies(atree_ffi atree_ffi_build)
 

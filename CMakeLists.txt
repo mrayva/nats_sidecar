@@ -47,6 +47,14 @@ elseif(NOT SIDECAR_SANITIZER STREQUAL "none")
 endif()
 
 # --- vcpkg dependencies ---
+# asio/cxxopts/fmt/nlohmann_json/spdlog/yaml-cpp/Threads are linked directly
+# by sidecar_lib below. simdjson/OpenSSL/ZLIB/libzip/zstd are not used by our
+# own code - they satisfy nats_asio's own vcpkg.json (it depends on them
+# internally, e.g. OpenSSL for TLS); since nats_asio is pulled in via
+# FetchContent rather than vcpkg's registry, vcpkg only resolves the
+# top-level manifest, so these have to stay declared here for nats_asio's
+# find_package() calls to succeed. Same reasoning covers gtl/magic-enum/
+# stringzilla/concurrentqueue/gtest in vcpkg.json.
 find_package(asio CONFIG REQUIRED)
 find_package(cxxopts CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
@@ -60,13 +68,19 @@ find_package(libzip CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
+# Warnings for first-party targets only (sidecar_lib/nats_sidecar/sidecar_test).
+# FetchContent'd deps are marked SYSTEM above/below so their headers don't
+# trigger these when pulled into our translation units.
+set(SIDECAR_WARNING_FLAGS -Wall -Wextra -Wpedantic)
+
 # --- FetchContent: nats_asio (header-only, brings zerialize) ---
 include(FetchContent)
 FetchContent_Declare(
     nats_asio
     GIT_REPOSITORY https://github.com/mrayva/nats_asio.git
-    GIT_TAG        36095e5c2ad5488b460d60e424f37be6404453ab
+    GIT_TAG        5bcb3f849ecb198b2eafbcbb85337e9526571359
     GIT_SHALLOW    TRUE
+    SYSTEM
 )
 # Disable nats_asio's own samples/tests - we only need the library
 set(NATS_ASIO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -77,11 +91,19 @@ FetchContent_MakeAvailable(nats_asio)
 # zerialize is used directly by the event bridge and schema generator. Newer
 # nats_asio releases intentionally expose it only when their samples are built,
 # so keep it as an explicit, independently pinned dependency here.
+#
+# Using mrayva/zerialize (fork of colinator/zerialize) rather than upstream,
+# matching what nats_asio itself now pins: fixes OOB reads in the msgpack and
+# CBOR parsers and the Flex string/key writer, null-pointer memcpy/memcmp UB
+# in zera, and an exception-safety leak in json::RootSerializer. The msgpack/
+# CBOR/Flex/Zera deserializers are exactly what deserialize_and_match() runs
+# on every untrusted inbound NATS payload.
 set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
 FetchContent_Declare(
     zerialize
-    GIT_REPOSITORY https://github.com/colinator/zerialize.git
-    GIT_TAG        aedaaf2e585dbc0a7f239bca33fd2a6595ed47df
+    GIT_REPOSITORY https://github.com/mrayva/zerialize.git
+    GIT_TAG        32d9d9447c9ce725ba0ea9d1a5d25005066a0cd8
+    SYSTEM
 )
 FetchContent_MakeAvailable(zerialize)
 
@@ -113,15 +135,18 @@ target_link_libraries(sidecar_lib
         fmt::fmt
         asio::asio
         cxxopts::cxxopts
+        nlohmann_json::nlohmann_json
         Threads::Threads
         sidecar_sanitizers
 )
 
 target_compile_definitions(sidecar_lib PUBLIC FLATBUFFERS_LOCALE_INDEPENDENT=0)
+target_compile_options(sidecar_lib PRIVATE ${SIDECAR_WARNING_FLAGS})
 
 # --- main executable ---
 add_executable(nats_sidecar src/main.cpp)
 target_link_libraries(nats_sidecar PRIVATE sidecar_lib)
+target_compile_options(nats_sidecar PRIVATE ${SIDECAR_WARNING_FLAGS})
 
 set_target_properties(nats_sidecar PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
@@ -133,7 +158,9 @@ if(SIDECAR_BUILD_TESTS)
     find_package(GTest CONFIG REQUIRED)
 
     add_executable(sidecar_test
+        tests/test_config_loading.cpp
         tests/test_event_bridge.cpp
+        tests/test_lease_manager.cpp
         tests/test_sidecar_lifecycle.cpp
         tests/test_subscription_manager.cpp
         tests/test_worker_pool.cpp
@@ -143,6 +170,7 @@ if(SIDECAR_BUILD_TESTS)
             sidecar_lib
             GTest::gtest_main
     )
+    target_compile_options(sidecar_test PRIVATE ${SIDECAR_WARNING_FLAGS})
     set_target_properties(sidecar_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
     )
