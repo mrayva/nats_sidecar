@@ -5,7 +5,7 @@ nats_port: 4222
 
 # Input: core NATS subject carrying binary-encoded messages
 input_subject: "sensor.data"
-format: msgpack          # msgpack | cbor | flexbuffers | zera
+format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
 # input_queue_group: "sidecar-group"  # uncomment to load-balance across instances
 
 # Output: matched messages published to <output_prefix>.<BE-ID>

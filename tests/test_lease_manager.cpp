@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/sinks/null_sink.h>
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -47,6 +48,75 @@ nats_asio::message json_message(const nlohmann::json& body) {
 }
 
 } // namespace
+
+// --- fake_connection::kv_keys(bucket, pattern, timeout) ---
+//
+// Exercises the wildcard matcher added alongside iconnection's new
+// pattern-aware kv_keys() overload - nothing in production code calls the
+// pattern form yet (lease_manager only ever calls the plain kv_keys(bucket,
+// timeout)), so without these it would be untested, hand-written logic.
+
+TEST(fake_connection_kv_keys, literal_pattern_matches_only_that_key) {
+    asio::io_context ioc(1);
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "alice.1")] = {};
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "bob.1")] = {};
+
+    auto [keys, status] = run_to_completion<
+        std::pair<std::vector<std::string>, nats_asio::status>>(
+        ioc, conn->kv_keys("b", "alice.1", std::chrono::seconds(5)));
+
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(keys, std::vector<std::string>{"alice.1"});
+}
+
+TEST(fake_connection_kv_keys, star_matches_exactly_one_token) {
+    asio::io_context ioc(1);
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "alice.1")] = {};
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "alice.2")] = {};
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "alice.1.extra")] = {};
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "bob.1")] = {};
+
+    auto [keys, status] = run_to_completion<
+        std::pair<std::vector<std::string>, nats_asio::status>>(
+        ioc, conn->kv_keys("b", "alice.*", std::chrono::seconds(5)));
+
+    ASSERT_TRUE(status.ok());
+    std::sort(keys.begin(), keys.end());
+    EXPECT_EQ(keys, (std::vector<std::string>{"alice.1", "alice.2"}));
+}
+
+TEST(fake_connection_kv_keys, gt_matches_remaining_tokens) {
+    asio::io_context ioc(1);
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "alice.1")] = {};
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "alice.1.extra")] = {};
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "bob.1")] = {};
+
+    auto [keys, status] = run_to_completion<
+        std::pair<std::vector<std::string>, nats_asio::status>>(
+        ioc, conn->kv_keys("b", "alice.>", std::chrono::seconds(5)));
+
+    ASSERT_TRUE(status.ok());
+    std::sort(keys.begin(), keys.end());
+    EXPECT_EQ(keys, (std::vector<std::string>{"alice.1", "alice.1.extra"}));
+}
+
+TEST(fake_connection_kv_keys, excludes_deleted_entries_and_other_buckets) {
+    asio::io_context ioc(1);
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->kv_store[sidecar_test::fake_connection::kv_key("b", "alice.1")] =
+        {{}, 1, {}, nats_asio::kv_entry::operation::del};
+    conn->kv_store[sidecar_test::fake_connection::kv_key("other", "alice.1")] = {};
+
+    auto [keys, status] = run_to_completion<
+        std::pair<std::vector<std::string>, nats_asio::status>>(
+        ioc, conn->kv_keys("b", "alice.*", std::chrono::seconds(5)));
+
+    ASSERT_TRUE(status.ok());
+    EXPECT_TRUE(keys.empty());
+}
 
 TEST(lease_manager, persist_lease_stores_record_in_kv_store) {
     asio::io_context ioc(1);
