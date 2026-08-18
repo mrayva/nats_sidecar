@@ -5,7 +5,7 @@ Content-based filtering sidecar for NATS. Receives binary-encoded messages on a 
 ## Features
 
 - Boolean expression subscriptions (e.g. `temperature > 30.0 AND location = "warehouse"`)
-- Supports MessagePack, CBOR, FlexBuffers, and Zera binary formats
+- Supports MessagePack, CBOR, FlexBuffers, Zera, Ion, BSON, and BEVE binary formats
 - Multi-threaded worker pool for parallel message processing with RCU snapshot-based lock-free reads
 - Soft-state leases via NATS KV with automatic TTL-based cleanup
 - Expression deduplication across clients
@@ -70,7 +70,7 @@ All configuration parameters can be set via CLI flags. When a config file is als
 | `-a, --address HOST` | NATS server address |
 | `-p, --port PORT` | NATS server port |
 | `-i, --input-subject SUBJ` | Input NATS subject |
-| `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`) |
+| `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`) |
 | `--output-prefix PREFIX` | Output subject prefix (defaults to input subject) |
 | `--queue-group GROUP` | Input queue group for load balancing |
 | `--subscribe-subject SUBJ` | Subscription request subject |
@@ -108,7 +108,7 @@ nats_port: 4222
 
 # Input: NATS subject carrying binary-encoded messages
 input_subject: "sensor.data"
-format: msgpack          # msgpack | cbor | flexbuffers | zera
+format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
 
 # Output: matched messages published to <output_prefix>.<subscription_id>
 output_prefix: "sensor.filtered"
@@ -228,7 +228,7 @@ attributes:
     type: string_list
 ```
 
-The format defaults to `msgpack` if `-f` is not specified. Supported formats: `msgpack`, `cbor`, `flexbuffers`, `zera`.
+The format defaults to `msgpack` if `-f` is not specified. Supported formats: `msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`.
 
 For arrays, the generator peeks at the first element to distinguish `integer_list` from `string_list`. Null or unrecognizable fields default to `string` with a warning on stderr.
 

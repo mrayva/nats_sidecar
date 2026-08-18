@@ -30,6 +30,18 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
                 zerialize::Zera::Deserializer reader(bytes);
                 return match_message(tree, schema, reader, log);
             }
+            case binary_format::ion: {
+                zerialize::Ion::Deserializer reader(bytes);
+                return match_message(tree, schema, reader, log);
+            }
+            case binary_format::bson: {
+                zerialize::Bson::Deserializer reader(bytes);
+                return match_message(tree, schema, reader, log);
+            }
+            case binary_format::beve: {
+                zerialize::Beve::Deserializer reader(bytes);
+                return match_message(tree, schema, reader, log);
+            }
         }
     } catch (const std::exception& e) {
         if (log) log->debug("event_bridge: deserialization failed: {}", e.what());

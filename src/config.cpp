@@ -9,6 +9,9 @@ std::optional<binary_format> parse_format(const std::string& s) {
     if (s == "cbor")        return binary_format::cbor;
     if (s == "flexbuffers") return binary_format::flexbuffers;
     if (s == "zera")        return binary_format::zera;
+    if (s == "ion")         return binary_format::ion;
+    if (s == "bson")        return binary_format::bson;
+    if (s == "beve")        return binary_format::beve;
     return std::nullopt;
 }
 

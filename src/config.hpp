@@ -27,7 +27,10 @@ enum class binary_format {
     msgpack,
     cbor,
     flexbuffers,
-    zera
+    zera,
+    ion,
+    bson,
+    beve
 };
 
 struct config {

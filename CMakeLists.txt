@@ -96,9 +96,14 @@ FetchContent_MakeAvailable(nats_asio)
 # matching what nats_asio itself now pins: fixes OOB reads in the msgpack and
 # CBOR parsers and the Flex string/key writer, null-pointer memcpy/memcmp UB
 # in zera, and an exception-safety leak in json::RootSerializer. The msgpack/
-# CBOR/Flex/Zera deserializers are exactly what deserialize_and_match() runs
-# on every untrusted inbound NATS payload.
+# CBOR/Flex/Zera/Ion/BSON/BEVE deserializers are exactly what
+# deserialize_and_match() runs on every untrusted inbound NATS payload.
 set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
+# BEVE is gated behind this flag upstream (glaze, requires C++23) - now that
+# this project itself is C++23 (see CMAKE_CXX_STANDARD above), take it on
+# deliberately rather than leaving it excluded, same call nats_asio's own
+# CMakeLists.txt made for nats_tool's --format beve.
+set(ZERIALIZE_ENABLE_BEVE ON CACHE BOOL "Enable BEVE (via glaze) for the sidecar's --format" FORCE)
 FetchContent_Declare(
     zerialize
     GIT_REPOSITORY https://github.com/mrayva/zerialize.git

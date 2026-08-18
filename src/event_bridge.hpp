@@ -8,6 +8,9 @@
 #include <zerialize/protocols/cbor.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/zera.hpp>
+#include <zerialize/protocols/ion.hpp>
+#include <zerialize/protocols/bson.hpp>
+#include <zerialize/protocols/beve.hpp>
 #include <spdlog/spdlog.h>
 #include <span>
 #include <string>

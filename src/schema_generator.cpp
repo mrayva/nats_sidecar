@@ -6,6 +6,9 @@
 #include <zerialize/protocols/cbor.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/zera.hpp>
+#include <zerialize/protocols/ion.hpp>
+#include <zerialize/protocols/bson.hpp>
+#include <zerialize/protocols/beve.hpp>
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -105,6 +108,21 @@ void generate_schema(const std::string& path, binary_format format) {
         }
         case binary_format::zera: {
             zerialize::Zera::Deserializer reader(bytes);
+            print_schema(reader);
+            break;
+        }
+        case binary_format::ion: {
+            zerialize::Ion::Deserializer reader(bytes);
+            print_schema(reader);
+            break;
+        }
+        case binary_format::bson: {
+            zerialize::Bson::Deserializer reader(bytes);
+            print_schema(reader);
+            break;
+        }
+        case binary_format::beve: {
+            zerialize::Beve::Deserializer reader(bytes);
             print_schema(reader);
             break;
         }

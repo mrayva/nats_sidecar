@@ -13,7 +13,7 @@ cxxopts::Options build_cli_options() {
         ("a,address", "NATS server address", cxxopts::value<std::string>())
         ("p,port", "NATS server port", cxxopts::value<uint16_t>())
         ("i,input-subject", "Input NATS subject", cxxopts::value<std::string>())
-        ("f,format", "Binary format (msgpack|cbor|flexbuffers|zera)", cxxopts::value<std::string>())
+        ("f,format", "Binary format (msgpack|cbor|flexbuffers|zera|ion|bson|beve)", cxxopts::value<std::string>())
         ("output-prefix", "Output subject prefix", cxxopts::value<std::string>())
         ("queue-group", "Input queue group for load balancing", cxxopts::value<std::string>())
         ("subscribe-subject", "Subscription request subject", cxxopts::value<std::string>())
