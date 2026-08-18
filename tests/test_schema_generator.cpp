@@ -6,6 +6,9 @@
 #include <zerialize/protocols/cbor.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/zera.hpp>
+#include <zerialize/protocols/ion.hpp>
+#include <zerialize/protocols/bson.hpp>
+#include <zerialize/protocols/beve.hpp>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -108,6 +111,24 @@ TEST(schema_generator, works_across_all_binary_formats) {
         temp_binary_file file(zerialize::serialize<zerialize::Zera>(payload));
         capture_stdout out;
         sidecar::generate_schema(file.path(), sidecar::binary_format::zera);
+        EXPECT_NE(out.str().find("type: integer"), std::string::npos);
+    }
+    {
+        temp_binary_file file(zerialize::serialize<zerialize::Ion>(payload));
+        capture_stdout out;
+        sidecar::generate_schema(file.path(), sidecar::binary_format::ion);
+        EXPECT_NE(out.str().find("type: integer"), std::string::npos);
+    }
+    {
+        temp_binary_file file(zerialize::serialize<zerialize::Bson>(payload));
+        capture_stdout out;
+        sidecar::generate_schema(file.path(), sidecar::binary_format::bson);
+        EXPECT_NE(out.str().find("type: integer"), std::string::npos);
+    }
+    {
+        temp_binary_file file(zerialize::serialize<zerialize::Beve>(payload));
+        capture_stdout out;
+        sidecar::generate_schema(file.path(), sidecar::binary_format::beve);
         EXPECT_NE(out.str().find("type: integer"), std::string::npos);
     }
 }

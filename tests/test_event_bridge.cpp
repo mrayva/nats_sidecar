@@ -10,6 +10,9 @@
 #include <zerialize/protocols/cbor.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/zera.hpp>
+#include <zerialize/protocols/ion.hpp>
+#include <zerialize/protocols/bson.hpp>
+#include <zerialize/protocols/beve.hpp>
 #include <algorithm>
 
 namespace {
@@ -61,6 +64,9 @@ TEST(config_parsing, parse_format) {
     EXPECT_EQ(sidecar::parse_format("cbor"),        sidecar::binary_format::cbor);
     EXPECT_EQ(sidecar::parse_format("flexbuffers"), sidecar::binary_format::flexbuffers);
     EXPECT_EQ(sidecar::parse_format("zera"),        sidecar::binary_format::zera);
+    EXPECT_EQ(sidecar::parse_format("ion"),         sidecar::binary_format::ion);
+    EXPECT_EQ(sidecar::parse_format("bson"),        sidecar::binary_format::bson);
+    EXPECT_EQ(sidecar::parse_format("beve"),        sidecar::binary_format::beve);
     EXPECT_FALSE(sidecar::parse_format("invalid").has_value());
 }
 
@@ -102,7 +108,7 @@ TEST(lease_manager, parse_invalid_lease_key) {
     EXPECT_FALSE(sidecar::lease_manager::parse_lease_key("42junk.client", id, client));
 }
 
-// --- Real message matching, across all four binary formats ---
+// --- Real message matching, across all seven binary formats ---
 
 namespace {
 
@@ -146,6 +152,21 @@ TEST(event_bridge_matching, matches_across_all_binary_formats) {
         *snap->tree, schema, sidecar::binary_format::zera, payload, make_log());
     ASSERT_TRUE(zera_result.has_value());
     EXPECT_TRUE(contains(*zera_result, id));
+
+    auto ion_result = match_with<zerialize::Ion>(
+        *snap->tree, schema, sidecar::binary_format::ion, payload, make_log());
+    ASSERT_TRUE(ion_result.has_value());
+    EXPECT_TRUE(contains(*ion_result, id));
+
+    auto bson_result = match_with<zerialize::Bson>(
+        *snap->tree, schema, sidecar::binary_format::bson, payload, make_log());
+    ASSERT_TRUE(bson_result.has_value());
+    EXPECT_TRUE(contains(*bson_result, id));
+
+    auto beve_result = match_with<zerialize::Beve>(
+        *snap->tree, schema, sidecar::binary_format::beve, payload, make_log());
+    ASSERT_TRUE(beve_result.has_value());
+    EXPECT_TRUE(contains(*beve_result, id));
 }
 
 TEST(event_bridge_matching, does_not_match_when_expression_false) {
