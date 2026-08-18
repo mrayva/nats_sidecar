@@ -14,7 +14,7 @@ Content-based filtering sidecar for NATS. Receives binary-encoded messages on a 
 
 ## Prerequisites
 
-- C++20 compiler (GCC 13+ or Clang 16+)
+- C++23 compiler (GCC 13+ or Clang 16+)
 - CMake 3.25+
 - Rust toolchain (for building the a-tree FFI library)
 - [vcpkg](https://github.com/microsoft/vcpkg) (for C++ dependencies)

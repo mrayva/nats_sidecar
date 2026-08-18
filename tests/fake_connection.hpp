@@ -257,6 +257,52 @@ public:
             std::move(keys), nats_asio::status{}};
     }
 
+    // Matches key_pattern's dot-separated tokens against a key's own
+    // dot-separated tokens: '*' matches exactly one token, '>' matches the
+    // rest (must be the pattern's last token), anything else must match
+    // literally - the same subject-wildcard semantics kv_keys' real
+    // subscription-based implementation relies on.
+    static bool matches_key_pattern(std::string_view key, std::string_view pattern) {
+        auto split = [](std::string_view s) {
+            std::vector<std::string_view> parts;
+            std::size_t start = 0;
+            while (start <= s.size()) {
+                auto dot = s.find('.', start);
+                if (dot == std::string_view::npos) {
+                    parts.push_back(s.substr(start));
+                    break;
+                }
+                parts.push_back(s.substr(start, dot - start));
+                start = dot + 1;
+            }
+            return parts;
+        };
+        auto key_parts = split(key);
+        auto pattern_parts = split(pattern);
+
+        std::size_t i = 0;
+        for (; i < pattern_parts.size(); ++i) {
+            if (pattern_parts[i] == ">") return true;  // matches all remaining tokens
+            if (i >= key_parts.size()) return false;
+            if (pattern_parts[i] != "*" && pattern_parts[i] != key_parts[i]) return false;
+        }
+        return i == key_parts.size();
+    }
+
+    asio::awaitable<std::pair<std::vector<std::string>, nats_asio::status>> kv_keys(
+        std::string_view bucket, std::string_view key_pattern, std::chrono::milliseconds) override {
+        std::vector<std::string> keys;
+        const std::string prefix = std::string(bucket) + "/";
+        for (const auto& [k, rec] : kv_store) {
+            if (rec.op != nats_asio::kv_entry::operation::put) continue;
+            if (k.rfind(prefix, 0) != 0) continue;
+            auto key_only = k.substr(prefix.size());
+            if (matches_key_pattern(key_only, key_pattern)) keys.push_back(std::move(key_only));
+        }
+        co_return std::pair<std::vector<std::string>, nats_asio::status>{
+            std::move(keys), nats_asio::status{}};
+    }
+
     asio::awaitable<std::pair<std::vector<nats_asio::kv_entry>, nats_asio::status>> kv_history(
         std::string_view, std::string_view, std::chrono::milliseconds) override {
         co_return std::pair<std::vector<nats_asio::kv_entry>, nats_asio::status>{

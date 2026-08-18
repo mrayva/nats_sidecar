@@ -8,7 +8,7 @@ project(nats_sidecar
     LANGUAGES CXX
 )
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -78,7 +78,7 @@ include(FetchContent)
 FetchContent_Declare(
     nats_asio
     GIT_REPOSITORY https://github.com/mrayva/nats_asio.git
-    GIT_TAG        5bcb3f849ecb198b2eafbcbb85337e9526571359
+    GIT_TAG        751c8173154c49d2b71af022d0b23a689b1e5906
     GIT_SHALLOW    TRUE
     SYSTEM
 )
@@ -102,7 +102,7 @@ set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" F
 FetchContent_Declare(
     zerialize
     GIT_REPOSITORY https://github.com/mrayva/zerialize.git
-    GIT_TAG        32d9d9447c9ce725ba0ea9d1a5d25005066a0cd8
+    GIT_TAG        fd4710e2251a24a6ccf7fd32e67546f6242c408c
     SYSTEM
 )
 FetchContent_MakeAvailable(zerialize)
