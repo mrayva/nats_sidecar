@@ -259,6 +259,43 @@ TEST(event_bridge_matching, matches_end_to_end_with_betree_engine) {
     EXPECT_TRUE(result2->empty());
 }
 
+TEST(event_bridge_matching, search_time_out_populated_when_search_runs) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    auto buf = zerialize::serialize<zerialize::MsgPack>(zerialize::dyn::map({{"value", 42}}));
+    std::optional<std::chrono::nanoseconds> search_time;
+    auto result = sidecar::deserialize_and_match(
+        *snap->tree, schema, sidecar::binary_format::msgpack, as_char_span(buf),
+        make_log(), &search_time);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(search_time.has_value());
+    EXPECT_GT(search_time->count(), 0);
+}
+
+TEST(event_bridge_matching, search_time_out_left_unset_when_search_never_runs) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    // 0xc1 is reserved/invalid in MessagePack - deserialization fails before
+    // matching_engine::search() is ever reached.
+    std::vector<char> garbage{static_cast<char>(0xc1)};
+    std::optional<std::chrono::nanoseconds> search_time;
+    auto result = sidecar::deserialize_and_match(
+        *snap->tree, schema, sidecar::binary_format::msgpack,
+        std::span<const char>(garbage.data(), garbage.size()), make_log(), &search_time);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_FALSE(search_time.has_value());
+}
+
 TEST(event_bridge_matching, unrecognized_binary_returns_nullopt) {
     std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
     sidecar::attribute_schema schema(defs);

@@ -7,7 +7,8 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,
-    std::shared_ptr<spdlog::logger> log)
+    std::shared_ptr<spdlog::logger> log,
+    std::optional<std::chrono::nanoseconds>* search_time_out)
 {
     try {
         auto bytes = std::span<const uint8_t>(
@@ -16,31 +17,31 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
         switch (format) {
             case binary_format::msgpack: {
                 zerialize::MsgPack::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log);
+                return match_message(tree, schema, reader, log, search_time_out);
             }
             case binary_format::cbor: {
                 zerialize::CBOR::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log);
+                return match_message(tree, schema, reader, log, search_time_out);
             }
             case binary_format::flexbuffers: {
                 zerialize::Flex::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log);
+                return match_message(tree, schema, reader, log, search_time_out);
             }
             case binary_format::zera: {
                 zerialize::Zera::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log);
+                return match_message(tree, schema, reader, log, search_time_out);
             }
             case binary_format::ion: {
                 zerialize::Ion::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log);
+                return match_message(tree, schema, reader, log, search_time_out);
             }
             case binary_format::bson: {
                 zerialize::Bson::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log);
+                return match_message(tree, schema, reader, log, search_time_out);
             }
             case binary_format::beve: {
                 zerialize::Beve::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log);
+                return match_message(tree, schema, reader, log, search_time_out);
             }
         }
     } catch (const std::exception& e) {

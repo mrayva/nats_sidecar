@@ -46,6 +46,12 @@ public:
         std::size_t queue_depth = 0;
         std::size_t queue_bytes = 0;
         std::size_t publish_inflight = 0;
+        // Wall-clock time spent inside matching_engine::search() alone (not
+        // deserialize/populate), summed across every message that actually
+        // reached search. match_time_count is the number of such messages -
+        // divide to get an average; both are 0 if none have run yet.
+        uint64_t match_time_ns_total = 0;
+        uint64_t match_time_count = 0;
     };
 
     worker_pool(asio::io_context& ioc, const config& cfg,
@@ -119,6 +125,8 @@ private:
     std::atomic<uint64_t> m_match_failures{0};
     std::atomic<uint64_t> m_input_dropped{0};
     std::atomic<uint64_t> m_publish_tasks_dropped{0};
+    std::atomic<uint64_t> m_match_time_ns_total{0};
+    std::atomic<uint64_t> m_match_time_count{0};
 };
 
 } // namespace sidecar

@@ -115,7 +115,9 @@ worker_pool::stats worker_pool::get_stats() const {
         m_publish_counters->publish_failures.load(std::memory_order_relaxed),
         m_queued_messages.load(std::memory_order_relaxed),
         m_queued_bytes.load(std::memory_order_relaxed),
-        m_publish_counters->publish_inflight.load(std::memory_order_relaxed)
+        m_publish_counters->publish_inflight.load(std::memory_order_relaxed),
+        m_match_time_ns_total.load(std::memory_order_relaxed),
+        m_match_time_count.load(std::memory_order_relaxed)
     };
 }
 
@@ -157,8 +159,15 @@ void worker_pool::worker_loop(unsigned int worker_id) {
 
         std::span<const char> payload_span(payload.data(), payload.size());
 
+        std::optional<std::chrono::nanoseconds> search_time;
         auto matches = deserialize_and_match(
-            *snap->tree, m_schema, m_format, payload_span, m_log);
+            *snap->tree, m_schema, m_format, payload_span, m_log, &search_time);
+
+        if (search_time) {
+            m_match_time_ns_total.fetch_add(
+                static_cast<uint64_t>(search_time->count()), std::memory_order_relaxed);
+            m_match_time_count.fetch_add(1, std::memory_order_relaxed);
+        }
 
         m_processed.fetch_add(1, std::memory_order_relaxed);
 

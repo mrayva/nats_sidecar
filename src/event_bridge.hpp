@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "matching_engine.hpp"
+#include <chrono>
 #include <limits>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/msgpack.hpp>
@@ -136,12 +137,18 @@ bool populate_event(
 }
 
 // Match a deserialized message against all active subscriptions.
+// search_time_out, if non-null, is set to the wall-clock duration of the
+// matching_engine::search() call alone (not deserialize/populate) whenever
+// search actually runs - left untouched (still nullopt) if populate_event
+// bails out first or search throws, so callers can distinguish "no search
+// happened" from "search took some time" without a sentinel duration.
 template <typename Reader>
 std::optional<std::vector<uint64_t>> match_message(
     const matching_engine& tree,
     const attribute_schema& schema,
     Reader& reader,
-    std::shared_ptr<spdlog::logger> log)
+    std::shared_ptr<spdlog::logger> log,
+    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr)
 {
     auto event = tree.make_event();
 
@@ -150,7 +157,13 @@ std::optional<std::vector<uint64_t>> match_message(
     }
 
     try {
-        return tree.search(*event);
+        auto t0 = std::chrono::steady_clock::now();
+        auto result = tree.search(*event);
+        auto t1 = std::chrono::steady_clock::now();
+        if (search_time_out) {
+            *search_time_out = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0);
+        }
+        return result;
     } catch (const std::exception& e) {
         if (log) log->warn("event_bridge: matching engine search failed: {}", e.what());
         return std::nullopt;
@@ -158,11 +171,13 @@ std::optional<std::vector<uint64_t>> match_message(
 }
 
 // Top-level entry: deserialize raw bytes according to format, then match.
+// See match_message() for search_time_out's semantics.
 std::optional<std::vector<uint64_t>> deserialize_and_match(
     const matching_engine& tree,
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,
-    std::shared_ptr<spdlog::logger> log);
+    std::shared_ptr<spdlog::logger> log,
+    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr);
 
 } // namespace sidecar

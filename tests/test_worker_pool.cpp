@@ -116,6 +116,31 @@ TEST(worker_pool, stop_drains_every_accepted_input) {
     EXPECT_EQ(stats.processed, accepted);
     EXPECT_EQ(stats.queue_depth, 0u);
     EXPECT_EQ(stats.queue_bytes, 0u);
+    // Invalid MessagePack fails deserialization before matching_engine::search()
+    // is ever reached, so none of these should count towards match timing.
+    EXPECT_EQ(stats.match_time_count, 0u);
+}
+
+TEST(worker_pool, tracks_match_time_when_search_runs) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
+
+    pool.start();
+    // value=5 does not satisfy "value > 10" - search runs (and is timed) but
+    // nothing matches, so no publish path (and no connection) is needed.
+    EXPECT_TRUE(pool.enqueue(matching_payload(5)));
+    EXPECT_TRUE(sidecar_test::drive_until(
+        ioc, [&] { return pool.get_stats().processed > 0; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.matched, 0u);
+    EXPECT_EQ(stats.match_time_count, 1u);
+    EXPECT_GT(stats.match_time_ns_total, 0u);
 }
 
 TEST(worker_pool, publishes_matched_message_via_connection) {
