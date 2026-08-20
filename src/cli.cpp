@@ -14,6 +14,7 @@ cxxopts::Options build_cli_options() {
         ("p,port", "NATS server port", cxxopts::value<uint16_t>())
         ("i,input-subject", "Input NATS subject", cxxopts::value<std::string>())
         ("f,format", "Binary format (msgpack|cbor|flexbuffers|zera|ion|bson|beve)", cxxopts::value<std::string>())
+        ("engine", "Matching engine (atree|betree)", cxxopts::value<std::string>())
         ("output-prefix", "Output subject prefix", cxxopts::value<std::string>())
         ("queue-group", "Input queue group for load balancing", cxxopts::value<std::string>())
         ("subscribe-subject", "Subscription request subject", cxxopts::value<std::string>())
@@ -68,6 +69,14 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
             return fmt::format("Invalid format: {}", result["format"].as<std::string>());
         }
         cfg.format = *fmt_opt;
+    }
+
+    if (result.count("engine")) {
+        auto eng_opt = parse_engine_type(result["engine"].as<std::string>());
+        if (!eng_opt) {
+            return fmt::format("Invalid engine: {}", result["engine"].as<std::string>());
+        }
+        cfg.engine = *eng_opt;
     }
 
     // Parse --attr name:type pairs (appended to any YAML-defined attributes)

@@ -15,6 +15,12 @@ std::optional<binary_format> parse_format(const std::string& s) {
     return std::nullopt;
 }
 
+std::optional<engine_type> parse_engine_type(const std::string& s) {
+    if (s == "atree")  return engine_type::atree;
+    if (s == "betree") return engine_type::betree;
+    return std::nullopt;
+}
+
 std::optional<attribute_type> parse_attribute_type(const std::string& s) {
     if (s == "boolean" || s == "bool")     return attribute_type::boolean;
     if (s == "integer" || s == "int")      return attribute_type::integer;
@@ -50,6 +56,12 @@ config load_config(const std::string& path) {
     }
 
     if (auto n = root["input_queue_group"]) cfg.input_queue_group = n.as<std::string>();
+
+    if (auto n = root["engine"]) {
+        auto eng = parse_engine_type(n.as<std::string>());
+        if (!eng) throw std::runtime_error("config: invalid 'engine': " + n.as<std::string>());
+        cfg.engine = *eng;
+    }
 
     // Output
     if (auto n = root["output_prefix"]) {

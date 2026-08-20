@@ -3,7 +3,7 @@
 namespace sidecar {
 
 std::optional<std::vector<uint64_t>> deserialize_and_match(
-    const atree::Tree& tree,
+    const matching_engine& tree,
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,

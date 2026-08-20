@@ -115,11 +115,16 @@ FetchContent_MakeAvailable(zerialize)
 # --- a-tree FFI (Rust -> C/C++) ---
 include(cmake/BuildAtree.cmake)
 
+# --- be-tree (C++20 core, native CMake) ---
+include(cmake/BuildBetree.cmake)
+
 # --- sidecar library (shared between executable and tests) ---
 add_library(sidecar_lib STATIC
     src/cli.cpp
     src/config.cpp
+    src/dialect.cpp
     src/event_bridge.cpp
+    src/matching_engine.cpp
     src/schema_generator.cpp
     src/subscription_manager.cpp
     src/lease_manager.cpp
@@ -136,6 +141,7 @@ target_link_libraries(sidecar_lib
         nats_asio::nats_asio
         zerialize
         atree_ffi
+        betree
         yaml-cpp::yaml-cpp
         spdlog::spdlog
         fmt::fmt

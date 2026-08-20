@@ -1,7 +1,7 @@
 #pragma once
 
 #include "config.hpp"
-#include <atree.hpp>
+#include "matching_engine.hpp"
 #include <limits>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/msgpack.hpp>
@@ -38,10 +38,10 @@ struct attribute_schema {
     }
 };
 
-// Populate an EventBuilder from a zerialize reader using the schema.
+// Populate an event_sink from a zerialize reader using the schema.
 template <typename Reader>
 bool populate_event(
-    atree::EventBuilder& builder,
+    event_sink& builder,
     const attribute_schema& schema,
     Reader& reader,
     std::shared_ptr<spdlog::logger> log)
@@ -138,28 +138,28 @@ bool populate_event(
 // Match a deserialized message against all active subscriptions.
 template <typename Reader>
 std::optional<std::vector<uint64_t>> match_message(
-    const atree::Tree& tree,
+    const matching_engine& tree,
     const attribute_schema& schema,
     Reader& reader,
     std::shared_ptr<spdlog::logger> log)
 {
     auto event = tree.make_event();
 
-    if (!populate_event(event, schema, reader, log)) {
+    if (!populate_event(*event, schema, reader, log)) {
         return std::nullopt;
     }
 
     try {
-        return tree.search(std::move(event));
+        return tree.search(*event);
     } catch (const std::exception& e) {
-        if (log) log->warn("event_bridge: a-tree search failed: {}", e.what());
+        if (log) log->warn("event_bridge: matching engine search failed: {}", e.what());
         return std::nullopt;
     }
 }
 
 // Top-level entry: deserialize raw bytes according to format, then match.
 std::optional<std::vector<uint64_t>> deserialize_and_match(
-    const atree::Tree& tree,
+    const matching_engine& tree,
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,

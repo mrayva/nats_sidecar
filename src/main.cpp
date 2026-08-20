@@ -45,6 +45,7 @@ void log_startup_banner(spdlog::logger& console, const sidecar::config& cfg) {
     console.info("nats_sidecar starting");
     console.info("  server: {}:{}", cfg.nats_address, cfg.nats_port);
     console.info("  input:  {} (format={})", cfg.input_subject, static_cast<int>(cfg.format));
+    console.info("  engine: {}", cfg.engine == sidecar::engine_type::atree ? "atree" : "betree");
     console.info("  output: {}.<ID>", cfg.output_prefix);
     console.info("  attributes: {}", cfg.attributes.size());
     console.info("  worker threads: {}", sidecar::effective_worker_count(cfg));
@@ -72,7 +73,7 @@ int run_engine(const sidecar::config& cfg, std::shared_ptr<spdlog::logger> conso
     std::shared_ptr<sidecar::sidecar_engine> engine;
     try {
         engine = std::make_shared<sidecar::sidecar_engine>(ioc, cfg, console);
-    } catch (const atree::Error& e) {
+    } catch (const sidecar::matching_engine_error& e) {
         console->error("Failed to initialize sidecar engine: {}", e.what());
         return 1;
     } catch (const std::exception& e) {

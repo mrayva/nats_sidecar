@@ -33,6 +33,12 @@ enum class binary_format {
     beve
 };
 
+// Boolean-expression matching engine backing subscription_manager.
+enum class engine_type {
+    atree,
+    betree
+};
+
 struct config {
     // NATS connection
     std::string nats_address = "127.0.0.1";
@@ -58,8 +64,11 @@ struct config {
     uint32_t lease_ttl_seconds = 3600;
     uint32_t lease_check_interval_seconds = 60;
 
-    // A-Tree attribute schema
+    // Boolean-expression attribute schema
     std::vector<attribute_def> attributes;
+
+    // Matching engine backing subscription_manager
+    engine_type engine = engine_type::atree;
 
     // Operational
     int stats_interval_seconds = 10;
@@ -82,6 +91,9 @@ config load_config(const std::string& path);
 
 // Parse binary_format from string. Returns nullopt if invalid.
 std::optional<binary_format> parse_format(const std::string& s);
+
+// Parse engine_type from string ("atree" | "betree"). Returns nullopt if invalid.
+std::optional<engine_type> parse_engine_type(const std::string& s);
 
 // Parse attribute_type from string. Returns nullopt if invalid.
 std::optional<attribute_type> parse_attribute_type(const std::string& s);

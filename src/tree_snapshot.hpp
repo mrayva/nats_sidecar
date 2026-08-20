@@ -1,6 +1,6 @@
 #pragma once
 
-#include <atree.hpp>
+#include "matching_engine.hpp"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -8,11 +8,11 @@
 
 namespace sidecar {
 
-// Immutable snapshot of the a-tree and associated metadata.
+// Immutable snapshot of the matching engine and associated metadata.
 // Shared by worker threads via shared_ptr<const tree_snapshot>.
-// Workers only need the tree (for search) and precomputed output subjects.
+// Workers only need the engine (for search) and precomputed output subjects.
 struct tree_snapshot {
-    std::shared_ptr<const atree::Tree> tree;
+    std::shared_ptr<const matching_engine> tree;
 
     // subscription_id -> precomputed output subject (e.g. "sensor.filtered.42")
     std::unordered_map<uint64_t, std::string> output_subjects;

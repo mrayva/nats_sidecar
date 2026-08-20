@@ -2,36 +2,23 @@
 
 namespace sidecar {
 
-static atree::Tree build_tree(const std::vector<attribute_def>& attributes) {
-    auto builder = atree::Tree::builder();
-    for (const auto& attr : attributes) {
-        switch (attr.type) {
-            case attribute_type::boolean:      builder.with_boolean(attr.name); break;
-            case attribute_type::integer:       builder.with_integer(attr.name); break;
-            case attribute_type::float_val:     builder.with_float(attr.name); break;
-            case attribute_type::string:        builder.with_string(attr.name); break;
-            case attribute_type::string_list:   builder.with_string_list(attr.name); break;
-            case attribute_type::integer_list:  builder.with_integer_list(attr.name); break;
-        }
-    }
-    return std::move(builder).build();
-}
-
 subscription_manager::subscription_manager(
     const std::vector<attribute_def>& attributes,
     const std::string& output_prefix,
-    std::shared_ptr<spdlog::logger> log)
+    std::shared_ptr<spdlog::logger> log,
+    engine_type engine)
     : m_log(std::move(log)),
       m_attributes(attributes),
-      m_output_prefix(output_prefix)
+      m_output_prefix(output_prefix),
+      m_engine(engine)
 {
     // Publish an initial empty snapshot
     publish_snapshot();
 }
 
 void subscription_manager::publish_snapshot() {
-    // Build a fresh tree and insert all current expressions
-    auto tree = std::make_shared<atree::Tree>(build_tree(m_attributes));
+    // Build a fresh engine and insert all current expressions
+    std::shared_ptr<matching_engine> tree = build_matching_engine(m_engine, m_attributes);
     for (const auto& [id, sub] : m_subscriptions) {
         tree->insert(id, sub.expression);
     }

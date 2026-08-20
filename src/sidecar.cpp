@@ -10,7 +10,7 @@ namespace sidecar {
 sidecar_engine::sidecar_engine(asio::io_context& ioc, const config& cfg,
                                std::shared_ptr<spdlog::logger> log)
     : m_ioc(ioc), m_cfg(cfg), m_log(std::move(log)),
-      m_sub_mgr(cfg.attributes, cfg.output_prefix, m_log),
+      m_sub_mgr(cfg.attributes, cfg.output_prefix, m_log, cfg.engine),
       m_schema(cfg.attributes)
 {}
 
@@ -208,7 +208,7 @@ asio::awaitable<void> sidecar_engine::on_subscribe_request(
         };
         reply_str = reply.dump();
 
-    } catch (const atree::Error& e) {
+    } catch (const matching_engine_error& e) {
         reply_str = nlohmann::json({{"error", std::string("Invalid expression: ") + e.what()}}).dump();
     } catch (const std::exception& e) {
         reply_str = nlohmann::json({{"error", std::string("Bad request: ") + e.what()}}).dump();

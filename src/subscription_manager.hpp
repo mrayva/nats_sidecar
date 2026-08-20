@@ -1,8 +1,8 @@
 #pragma once
 
 #include "config.hpp"
+#include "matching_engine.hpp"
 #include "tree_snapshot.hpp"
-#include <atree.hpp>
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <cstdint>
@@ -30,17 +30,18 @@ struct subscription_info {
     std::unordered_set<std::string> lease_holders;
 };
 
-// Manages boolean expression subscriptions in the A-Tree.
+// Manages boolean expression subscriptions in the matching engine.
 // Uses RCU-style snapshot swapping: readers atomically acquire an immutable snapshot,
 // while writers serialize via mutex and publish replacements atomically.
 class subscription_manager {
 public:
     subscription_manager(const std::vector<attribute_def>& attributes,
                          const std::string& output_prefix,
-                         std::shared_ptr<spdlog::logger> log);
+                         std::shared_ptr<spdlog::logger> log,
+                         engine_type engine = engine_type::atree);
 
     // Subscribe with a boolean expression. Returns the subscription ID
-    // (new or existing). Throws atree::Error on invalid expression.
+    // (new or existing). Throws matching_engine_error on invalid expression.
     uint64_t subscribe(const std::string& expression, const std::string& client_id);
 
     // Restore a persisted subscription using its original ID. Returns false
@@ -79,6 +80,7 @@ private:
     // Needed to rebuild tree from scratch on expression changes.
     std::vector<attribute_def> m_attributes;
     std::string m_output_prefix;
+    engine_type m_engine;
 
     // Current snapshot — atomically published for concurrent reader access.
     std::atomic<std::shared_ptr<const tree_snapshot>> m_snapshot;
