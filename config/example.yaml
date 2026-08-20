@@ -8,6 +8,14 @@ input_subject: "sensor.data"
 format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
 # input_queue_group: "sidecar-group"  # uncomment to load-balance across instances
 
+# Matching engine - both accept the same expression syntax, except
+# "is not empty" which only atree supports (see README's Expression Syntax
+# section). Switching this after subscriptions exist won't crash startup,
+# but any persisted subscription that used "is not empty" will fail to
+# restore under engine: betree (logged as a warning and skipped, not lost -
+# the lease record itself is untouched).
+engine: atree             # atree | betree
+
 # Output: matched messages published to <output_prefix>.<BE-ID>
 output_prefix: "sensor.filtered"
 

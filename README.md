@@ -1,10 +1,11 @@
 # nats_sidecar
 
-Content-based filtering sidecar for NATS. Receives binary-encoded messages on a NATS subject, evaluates them against boolean expression subscriptions using an [a-tree](https://github.com/mrayva/a-tree), and fans out matching messages to per-subscription output topics.
+Content-based filtering sidecar for NATS. Receives binary-encoded messages on a NATS subject, evaluates them against boolean expression subscriptions using [a-tree](https://github.com/mrayva/a-tree) or [be-tree](https://github.com/mrayva/be-tree) (selectable per deployment, see `--engine` below), and fans out matching messages to per-subscription output topics.
 
 ## Features
 
 - Boolean expression subscriptions (e.g. `temperature > 30.0 AND location = "warehouse"`)
+- Two selectable matching engines (a-tree, be-tree) sharing the same expression syntax
 - Supports MessagePack, CBOR, FlexBuffers, Zera, Ion, BSON, and BEVE binary formats
 - Multi-threaded worker pool for parallel message processing with RCU snapshot-based lock-free reads
 - Soft-state leases via NATS KV with automatic TTL-based cleanup
@@ -71,6 +72,7 @@ All configuration parameters can be set via CLI flags. When a config file is als
 | `-p, --port PORT` | NATS server port |
 | `-i, --input-subject SUBJ` | Input NATS subject |
 | `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`) |
+| `--engine ENGINE` | Matching engine (`atree`, `betree`); defaults to `atree` |
 | `--output-prefix PREFIX` | Output subject prefix (defaults to input subject) |
 | `--queue-group GROUP` | Input queue group for load balancing |
 | `--subscribe-subject SUBJ` | Subscription request subject |
@@ -109,6 +111,7 @@ nats_port: 4222
 # Input: NATS subject carrying binary-encoded messages
 input_subject: "sensor.data"
 format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
+engine: atree             # atree | betree
 
 # Output: matched messages published to <output_prefix>.<subscription_id>
 output_prefix: "sensor.filtered"
@@ -149,6 +152,14 @@ publish_backpressure_timeout_ms: 5000
 | `string` / `str` | UTF-8 string |
 | `string_list` | Array of strings |
 | `integer_list` / `int_list` | Array of integers |
+
+### Expression Syntax
+
+Both engines accept the same expression syntax verbatim: `=`, `<>`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, `in`, `not in`, `one of`, `none of`, `all of`, `is null`, `is not null`, `is empty`. Multi-word operators are space-separated (`not in`, not `not_in`) - this matches both engines' actual grammars, confirmed against their lexers directly.
+
+One operator is engine-specific: **`is not empty` is only available under `engine: atree`**. be-tree's grammar has no rule for it at all; subscribing with it under `engine: betree` is rejected at subscribe time with a clear error rather than silently misbehaving. There's no substitute expression to fall back to if you need this on be-tree.
+
+`in` / `not in` list literals accept integer or string values only, not floats. `one of` / `none of` / `all of` apply to list-typed attributes (`string_list` / `integer_list`); `is empty` / `is not empty` likewise.
 
 ## Client Protocol
 
@@ -272,7 +283,7 @@ NATS input subject
 ```
 
 - The ASIO I/O thread handles all NATS network I/O and subscription control
-- Worker threads process messages in parallel using lock-free RCU snapshots of the a-tree
+- Worker threads process messages in parallel using lock-free RCU snapshots of the matching engine (a-tree or be-tree)
 - NATS publishes are posted back to the ASIO thread via `co_spawn`
 
 ## License
