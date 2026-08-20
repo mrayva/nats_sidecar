@@ -92,6 +92,34 @@ TEST(cli, apply_cli_overrides_verbose_overrides_log_level) {
     EXPECT_EQ(cfg.log_level, "debug");
 }
 
+TEST(cli, apply_cli_overrides_applies_engine) {
+    auto options = sidecar::build_cli_options();
+    auto result = parse_args(options, {"--engine", "betree"});
+
+    sidecar::config cfg;
+    ASSERT_FALSE(sidecar::apply_cli_overrides(cfg, result).has_value());
+    EXPECT_EQ(cfg.engine, sidecar::engine_type::betree);
+}
+
+TEST(cli, apply_cli_overrides_engine_defaults_to_atree_when_unset) {
+    auto options = sidecar::build_cli_options();
+    auto result = parse_args(options, {"--input-subject", "sensor.data"});
+
+    sidecar::config cfg;
+    ASSERT_FALSE(sidecar::apply_cli_overrides(cfg, result).has_value());
+    EXPECT_EQ(cfg.engine, sidecar::engine_type::atree);
+}
+
+TEST(cli, apply_cli_overrides_invalid_engine_returns_error) {
+    auto options = sidecar::build_cli_options();
+    auto result = parse_args(options, {"--engine", "not-a-real-engine"});
+
+    sidecar::config cfg;
+    auto err = sidecar::apply_cli_overrides(cfg, result);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("Invalid engine"), std::string::npos);
+}
+
 TEST(cli, apply_cli_overrides_invalid_format_returns_error) {
     auto options = sidecar::build_cli_options();
     auto result = parse_args(options, {"--format", "not-a-format"});

@@ -114,7 +114,7 @@ namespace {
 
 template <typename Protocol>
 std::optional<std::vector<uint64_t>> match_with(
-    const atree::Tree& tree, const sidecar::attribute_schema& schema,
+    const sidecar::matching_engine& tree, const sidecar::attribute_schema& schema,
     sidecar::binary_format format, const zerialize::dyn::Value& payload,
     std::shared_ptr<spdlog::logger> log) {
     auto buf = zerialize::serialize<Protocol>(payload);
@@ -227,6 +227,36 @@ TEST(event_bridge_matching, matches_bool_string_and_list_attributes) {
         *snap->tree, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(contains(*result, id));
+}
+
+TEST(event_bridge_matching, matches_end_to_end_with_betree_engine) {
+    std::vector<sidecar::attribute_def> defs = {
+        {"value",  sidecar::attribute_type::integer},
+        {"symbol", sidecar::attribute_type::string},
+    };
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log(), sidecar::engine_type::betree);
+    // Canonical dialect - proves the full real pipeline (subscribe ->
+    // dialect translation -> be-tree parse -> deserialize -> match) works
+    // end to end, not just the direct matching_engine API.
+    uint64_t id = mgr.subscribe("value > 10 and symbol not in (\"GOOG\", \"TSLA\")", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    auto buf = zerialize::serialize<zerialize::MsgPack>(
+        zerialize::dyn::map({{"value", 42}, {"symbol", std::string("AAPL")}}));
+    auto result = sidecar::deserialize_and_match(
+        *snap->tree, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(contains(*result, id));
+
+    auto non_matching = zerialize::serialize<zerialize::MsgPack>(
+        zerialize::dyn::map({{"value", 42}, {"symbol", std::string("GOOG")}}));
+    auto result2 = sidecar::deserialize_and_match(
+        *snap->tree, schema, sidecar::binary_format::msgpack,
+        as_char_span(non_matching), make_log());
+    ASSERT_TRUE(result2.has_value());
+    EXPECT_TRUE(result2->empty());
 }
 
 TEST(event_bridge_matching, unrecognized_binary_returns_nullopt) {

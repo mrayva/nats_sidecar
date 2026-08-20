@@ -100,7 +100,7 @@ TEST(subscription_manager, invalid_expression_throws) {
 
     EXPECT_THROW(
         mgr.subscribe("this is not a valid expression !!!", "client-1"),
-        atree::Error
+        sidecar::matching_engine_error
     );
     EXPECT_EQ(mgr.active_count(), 0u);
 }
@@ -193,4 +193,67 @@ TEST(subscription_manager, rejects_conflicting_restored_records) {
     EXPECT_FALSE(mgr.restore(8, "temperature > 30.0", "client-2"));
     EXPECT_FALSE(mgr.restore(7, "severity = 5", "client-2"));
     EXPECT_EQ(mgr.active_count(), 1u);
+}
+
+// --- engine=betree: same subscribe/lease/snapshot behavior, different backing engine ---
+
+TEST(subscription_manager_betree, subscribe_and_lease_lifecycle) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::betree);
+
+    uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
+    EXPECT_GT(id, 0u);
+    EXPECT_EQ(mgr.active_count(), 1u);
+
+    auto removal = mgr.remove_lease(id, "client-1");
+    EXPECT_EQ(removal, sidecar::lease_removal::fully_removed);
+    EXPECT_EQ(mgr.active_count(), 0u);
+}
+
+TEST(subscription_manager_betree, invalid_expression_throws) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::betree);
+
+    EXPECT_THROW(
+        mgr.subscribe("this is not a valid expression !!!", "client-1"),
+        sidecar::matching_engine_error
+    );
+    EXPECT_EQ(mgr.active_count(), 0u);
+}
+
+TEST(subscription_manager_betree, snapshot_valid_after_subscribe) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::betree);
+
+    uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
+
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap);
+    ASSERT_TRUE(snap->tree);
+    EXPECT_EQ(snap->active_count, 1u);
+    EXPECT_EQ(snap->output_subjects.at(id), "test.output." + std::to_string(id));
+}
+
+TEST(subscription_manager_betree, space_separated_keyword_works_natively) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::betree);
+
+    // a-tree and be-tree agree on "is not null"'s spelling verbatim - no
+    // translation needed, just confirms the real pipeline accepts it.
+    EXPECT_NO_THROW(mgr.subscribe("location is not null", "client-1"));
+    EXPECT_EQ(mgr.active_count(), 1u);
+}
+
+TEST(subscription_manager_betree, is_not_empty_is_rejected) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::betree);
+
+    // be-tree's grammar has no rule for "is not empty" at all - this must
+    // be caught before it reaches be-tree's own parser with a confusing
+    // syntax error.
+    EXPECT_THROW(
+        mgr.subscribe("location is not empty", "client-1"),
+        sidecar::matching_engine_error
+    );
+    EXPECT_EQ(mgr.active_count(), 0u);
 }

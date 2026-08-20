@@ -172,8 +172,10 @@ if(SIDECAR_BUILD_TESTS)
     add_executable(sidecar_test
         tests/test_cli.cpp
         tests/test_config_loading.cpp
+        tests/test_dialect.cpp
         tests/test_event_bridge.cpp
         tests/test_lease_manager.cpp
+        tests/test_matching_engine.cpp
         tests/test_schema_generator.cpp
         tests/test_sidecar_lifecycle.cpp
         tests/test_subscription_manager.cpp

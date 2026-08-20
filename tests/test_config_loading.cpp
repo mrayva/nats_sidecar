@@ -116,6 +116,42 @@ attributes:
     EXPECT_EQ(cfg.attributes[1].type, sidecar::attribute_type::string_list);
 }
 
+TEST(config_loading, defaults_engine_to_atree) {
+    temp_yaml_file file(R"(
+input_subject: sensor.data
+attributes:
+  - name: temperature
+    type: float
+)");
+
+    auto cfg = sidecar::load_config(file.path());
+    EXPECT_EQ(cfg.engine, sidecar::engine_type::atree);
+}
+
+TEST(config_loading, parses_engine_betree) {
+    temp_yaml_file file(R"(
+input_subject: sensor.data
+engine: betree
+attributes:
+  - name: temperature
+    type: float
+)");
+
+    auto cfg = sidecar::load_config(file.path());
+    EXPECT_EQ(cfg.engine, sidecar::engine_type::betree);
+}
+
+TEST(config_loading, invalid_engine_throws) {
+    temp_yaml_file file(R"(
+input_subject: sensor.data
+engine: not-a-real-engine
+attributes:
+  - name: temperature
+    type: float
+)");
+    EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
+}
+
 TEST(config_loading, missing_input_subject_throws) {
     temp_yaml_file file(R"(
 attributes:
