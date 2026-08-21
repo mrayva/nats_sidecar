@@ -27,4 +27,27 @@ namespace sidecar {
 // unchanged - no translation is actually needed.
 std::string translate_to_betree_dialect(std::string_view expr);
 
+// a-tree's own "all of" list operator means the opposite of what its name
+// (and be-tree's "all of") suggests: confirmed against both engines' real
+// matcher source, a-tree's checks the *event's* value list is a subset of
+// the literal list ("all of the event's values are among these"), while
+// be-tree's checks the event's value list is a superset of (contains) the
+// literal list ("the event has all of these values") - the reading that
+// actually matches the operator's name. be-tree's semantic is treated as
+// canonical; this rewrites every "<ident> all of (v1, v2, ..., vn)" found
+// outside quoted string literals into an equivalent conjunction of
+// singleton "one of" checks - "(<ident> one of (v1) and ... and <ident>
+// one of (vn))" - which both engines already agree on (a symmetric
+// non-empty-intersection test), sidestepping a-tree's native "all of"
+// token entirely rather than trying to reinterpret it.
+//
+// A malformed "all of" clause (an empty or unterminated list, which
+// neither engine's grammar accepts to begin with) is left untouched, so
+// the underlying parser reports its own ordinary syntax error instead of
+// this rewrite doing something unexpected. Everything else - including
+// occurrences of the words "all"/"of" inside quoted strings, or as
+// unrelated identifiers not followed by "of ("/"(" - passes through
+// byte-for-byte.
+std::string translate_to_atree_dialect(std::string_view expr);
+
 } // namespace sidecar

@@ -166,10 +166,17 @@ std::vector<diff_case> differential_cases() {
         {"none_of_true", "tags none of (\"x\", \"y\")", {.tags = std::vector<std::string>{"z"}}, true},
         {"none_of_false","tags none of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x"}}, false},
 
-        // "all of" is deliberately NOT in this matrix - see
-        // matching_engine_all_of_semantics_diverge below. Unlike
-        // one_of/none_of, the two engines disagree on what "X all of (lits)"
-        // even means, so there is no single expected answer to assert here.
+        // --- all of: reconciled to be-tree's native semantic (the event's
+        // attribute list must contain every listed value - "the event has
+        // ALL OF these") via dialect.cpp's translate_to_atree_dialect(),
+        // which rewrites "X all of (lits)" into a conjunction of singleton
+        // "one of" checks before handing it to a-tree - see matching_engine
+        // .all_of_reconciled_across_engines below for why this exists.
+        {"all_of_true",       "scores all of (1, 2)",    {.scores = std::vector<int64_t>{1, 2, 3}}, true},
+        {"all_of_missing_one","scores all of (1, 2)",    {.scores = std::vector<int64_t>{1, 3}},     false},
+        {"all_of_string_true","tags all of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x", "y", "z"}}, true},
+        {"all_of_string_missing", "tags all of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x"}}, false},
+        {"all_of_single_element", "scores all of (2)",   {.scores = std::vector<int64_t>{1, 2, 3}}, true},
     };
 }
 
@@ -178,49 +185,50 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::ValuesIn(differential_cases()),
     [](const ::testing::TestParamInfo<diff_case>& info) { return info.param.label; });
 
-// Real, confirmed divergence found by this file's own differential matrix
-// during development (not hypothetical): "X all of (lits)" means opposite
-// things on the two engines, and NEITHER errors - a query that switches
-// engine=atree to engine=betree (or vice versa) silently changes which
-// messages match, unlike every other operator this file tests. Root cause,
-// read directly out of both engines' vendored evaluator source:
+// Real divergence found by this file's own differential matrix during
+// development (not hypothetical), now reconciled - kept here as a
+// dedicated regression test (in addition to the "all_of_*" cases folded
+// into the main matrix above) because the root cause is worth keeping
+// documented even though it's fixed. Read directly out of both engines'
+// vendored evaluator source:
 //
 //   - a-tree (predicates.rs, all_of(left=attr, right=literal)): requires
 //     left.len() <= right.len(), then checks every element of the
-//     ATTRIBUTE appears in the LITERAL - i.e. "attribute is a subset of
-//     the literal set".
+//     ATTRIBUTE appears in the LITERAL - i.e. natively, "attribute is a
+//     subset of the literal set".
 //   - be-tree (ast_match_shared.hpp, ast_match_all_of_int/string(variable,
 //     list_expr)): requires literal_count <= attribute_count, then checks
 //     every element of the LITERAL appears in the ATTRIBUTE - i.e.
 //     "attribute is a superset of the literal set" (the intuitive
-//     reading, and the opposite direction from a-tree's).
+//     reading matching the operator's own name, and the opposite
+//     direction from a-tree's native one).
 //
-// scores = [1, 2, 3], expression "scores all of (1, 2)": a-tree says false
-// (the 3-element attribute can't be a subset of the 2-element literal);
-// be-tree says true (the attribute contains every literal element). This
-// is a real gap in matching_engine's engine-agnostic contract - the two
-// engines are not swappable for any expression using "all of" - not
-// something a test can "fix", so it's pinned here to keep the divergence
-// visible rather than silently rediscovered later.
-TEST(matching_engine, all_of_semantics_diverge_between_engines) {
+// be-tree's (superset) semantic is treated as canonical. matching_engine's
+// atree_matching_engine::insert() runs every expression through
+// dialect.cpp's translate_to_atree_dialect() first, which rewrites
+// "X all of (lits)" into a conjunction of singleton "one of" checks -
+// which both engines' one_of() already agree on (a symmetric
+// non-empty-intersection test) - so a-tree's own native (wrong-for-us)
+// "all of" token is never actually used for this construct. This test
+// exercises that end-to-end, through matching_engine::insert() (not
+// dialect.cpp's translate function directly - that's covered by
+// tests/test_dialect.cpp), for both engines against the exact scores=[1,2,3]
+// fixture that originally exposed the divergence.
+TEST(matching_engine, all_of_reconciled_across_engines) {
     std::vector<attribute_def> attrs = {{"scores", attribute_type::integer_list}};
     std::vector<int64_t> scores{1, 2, 3};
 
-    auto atree_engine = sidecar::build_matching_engine(engine_type::atree, attrs);
-    atree_engine->insert(1, "scores all of (1, 2)");
-    auto atree_sink = atree_engine->make_event();
-    atree_sink->with_integer_list("scores", scores);
-    auto atree_result = atree_engine->search(*atree_sink);
-    EXPECT_TRUE(atree_result.empty())
-        << "a-tree's all_of requires the attribute to be a SUBSET of the literal";
-
-    auto betree_engine = sidecar::build_matching_engine(engine_type::betree, attrs);
-    betree_engine->insert(1, "scores all of (1, 2)");
-    auto betree_sink = betree_engine->make_event();
-    betree_sink->with_integer_list("scores", scores);
-    auto betree_result = betree_engine->search(*betree_sink);
-    EXPECT_FALSE(betree_result.empty())
-        << "be-tree's all_of requires the attribute to be a SUPERSET of the literal";
+    for (auto type : {engine_type::atree, engine_type::betree}) {
+        auto engine = sidecar::build_matching_engine(type, attrs);
+        engine->insert(1, "scores all of (1, 2)");
+        auto sink = engine->make_event();
+        sink->with_integer_list("scores", scores);
+        auto result = engine->search(*sink);
+        EXPECT_FALSE(result.empty())
+            << "engine " << (type == engine_type::atree ? "atree" : "betree")
+            << " should match scores=[1,2,3] against \"scores all of (1, 2)\" "
+               "now that all_of is reconciled to be-tree's superset semantic";
+    }
 }
 
 } // namespace

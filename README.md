@@ -161,6 +161,8 @@ One operator is engine-specific: **`is not empty` is only available under `engin
 
 `in` / `not in` list literals accept integer or string values only, not floats. `one of` / `none of` / `all of` apply to list-typed attributes (`string_list` / `integer_list`); `is empty` / `is not empty` likewise.
 
+`all of` means "the attribute contains every listed value" on both engines - but only because it's made to: a-tree's own native `all of` actually checks the opposite (the attribute is a subset of the literal list), so `matching_engine` transparently rewrites `X all of (v1, ..., vn)` into `X one of (v1) and ... and X one of (vn)` before handing it to a-tree, which evaluates to the same (be-tree-matching) result. This is invisible in normal use - the rewrite happens automatically inside `insert()` - but worth knowing if you're reading a-tree's own docs/tests, which describe `all of` differently.
+
 ## Client Protocol
 
 ### Subscribe

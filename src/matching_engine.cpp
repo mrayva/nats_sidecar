@@ -73,7 +73,7 @@ public:
 
     void insert(uint64_t id, const std::string& expression) override {
         try {
-            m_tree.insert(id, expression);
+            m_tree.insert(id, translate_to_atree_dialect(expression));
         } catch (const atree::Error& e) {
             throw matching_engine_error(e.what());
         }
