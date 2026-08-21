@@ -50,7 +50,11 @@ jobs:
         run: cmake --build build-ci --parallel 2
 
       - name: Test
-        run: ctest --test-dir build-ci --output-on-failure
+        # -R scopes to nats_sidecar's own test: cmake/BuildBetree.cmake pulls
+        # in be-tree's ~22 internal test executables via add_subdirectory(...
+        # EXCLUDE_FROM_ALL), which keeps them out of the build but not out of
+        # ctest's registry, since add_test() isn't gated by EXCLUDE_FROM_ALL.
+        run: ctest --test-dir build-ci --output-on-failure -R '^sidecar_test$'
 
       - name: Smoke-test CLI
         run: build-ci/bin/nats_sidecar --help
@@ -122,4 +126,4 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
-        run: ctest --test-dir build-sanitizer --output-on-failure
+        run: ctest --test-dir build-sanitizer --output-on-failure -R '^sidecar_test$'
