@@ -38,15 +38,16 @@ private:
 
 TEST(config_loading, loads_minimal_config_with_defaults) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 attributes:
   - name: temperature
     type: float
 )");
 
     auto cfg = sidecar::load_config(file.path());
-    EXPECT_EQ(cfg.input_subject, "sensor.data");
-    EXPECT_EQ(cfg.output_prefix, "sensor.data");  // defaults to input_subject
+    ASSERT_EQ(cfg.input_subjects.size(), 1u);
+    EXPECT_EQ(cfg.input_subjects[0], "sensor.data");
+    EXPECT_EQ(cfg.output_prefix, "sensor.data");  // defaults to the single input subject
     ASSERT_EQ(cfg.attributes.size(), 1u);
     EXPECT_EQ(cfg.attributes[0].name, "temperature");
     EXPECT_EQ(cfg.attributes[0].type, sidecar::attribute_type::float_val);
@@ -61,7 +62,7 @@ attributes:
 
 TEST(config_loading, explicit_output_prefix_overrides_default) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 output_prefix: sensor.filtered
 attributes:
   - name: temperature
@@ -74,7 +75,7 @@ attributes:
 
 TEST(config_loading, overrides_operational_and_queue_fields) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 format: cbor
 input_queue_group: workers
 subscribe_subject: custom.subscribe
@@ -118,7 +119,7 @@ attributes:
 
 TEST(config_loading, defaults_engine_to_atree) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 attributes:
   - name: temperature
     type: float
@@ -130,7 +131,7 @@ attributes:
 
 TEST(config_loading, parses_engine_betree) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 engine: betree
 attributes:
   - name: temperature
@@ -143,7 +144,7 @@ attributes:
 
 TEST(config_loading, invalid_engine_throws) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 engine: not-a-real-engine
 attributes:
   - name: temperature
@@ -152,7 +153,7 @@ attributes:
     EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
 }
 
-TEST(config_loading, missing_input_subject_throws) {
+TEST(config_loading, missing_input_subjects_throws) {
     temp_yaml_file file(R"(
 attributes:
   - name: temperature
@@ -161,16 +162,56 @@ attributes:
     EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
 }
 
+TEST(config_loading, empty_input_subjects_list_throws) {
+    temp_yaml_file file(R"(
+input_subjects: []
+attributes:
+  - name: temperature
+    type: float
+)");
+    EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
+}
+
+TEST(config_loading, multiple_input_subjects_with_explicit_output_prefix) {
+    temp_yaml_file file(R"(
+input_subjects: [sensor.data, sensor.data.backup]
+output_prefix: sensor.filtered
+attributes:
+  - name: temperature
+    type: float
+)");
+    auto cfg = sidecar::load_config(file.path());
+    ASSERT_EQ(cfg.input_subjects.size(), 2u);
+    EXPECT_EQ(cfg.input_subjects[0], "sensor.data");
+    EXPECT_EQ(cfg.input_subjects[1], "sensor.data.backup");
+    EXPECT_EQ(cfg.output_prefix, "sensor.filtered");
+}
+
+TEST(config_loading, multiple_input_subjects_without_output_prefix_leaves_it_empty) {
+    // load_config() itself doesn't raise for this - the ambiguous-default
+    // check lives in finalize_and_validate_config() (see test_cli.cpp),
+    // shared by both the CLI and config-file paths. Confirm load_config()
+    // just leaves output_prefix empty rather than guessing.
+    temp_yaml_file file(R"(
+input_subjects: [sensor.data, sensor.data.backup]
+attributes:
+  - name: temperature
+    type: float
+)");
+    auto cfg = sidecar::load_config(file.path());
+    EXPECT_TRUE(cfg.output_prefix.empty());
+}
+
 TEST(config_loading, missing_attributes_throws) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 )");
     EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
 }
 
 TEST(config_loading, empty_attributes_list_throws) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 attributes: []
 )");
     EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
@@ -178,7 +219,7 @@ attributes: []
 
 TEST(config_loading, invalid_format_throws) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 format: not-a-real-format
 attributes:
   - name: temperature
@@ -189,7 +230,7 @@ attributes:
 
 TEST(config_loading, invalid_attribute_type_throws) {
     temp_yaml_file file(R"(
-input_subject: sensor.data
+input_subjects: [sensor.data]
 attributes:
   - name: temperature
     type: not-a-real-type

@@ -8,6 +8,7 @@
 #include <asio/detached.hpp>
 #include <asio/use_awaitable.hpp>
 #include <cxxopts.hpp>
+#include <fmt/ranges.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <iostream>
@@ -44,7 +45,7 @@ void set_log_level(const std::string& level) {
 void log_startup_banner(spdlog::logger& console, const sidecar::config& cfg) {
     console.info("nats_sidecar starting");
     console.info("  server: {}:{}", cfg.nats_address, cfg.nats_port);
-    console.info("  input:  {} (format={})", cfg.input_subject, static_cast<int>(cfg.format));
+    console.info("  input:  {} (format={})", fmt::join(cfg.input_subjects, ", "), static_cast<int>(cfg.format));
     console.info("  engine: {}", cfg.engine == sidecar::engine_type::atree ? "atree" : "betree");
     console.info("  output: {}.<ID>", cfg.output_prefix);
     console.info("  attributes: {}", cfg.attributes.size());

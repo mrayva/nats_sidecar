@@ -46,7 +46,8 @@ TEST(cli, apply_cli_overrides_applies_all_flags) {
 
     EXPECT_EQ(cfg.nats_address, "10.0.0.5");
     EXPECT_EQ(cfg.nats_port, 4223);
-    EXPECT_EQ(cfg.input_subject, "sensor.data");
+    ASSERT_EQ(cfg.input_subjects.size(), 1u);
+    EXPECT_EQ(cfg.input_subjects[0], "sensor.data");
     EXPECT_EQ(cfg.output_prefix, "sensor.filtered");
     EXPECT_EQ(cfg.input_queue_group, "workers");
     EXPECT_EQ(cfg.subscribe_subject, "custom.subscribe");
@@ -65,6 +66,21 @@ TEST(cli, apply_cli_overrides_applies_all_flags) {
     EXPECT_EQ(cfg.stats_interval_seconds, 30);
     EXPECT_EQ(cfg.log_level, "warn");
     EXPECT_EQ(cfg.format, sidecar::binary_format::cbor);
+}
+
+TEST(cli, apply_cli_overrides_accepts_repeated_input_subject_flags) {
+    auto options = sidecar::build_cli_options();
+    auto result = parse_args(options, {
+        "--input-subject", "sensor.data",
+        "--input-subject", "sensor.data.backup",
+    });
+
+    sidecar::config cfg;
+    auto err = sidecar::apply_cli_overrides(cfg, result);
+    ASSERT_FALSE(err.has_value()) << *err;
+    ASSERT_EQ(cfg.input_subjects.size(), 2u);
+    EXPECT_EQ(cfg.input_subjects[0], "sensor.data");
+    EXPECT_EQ(cfg.input_subjects[1], "sensor.data.backup");
 }
 
 TEST(cli, apply_cli_overrides_leaves_unset_fields_at_default) {
@@ -169,7 +185,7 @@ TEST(cli, apply_cli_overrides_attr_invalid_type_returns_error) {
 
 TEST(cli, finalize_and_validate_config_defaults_output_prefix_to_input_subject) {
     sidecar::config cfg;
-    cfg.input_subject = "sensor.data";
+    cfg.input_subjects = {"sensor.data"};
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
     EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
@@ -178,7 +194,7 @@ TEST(cli, finalize_and_validate_config_defaults_output_prefix_to_input_subject) 
 
 TEST(cli, finalize_and_validate_config_keeps_explicit_output_prefix) {
     sidecar::config cfg;
-    cfg.input_subject = "sensor.data";
+    cfg.input_subjects = {"sensor.data"};
     cfg.output_prefix = "sensor.filtered";
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
@@ -186,18 +202,38 @@ TEST(cli, finalize_and_validate_config_keeps_explicit_output_prefix) {
     EXPECT_EQ(cfg.output_prefix, "sensor.filtered");
 }
 
-TEST(cli, finalize_and_validate_config_missing_input_subject_errors) {
+TEST(cli, finalize_and_validate_config_missing_input_subjects_errors) {
     sidecar::config cfg;
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
     auto err = sidecar::finalize_and_validate_config(cfg);
     ASSERT_TRUE(err.has_value());
-    EXPECT_NE(err->find("input_subject"), std::string::npos);
+    EXPECT_NE(err->find("input subject"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_multiple_subjects_require_explicit_output_prefix) {
+    sidecar::config cfg;
+    cfg.input_subjects = {"sensor.data", "sensor.data.backup"};
+    cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("output_prefix"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_multiple_subjects_with_explicit_output_prefix_succeeds) {
+    sidecar::config cfg;
+    cfg.input_subjects = {"sensor.data", "sensor.data.backup"};
+    cfg.output_prefix = "sensor.filtered";
+    cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
+
+    EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
+    EXPECT_EQ(cfg.output_prefix, "sensor.filtered");
 }
 
 TEST(cli, finalize_and_validate_config_missing_attributes_errors) {
     sidecar::config cfg;
-    cfg.input_subject = "sensor.data";
+    cfg.input_subjects = {"sensor.data"};
 
     auto err = sidecar::finalize_and_validate_config(cfg);
     ASSERT_TRUE(err.has_value());
@@ -206,7 +242,7 @@ TEST(cli, finalize_and_validate_config_missing_attributes_errors) {
 
 TEST(cli, finalize_and_validate_config_zero_lease_ttl_errors) {
     sidecar::config cfg;
-    cfg.input_subject = "sensor.data";
+    cfg.input_subjects = {"sensor.data"};
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
     cfg.lease_ttl_seconds = 0;
 
@@ -217,7 +253,7 @@ TEST(cli, finalize_and_validate_config_zero_lease_ttl_errors) {
 
 TEST(cli, finalize_and_validate_config_zero_publish_max_inflight_errors) {
     sidecar::config cfg;
-    cfg.input_subject = "sensor.data";
+    cfg.input_subjects = {"sensor.data"};
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
     cfg.publish_max_inflight = 0;
 
@@ -228,7 +264,7 @@ TEST(cli, finalize_and_validate_config_zero_publish_max_inflight_errors) {
 
 TEST(cli, finalize_and_validate_config_accepts_valid_config) {
     sidecar::config cfg;
-    cfg.input_subject = "sensor.data";
+    cfg.input_subjects = {"sensor.data"};
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
     EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());

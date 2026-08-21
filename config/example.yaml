@@ -3,8 +3,14 @@
 nats_address: "127.0.0.1"
 nats_port: 4222
 
-# Input: core NATS subject carrying binary-encoded messages
-input_subject: "sensor.data"
+# Input: core NATS subjects carrying binary-encoded messages, all sharing
+# this file's one attribute schema below. Every message from every listed
+# subject is matched against the same subscription tree. Add more entries
+# to subscribe to multiple subjects at once:
+#   input_subjects: ["sensor.data", "sensor.data.backup"]
+# output_prefix (below) must be set explicitly whenever more than one
+# input subject is listed - with exactly one, it defaults to that subject.
+input_subjects: ["sensor.data"]
 format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
 # input_queue_group: "sidecar-group"  # uncomment to load-balance across instances
 

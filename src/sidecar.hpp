@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace sidecar {
 
@@ -35,6 +36,11 @@ public:
 
 private:
     friend struct sidecar_engine_test_access;
+
+    // Subscribes to every configured input subject, wiring each to
+    // on_data_message(). Returns false (having already logged and stopped
+    // the ioc) on the first subscription failure.
+    asio::awaitable<bool> subscribe_to_inputs();
 
     // Callback: incoming data message on the input subject
     asio::awaitable<void> on_data_message(
@@ -62,7 +68,7 @@ private:
     std::shared_ptr<spdlog::logger> m_log;
 
     nats_asio::iconnection_sptr m_conn;
-    nats_asio::isubscription_sptr m_data_sub;
+    std::vector<nats_asio::isubscription_sptr> m_data_subs;
     nats_asio::isubscription_sptr m_subscribe_sub;
     nats_asio::isubscription_sptr m_unsubscribe_sub;
     subscription_manager m_sub_mgr;

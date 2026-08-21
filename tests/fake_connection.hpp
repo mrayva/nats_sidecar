@@ -16,6 +16,15 @@
 
 namespace sidecar_test {
 
+// Trivial isubscription for tests whose on_subscribe hook needs to return a
+// real (non-null) subscription on success.
+struct fake_subscription : public nats_asio::isubscription {
+    uint64_t sid() noexcept override { return 1; }
+    void cancel() noexcept override {}
+    uint32_t max_messages() const noexcept override { return 0; }
+    uint32_t message_count() const noexcept override { return 0; }
+};
+
 class fake_connection : public nats_asio::iconnection {
 public:
     // --- configurable hooks (nullptr = default "unimplemented" behavior) ---
@@ -27,6 +36,14 @@ public:
         on_request;
     std::function<asio::awaitable<nats_asio::status>(std::string_view, std::span<const char>)>
         on_publish;
+    // Backs the on_message_cb subscribe() overload only - the one
+    // sidecar_engine's data-subject subscription loop actually uses.
+    std::function<asio::awaitable<std::pair<nats_asio::isubscription_sptr, nats_asio::status>>(
+        std::string_view, nats_asio::on_message_cb, nats_asio::subscribe_options)>
+        on_subscribe;
+    // Always populated regardless of on_subscribe, in call order - lets
+    // tests assert which subjects a subscribe loop actually attempted.
+    std::vector<std::string> subscribed_subjects;
 
     // --- in-memory KV store backing kv_put/kv_get/kv_delete/kv_keys ---
     struct kv_record {
@@ -323,7 +340,10 @@ public:
         co_return nats_asio::status{};
     }
     asio::awaitable<std::pair<nats_asio::isubscription_sptr, nats_asio::status>> subscribe(
-        std::string_view, nats_asio::on_message_cb, nats_asio::subscribe_options) override {
+        std::string_view subject, nats_asio::on_message_cb cb,
+        nats_asio::subscribe_options opts) override {
+        subscribed_subjects.emplace_back(subject);
+        if (on_subscribe) co_return co_await on_subscribe(subject, std::move(cb), opts);
         co_return std::pair<nats_asio::isubscription_sptr, nats_asio::status>{
             nullptr, nats_asio::status(nats_asio::error_code::operation_failed)};
     }

@@ -16,9 +16,9 @@ cxxopts::Options build_cli_options();
 // nullopt on success.
 std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::ParseResult& result);
 
-// Fills in defaults (output_prefix defaults to input_subject) and validates
-// required/nonzero fields. Returns an error message if invalid, nullopt on
-// success.
+// Fills in defaults (output_prefix defaults to the single input subject when
+// there's exactly one) and validates required/nonzero fields. Returns an
+// error message if invalid, nullopt on success.
 std::optional<std::string> finalize_and_validate_config(config& cfg);
 
 // Resolves the worker thread count that will actually be used:

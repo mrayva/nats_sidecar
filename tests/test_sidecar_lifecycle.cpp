@@ -16,6 +16,7 @@
 namespace {
 
 using sidecar_test::run_void_to_completion;
+using sidecar_test::run_to_completion;
 
 auto make_log() {
     return std::make_shared<spdlog::logger>(
@@ -24,7 +25,7 @@ auto make_log() {
 
 sidecar::config sample_config() {
     sidecar::config cfg;
-    cfg.input_subject = "sensor.data";
+    cfg.input_subjects = {"sensor.data"};
     cfg.output_prefix = "sensor.filtered";
     cfg.stats_interval_seconds = 3600;
     cfg.lease_bucket = "test-leases";
@@ -72,6 +73,10 @@ struct sidecar_engine_test_access {
         engine.m_worker_pool = std::make_unique<sidecar::worker_pool>(
             engine.m_ioc, engine.m_cfg, engine.m_schema, engine.m_sub_mgr, conn, engine.m_log);
         engine.m_worker_pool->start();
+    }
+
+    static asio::awaitable<bool> subscribe_to_inputs(sidecar::sidecar_engine& engine) {
+        return engine.subscribe_to_inputs();
     }
 
     static sidecar::subscription_manager& sub_mgr(sidecar::sidecar_engine& engine) {
@@ -122,6 +127,103 @@ TEST(sidecar_engine, stop_workers_cancels_stats_loop) {
 
     EXPECT_TRUE(ioc.stopped());
     EXPECT_TRUE(sidecar::sidecar_engine_test_access::shutting_down(engine));
+}
+
+// --- subscribe_to_inputs (multiple input subjects) ---
+
+TEST(sidecar_engine, subscribe_to_inputs_subscribes_to_every_configured_subject) {
+    asio::io_context ioc(1);
+    auto cfg = sample_config();
+    cfg.input_subjects = {"sensor.data", "sensor.data.backup"};
+    sidecar::sidecar_engine engine(ioc, cfg, make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_subscribe = [](std::string_view, nats_asio::on_message_cb,
+                             nats_asio::subscribe_options)
+        -> asio::awaitable<std::pair<nats_asio::isubscription_sptr, nats_asio::status>> {
+        co_return std::pair<nats_asio::isubscription_sptr, nats_asio::status>{
+            std::make_shared<sidecar_test::fake_subscription>(), nats_asio::status{}};
+    };
+
+    bool ok = run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::subscribe_to_inputs(engine));
+    EXPECT_TRUE(ok);
+    ASSERT_EQ(conn->subscribed_subjects.size(), 2u);
+    EXPECT_EQ(conn->subscribed_subjects[0], "sensor.data");
+    EXPECT_EQ(conn->subscribed_subjects[1], "sensor.data.backup");
+}
+
+TEST(sidecar_engine, subscribe_to_inputs_stops_at_first_failure) {
+    asio::io_context ioc(1);
+    auto cfg = sample_config();
+    cfg.input_subjects = {"sensor.data", "sensor.data.backup", "sensor.data.third"};
+    sidecar::sidecar_engine engine(ioc, cfg, make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_subscribe = [](std::string_view subject, nats_asio::on_message_cb,
+                             nats_asio::subscribe_options)
+        -> asio::awaitable<std::pair<nats_asio::isubscription_sptr, nats_asio::status>> {
+        if (subject == "sensor.data") {
+            co_return std::pair<nats_asio::isubscription_sptr, nats_asio::status>{
+                std::make_shared<sidecar_test::fake_subscription>(), nats_asio::status{}};
+        }
+        co_return std::pair<nats_asio::isubscription_sptr, nats_asio::status>{
+            nullptr, nats_asio::status(nats_asio::error_code::operation_failed)};
+    };
+
+    bool ok = run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::subscribe_to_inputs(engine));
+    EXPECT_FALSE(ok);
+    // First subject succeeded and the second failed - the third should
+    // never have been attempted.
+    ASSERT_EQ(conn->subscribed_subjects.size(), 2u);
+    EXPECT_EQ(conn->subscribed_subjects[0], "sensor.data");
+    EXPECT_EQ(conn->subscribed_subjects[1], "sensor.data.backup");
+}
+
+TEST(sidecar_engine, messages_from_every_configured_subject_reach_the_worker_pool) {
+    // Proves the same on_data_message callback (and therefore the same
+    // shared subscription_manager/matching tree) is wired to every
+    // configured input subject, not just the first.
+    asio::io_context ioc(1);
+    auto cfg = sample_config();
+    cfg.input_subjects = {"sensor.data", "sensor.data.backup"};
+    sidecar::sidecar_engine engine(ioc, cfg, make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    std::vector<nats_asio::on_message_cb> callbacks;
+    conn->on_subscribe = [&callbacks](std::string_view, nats_asio::on_message_cb cb,
+                                       nats_asio::subscribe_options)
+        -> asio::awaitable<std::pair<nats_asio::isubscription_sptr, nats_asio::status>> {
+        callbacks.push_back(std::move(cb));
+        co_return std::pair<nats_asio::isubscription_sptr, nats_asio::status>{
+            std::make_shared<sidecar_test::fake_subscription>(), nats_asio::status{}};
+    };
+
+    ASSERT_TRUE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::subscribe_to_inputs(engine)));
+    ASSERT_EQ(callbacks.size(), 2u);
+
+    // 0xc1 is reserved/invalid in MessagePack - exercises processing
+    // without needing a matching subscription or publish work, same
+    // fixture as on_data_message_enqueues_into_worker_pool above.
+    std::vector<char> payload{static_cast<char>(0xc1)};
+    std::span<const char> payload_span(payload.data(), payload.size());
+
+    ASSERT_TRUE(run_void_to_completion(ioc, callbacks[0]("sensor.data", std::nullopt, payload_span)));
+    ASSERT_TRUE(run_void_to_completion(ioc, callbacks[1]("sensor.data.backup", std::nullopt, payload_span)));
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (sidecar::sidecar_engine_test_access::worker_stats(engine).processed < 2 &&
+           std::chrono::steady_clock::now() < deadline) {
+        ioc.restart();
+        ioc.run_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::worker_stats(engine).processed, 2u);
 }
 
 // --- on_data_message ---

@@ -21,7 +21,7 @@ auto worker_log() {
 
 sidecar::config worker_config() {
     sidecar::config cfg;
-    cfg.input_subject = "input";
+    cfg.input_subjects = {"input"};
     cfg.output_prefix = "output";
     cfg.worker_threads = 2;
     cfg.input_queue_max_messages = 1024;

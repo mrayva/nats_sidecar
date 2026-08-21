@@ -47,13 +47,18 @@ struct config {
     std::string tls_key;
     std::string tls_ca;
 
-    // Input stream - core NATS subject with binary messages
-    std::string input_subject;
+    // Input streams - core NATS subjects with binary messages, all sharing
+    // this config's one attribute schema. Every message from every
+    // configured subject is matched against the same subscription tree.
+    std::vector<std::string> input_subjects;
     binary_format format = binary_format::msgpack;
     std::string input_queue_group;  // optional load-balancing across sidecars
 
     // Output - matched messages published to <output_prefix>.<BE-ID>
-    std::string output_prefix;  // defaults to input_subject if empty
+    // Defaults to the single input subject if there is exactly one; must
+    // be set explicitly when input_subjects has more than one entry, since
+    // there is no unambiguous default to pick among them.
+    std::string output_prefix;
 
     // Subscription management - clients send requests here
     std::string subscribe_subject = "sidecar.subscribe";

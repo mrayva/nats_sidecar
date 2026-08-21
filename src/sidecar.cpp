@@ -34,28 +34,7 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
         m_ioc, m_cfg, m_schema, m_sub_mgr, m_conn, m_log);
     m_worker_pool->start();
 
-    // Subscribe to the input data subject
-    nats_asio::subscribe_options data_opts;
-    if (!m_cfg.input_queue_group.empty()) {
-        data_opts.queue_group = m_cfg.input_queue_group;
-    }
-
-    auto [data_sub, data_status] = co_await m_conn->subscribe(
-        m_cfg.input_subject,
-        [this](auto subject, auto reply_to, auto payload) {
-            return on_data_message(subject, reply_to, payload);
-        },
-        data_opts
-    );
-
-    if (data_status.failed()) {
-        m_log->error("Failed to subscribe to input subject '{}': {}",
-                    m_cfg.input_subject, data_status.error());
-        m_ioc.stop();
-        co_return;
-    }
-    m_data_sub = std::move(data_sub);
-    m_log->info("Subscribed to input subject '{}'", m_cfg.input_subject);
+    if (!co_await subscribe_to_inputs()) co_return;
 
     // Subscribe to subscription control subject (request/reply)
     auto [sub_ctrl, sub_ctrl_status] = co_await m_conn->subscribe(
@@ -119,7 +98,7 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
 
 void sidecar_engine::stop_workers() {
     m_shutting_down.store(true, std::memory_order_relaxed);
-    if (m_data_sub) m_data_sub->cancel();
+    for (auto& sub : m_data_subs) { if (sub) sub->cancel(); }
     if (m_subscribe_sub) m_subscribe_sub->cancel();
     if (m_unsubscribe_sub) m_unsubscribe_sub->cancel();
     if (m_lease_mgr) m_lease_mgr->stop();
@@ -139,6 +118,36 @@ asio::awaitable<bool> sidecar_engine::wait_for_publications(
     std::chrono::milliseconds timeout) {
     if (!m_worker_pool) co_return true;
     co_return co_await m_worker_pool->wait_for_publications(timeout);
+}
+
+asio::awaitable<bool> sidecar_engine::subscribe_to_inputs() {
+    // Subscribe to every configured input data subject - all share this
+    // engine's one on_data_message() callback and one subscription_manager,
+    // so messages from any of them are matched against the same tree.
+    nats_asio::subscribe_options data_opts;
+    if (!m_cfg.input_queue_group.empty()) {
+        data_opts.queue_group = m_cfg.input_queue_group;
+    }
+
+    for (const auto& subject : m_cfg.input_subjects) {
+        auto [data_sub, data_status] = co_await m_conn->subscribe(
+            subject,
+            [this](auto sub, auto reply_to, auto payload) {
+                return on_data_message(sub, reply_to, payload);
+            },
+            data_opts
+        );
+
+        if (data_status.failed()) {
+            m_log->error("Failed to subscribe to input subject '{}': {}",
+                        subject, data_status.error());
+            m_ioc.stop();
+            co_return false;
+        }
+        m_data_subs.push_back(std::move(data_sub));
+        m_log->info("Subscribed to input subject '{}'", subject);
+    }
+    co_return true;
 }
 
 asio::awaitable<void> sidecar_engine::on_data_message(

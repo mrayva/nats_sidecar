@@ -1,5 +1,6 @@
 #include "cli.hpp"
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <thread>
 
 namespace sidecar {
@@ -12,7 +13,9 @@ cxxopts::Options build_cli_options() {
         ("c,config", "Path to YAML config file", cxxopts::value<std::string>())
         ("a,address", "NATS server address", cxxopts::value<std::string>())
         ("p,port", "NATS server port", cxxopts::value<uint16_t>())
-        ("i,input-subject", "Input NATS subject", cxxopts::value<std::string>())
+        ("i,input-subject", "Input NATS subject (repeatable for multiple inputs; "
+                             "replaces any config-file input_subjects entirely if given)",
+                             cxxopts::value<std::vector<std::string>>())
         ("f,format", "Binary format (msgpack|cbor|flexbuffers|zera|ion|bson|beve)", cxxopts::value<std::string>())
         ("engine", "Matching engine (atree|betree)", cxxopts::value<std::string>())
         ("output-prefix", "Output subject prefix", cxxopts::value<std::string>())
@@ -43,7 +46,7 @@ cxxopts::Options build_cli_options() {
 std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::ParseResult& result) {
     if (result.count("address"))              cfg.nats_address = result["address"].as<std::string>();
     if (result.count("port"))                 cfg.nats_port = result["port"].as<uint16_t>();
-    if (result.count("input-subject"))        cfg.input_subject = result["input-subject"].as<std::string>();
+    if (result.count("input-subject"))        cfg.input_subjects = result["input-subject"].as<std::vector<std::string>>();
     if (result.count("output-prefix"))        cfg.output_prefix = result["output-prefix"].as<std::string>();
     if (result.count("queue-group"))          cfg.input_queue_group = result["queue-group"].as<std::string>();
     if (result.count("subscribe-subject"))    cfg.subscribe_subject = result["subscribe-subject"].as<std::string>();
@@ -100,11 +103,21 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
 }
 
 std::optional<std::string> finalize_and_validate_config(config& cfg) {
-    // Default output_prefix to input_subject if still empty
-    if (cfg.output_prefix.empty()) cfg.output_prefix = cfg.input_subject;
+    // Default output_prefix to the single input subject if still empty and
+    // unambiguous; with more than one input subject there's no sane default.
+    if (cfg.output_prefix.empty() && cfg.input_subjects.size() == 1) {
+        cfg.output_prefix = cfg.input_subjects.front();
+    }
 
-    if (cfg.input_subject.empty()) {
-        return "input_subject is required (via config file or --input-subject)";
+    if (cfg.input_subjects.empty()) {
+        return "at least one input subject is required (via config file's "
+               "input_subjects or --input-subject)";
+    }
+    if (cfg.output_prefix.empty()) {
+        return fmt::format(
+            "output_prefix is required when more than one input subject is configured "
+            "(got {} input subjects: {}) - there is no unambiguous default to pick among them",
+            cfg.input_subjects.size(), fmt::join(cfg.input_subjects, ", "));
     }
     if (cfg.attributes.empty()) {
         return "At least one attribute is required (via config file or --attr)";

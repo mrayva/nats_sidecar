@@ -43,10 +43,14 @@ config load_config(const std::string& path) {
     if (auto n = root["tls_ca"])       cfg.tls_ca   = n.as<std::string>();
 
     // Input
-    if (auto n = root["input_subject"]) {
-        cfg.input_subject = n.as<std::string>();
+    if (auto n = root["input_subjects"]) {
+        if (!n.IsSequence()) throw std::runtime_error("config: 'input_subjects' must be a list");
+        for (const auto& item : n) cfg.input_subjects.push_back(item.as<std::string>());
+        if (cfg.input_subjects.empty()) {
+            throw std::runtime_error("config: 'input_subjects' must not be empty");
+        }
     } else {
-        throw std::runtime_error("config: 'input_subject' is required");
+        throw std::runtime_error("config: 'input_subjects' is required");
     }
 
     if (auto n = root["format"]) {
@@ -66,9 +70,12 @@ config load_config(const std::string& path) {
     // Output
     if (auto n = root["output_prefix"]) {
         cfg.output_prefix = n.as<std::string>();
-    } else {
-        cfg.output_prefix = cfg.input_subject;
+    } else if (cfg.input_subjects.size() == 1) {
+        cfg.output_prefix = cfg.input_subjects.front();
     }
+    // else: left empty here: finalize_and_validate_config() (shared with the
+    // CLI path) raises a clear error for the multi-subject case rather than
+    // silently picking one input subject as the default.
 
     // Subscription subjects
     if (auto n = root["subscribe_subject"])   cfg.subscribe_subject   = n.as<std::string>();

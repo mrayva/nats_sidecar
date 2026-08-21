@@ -70,7 +70,7 @@ All configuration parameters can be set via CLI flags. When a config file is als
 | `-c, --config PATH` | Path to YAML config file |
 | `-a, --address HOST` | NATS server address |
 | `-p, --port PORT` | NATS server port |
-| `-i, --input-subject SUBJ` | Input NATS subject |
+| `-i, --input-subject SUBJ` | Input NATS subject (repeatable: `-i a -i b` for multiple inputs) |
 | `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`) |
 | `--engine ENGINE` | Matching engine (`atree`, `betree`); defaults to `atree` |
 | `--output-prefix PREFIX` | Output subject prefix (defaults to input subject) |
@@ -99,7 +99,7 @@ All configuration parameters can be set via CLI flags. When a config file is als
 
 The sidecar can be configured via a YAML file, CLI flags, or a combination of both. When both are provided, CLI flags override the corresponding YAML values. A config file is not required — all parameters can be supplied via CLI.
 
-The only required settings are `input_subject` and at least one attribute definition. Everything else has sensible defaults.
+The only required settings are `input_subjects` (at least one) and at least one attribute definition. Everything else has sensible defaults.
 
 See [`config/example.yaml`](config/example.yaml) for a full annotated example. Key settings:
 
@@ -108,8 +108,12 @@ See [`config/example.yaml`](config/example.yaml) for a full annotated example. K
 nats_address: "127.0.0.1"
 nats_port: 4222
 
-# Input: NATS subject carrying binary-encoded messages
-input_subject: "sensor.data"
+# Input: NATS subject(s) carrying binary-encoded messages, all sharing the
+# one attribute schema below - `-i`/`--input-subject` is repeatable on the
+# CLI for the same effect. With more than one subject, output_prefix must
+# be set explicitly (see below); with exactly one, it defaults to that
+# subject.
+input_subjects: ["sensor.data"]
 format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
 engine: atree             # atree | betree
 
