@@ -200,7 +200,30 @@ asio::awaitable<void> sidecar_engine::on_subscribe_request(
             }
         }
 
-        uint64_t sub_id = m_sub_mgr.subscribe(expression, client_id);
+        // A client that wants to broadcast this request to every instance
+        // sharing one control subject (fan-out, not queue group) must supply
+        // its own ID rather than let each instance's uncoordinated
+        // m_next_id++ counter assign one - otherwise two instances handling
+        // the same expression independently could land on different IDs and
+        // thus different output topics, with no way for the client to know
+        // which instance said what. When "id" is present, restore() is used
+        // instead of subscribe(): it adopts the given ID if the expression
+        // matches (idempotent, safe to replay), or fails if that ID is
+        // already bound to a *different* expression on this instance - a
+        // real conflict, surfaced below as an error reply, not silently
+        // absorbed. Omitting "id" keeps the original per-instance-assigned
+        // behavior for callers still using one control subject per instance.
+        uint64_t sub_id;
+        if (auto id_it = req.find("id"); id_it != req.end()) {
+            sub_id = id_it->get<uint64_t>();
+            if (!m_sub_mgr.restore(sub_id, expression, client_id)) {
+                throw std::runtime_error(
+                    "subscription id " + std::to_string(sub_id) +
+                    " is already bound to a different expression on this instance");
+            }
+        } else {
+            sub_id = m_sub_mgr.subscribe(expression, client_id);
+        }
         if (!co_await m_lease_mgr->persist_lease(sub_id, expression, client_id)) {
             if (!already_held) m_sub_mgr.remove_lease(sub_id, client_id);
             throw std::runtime_error("failed to create or refresh lease");

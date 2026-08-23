@@ -310,6 +310,104 @@ TEST(sidecar_engine, on_subscribe_request_valid_returns_subscription_details) {
     EXPECT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 1u);
 }
 
+TEST(sidecar_engine, on_subscribe_request_with_explicit_id_uses_it_as_subscription_id) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    std::string captured_reply;
+    conn->on_publish = [&](std::string_view, std::span<const char> payload) -> asio::awaitable<nats_asio::status> {
+        captured_reply.assign(payload.data(), payload.size());
+        co_return nats_asio::status{};
+    };
+
+    // Simulates a client broadcasting one subscribe request to a shared
+    // control subject that every instance listens on - the ID is
+    // client-assigned, not left to this instance's own m_next_id++ counter.
+    auto payload = json_payload({{"expression", "temperature > 30.0"},
+                                  {"client_id", "client-1"},
+                                  {"id", 424242ull}});
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply"), std::move(payload))));
+
+    auto reply = nlohmann::json::parse(captured_reply);
+    EXPECT_EQ(reply.at("id").get<uint64_t>(), 424242u);
+    EXPECT_EQ(reply.at("topic").get<std::string>(), "sensor.filtered.424242");
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 1u);
+}
+
+TEST(sidecar_engine, on_subscribe_request_explicit_id_replay_is_idempotent) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+    conn->on_publish = [](std::string_view, std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+
+    // Same broadcast request delivered twice (e.g. this instance received
+    // it once directly and once via a retry) must not create a duplicate
+    // subscription or a second lease holder entry for the same client.
+    for (int i = 0; i < 2; ++i) {
+        auto payload = json_payload({{"expression", "temperature > 30.0"},
+                                      {"client_id", "client-1"},
+                                      {"id", 424242ull}});
+        ASSERT_TRUE(run_void_to_completion(
+            ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                     engine, std::string("_INBOX.reply"), std::move(payload))));
+    }
+
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 1u);
+    auto sub = sidecar::sidecar_engine_test_access::sub_mgr(engine).get_subscription(424242u);
+    ASSERT_TRUE(sub.has_value());
+    EXPECT_EQ(sub->lease_holders.size(), 1u);
+}
+
+TEST(sidecar_engine, on_subscribe_request_explicit_id_conflict_replies_with_error) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+    conn->on_publish = [](std::string_view, std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+
+    auto first_payload = json_payload({{"expression", "temperature > 30.0"},
+                                        {"client_id", "client-1"},
+                                        {"id", 424242ull}});
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply1"), std::move(first_payload))));
+
+    // A different expression arrives claiming the same ID - a real conflict
+    // (two different clients' random IDs collided, or a bug on the client
+    // side), not a replay. Must be rejected, not silently overwrite the
+    // existing subscription's expression.
+    std::string captured_reply;
+    conn->on_publish = [&](std::string_view, std::span<const char> payload) -> asio::awaitable<nats_asio::status> {
+        captured_reply.assign(payload.data(), payload.size());
+        co_return nats_asio::status{};
+    };
+    auto second_payload = json_payload({{"expression", "temperature > 50.0"},
+                                         {"client_id", "client-2"},
+                                         {"id", 424242ull}});
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply2"), std::move(second_payload))));
+
+    auto reply = nlohmann::json::parse(captured_reply);
+    ASSERT_TRUE(reply.contains("error"));
+    EXPECT_NE(reply.at("error").get<std::string>().find("already bound to a different expression"),
+              std::string::npos);
+    // The original subscription must be untouched by the rejected conflict.
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 1u);
+    auto sub = sidecar::sidecar_engine_test_access::sub_mgr(engine).get_subscription(424242u);
+    ASSERT_TRUE(sub.has_value());
+    EXPECT_EQ(sub->expression, "temperature > 30.0");
+}
+
 TEST(sidecar_engine, on_subscribe_request_without_reply_to_is_ignored) {
     asio::io_context ioc(1);
     sidecar::sidecar_engine engine(ioc, sample_config(), make_log());

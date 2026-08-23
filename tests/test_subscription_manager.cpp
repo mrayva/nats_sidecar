@@ -195,6 +195,39 @@ TEST(subscription_manager, rejects_conflicting_restored_records) {
     EXPECT_EQ(mgr.active_count(), 1u);
 }
 
+// This is the property the whole client-assigned-ID control-plane redesign
+// depends on: two entirely independent sidecar instances (modeled here as
+// two independent subscription_manager objects, never talking to each
+// other), each fed the SAME client-supplied ID+expression pair via
+// restore() - as they would be by a shared, fan-out control subject - must
+// land on the identical output topic without any coordination between them.
+// This is what lets a client compute where matches will be published the
+// instant it publishes the subscribe request, without waiting for any
+// instance's reply.
+TEST(subscription_manager, independent_instances_restoring_same_id_agree_on_output_topic) {
+    sidecar::subscription_manager mgr_a(sample_attributes(), "sc.real.out", make_log());
+    sidecar::subscription_manager mgr_b(sample_attributes(), "sc.real.out", make_log());
+
+    constexpr uint64_t client_assigned_id = 0x9F3A7B21C4E60D18ull;
+    ASSERT_TRUE(mgr_a.restore(client_assigned_id, "location = \"NYC\"", "client-1"));
+    ASSERT_TRUE(mgr_b.restore(client_assigned_id, "location = \"NYC\"", "client-1"));
+
+    const auto& topic_a = mgr_a.snapshot()->output_subjects.at(client_assigned_id);
+    const auto& topic_b = mgr_b.snapshot()->output_subjects.at(client_assigned_id);
+    EXPECT_EQ(topic_a, topic_b);
+    EXPECT_EQ(topic_a, "sc.real.out." + std::to_string(client_assigned_id));
+
+    // Order-independence: mgr_b sees an unrelated prior subscription first
+    // (simulating divergent per-instance history - exactly the scenario
+    // that makes uncoordinated auto-incrementing IDs unsafe), yet still
+    // agrees with mgr_a once given the same explicit ID.
+    sidecar::subscription_manager mgr_c(sample_attributes(), "sc.real.out", make_log());
+    mgr_c.subscribe("severity = 5", "some-other-client");
+    mgr_c.subscribe("active", "some-other-client");
+    ASSERT_TRUE(mgr_c.restore(client_assigned_id, "location = \"NYC\"", "client-1"));
+    EXPECT_EQ(mgr_c.snapshot()->output_subjects.at(client_assigned_id), topic_a);
+}
+
 // --- engine=betree: same subscribe/lease/snapshot behavior, different backing engine ---
 
 TEST(subscription_manager_betree, subscribe_and_lease_lifecycle) {
