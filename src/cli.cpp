@@ -20,6 +20,22 @@ cxxopts::Options build_cli_options() {
         ("engine", "Matching engine (atree|betree)", cxxopts::value<std::string>())
         ("output-prefix", "Output subject prefix", cxxopts::value<std::string>())
         ("queue-group", "Input queue group for load balancing", cxxopts::value<std::string>())
+        ("input-stream", "JetStream stream name for input; enables the durable-consumer "
+                          "(loss-proof) input mode instead of plain queue-group subscribe",
+                          cxxopts::value<std::string>())
+        ("consumer-durable-name", "Durable JetStream consumer name, shared across every "
+                                   "instance (required with --input-stream)",
+                                   cxxopts::value<std::string>())
+        ("consumer-deliver-subject", "Fixed push-delivery subject shared by every instance "
+                                      "(required with --input-stream - never leave unset)",
+                                      cxxopts::value<std::string>())
+        ("consumer-deliver-group", "Queue group on the deliver subject, for load "
+                                    "distribution across instances (JetStream analog of "
+                                    "--queue-group)", cxxopts::value<std::string>())
+        ("consumer-max-ack-pending", "Max unacked messages in flight to this consumer "
+                                      "(flow control)", cxxopts::value<uint64_t>())
+        ("consumer-ack-wait", "Ack wait timeout in seconds before redelivery",
+                               cxxopts::value<uint32_t>())
         ("subscribe-subject", "Subscription request subject", cxxopts::value<std::string>())
         ("unsubscribe-subject", "Unsubscription request subject", cxxopts::value<std::string>())
         ("lease-bucket", "NATS KV lease bucket name", cxxopts::value<std::string>())
@@ -49,6 +65,12 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("input-subject"))        cfg.input_subjects = result["input-subject"].as<std::vector<std::string>>();
     if (result.count("output-prefix"))        cfg.output_prefix = result["output-prefix"].as<std::string>();
     if (result.count("queue-group"))          cfg.input_queue_group = result["queue-group"].as<std::string>();
+    if (result.count("input-stream"))              cfg.input_stream = result["input-stream"].as<std::string>();
+    if (result.count("consumer-durable-name"))     cfg.consumer_durable_name = result["consumer-durable-name"].as<std::string>();
+    if (result.count("consumer-deliver-subject"))  cfg.consumer_deliver_subject = result["consumer-deliver-subject"].as<std::string>();
+    if (result.count("consumer-deliver-group"))    cfg.consumer_deliver_group = result["consumer-deliver-group"].as<std::string>();
+    if (result.count("consumer-max-ack-pending"))  cfg.consumer_max_ack_pending = result["consumer-max-ack-pending"].as<uint64_t>();
+    if (result.count("consumer-ack-wait"))         cfg.consumer_ack_wait_seconds = result["consumer-ack-wait"].as<uint32_t>();
     if (result.count("subscribe-subject"))    cfg.subscribe_subject = result["subscribe-subject"].as<std::string>();
     if (result.count("unsubscribe-subject"))  cfg.unsubscribe_subject = result["unsubscribe-subject"].as<std::string>();
     if (result.count("lease-bucket"))         cfg.lease_bucket = result["lease-bucket"].as<std::string>();
@@ -127,6 +149,29 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
         cfg.input_queue_max_bytes == 0 || cfg.publish_max_inflight == 0 ||
         cfg.publish_backpressure_timeout_ms == 0) {
         return "Lease TTL and all queue/publication limits must be greater than zero";
+    }
+
+    // JetStream durable-consumer mode: consumer_durable_name and
+    // consumer_deliver_subject are both required, not defaulted. In
+    // particular, an unset deliver_subject would make nats_asio generate a
+    // random per-connection inbox - each instance would silently rebind the
+    // shared durable consumer to a different target, breaking multi-instance
+    // load distribution without any error. Fail loudly here instead.
+    if (cfg.jetstream_consumer_enabled()) {
+        if (cfg.consumer_durable_name.empty()) {
+            return "consumer_durable_name is required when input_stream is set";
+        }
+        if (cfg.consumer_deliver_subject.empty()) {
+            return "consumer_deliver_subject is required when input_stream is set "
+                   "(it must be a fixed value shared by every instance - never left "
+                   "unset, which would silently break multi-instance load distribution)";
+        }
+        if (cfg.consumer_max_ack_pending == 0) {
+            return "consumer_max_ack_pending must be greater than zero";
+        }
+        if (cfg.consumer_ack_wait_seconds == 0) {
+            return "consumer_ack_wait_seconds must be greater than zero";
+        }
     }
 
     return std::nullopt;

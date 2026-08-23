@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -58,7 +59,8 @@ public:
                 const attribute_schema& schema,
                 subscription_manager& sub_mgr,
                 nats_asio::iconnection_sptr conn,
-                std::shared_ptr<spdlog::logger> log);
+                std::shared_ptr<spdlog::logger> log,
+                nats_asio::ijs_subscription_sptr input_js_sub = nullptr);
     ~worker_pool();
 
     // Spawn N worker threads. Must be called once.
@@ -67,9 +69,18 @@ public:
     // Signal workers to stop, drain the queue, and join threads.
     void stop();
 
-    // Enqueue a payload for worker processing (move semantics).
-    // Returns false when shutdown has begun or a queue limit is reached.
+    // Enqueue a payload for worker processing (move semantics). Plain
+    // queue-group mode: no ack concept, matching today's at-most-once
+    // behavior exactly. Returns false when shutdown has begun or a queue
+    // limit is reached.
     bool enqueue(std::vector<char> payload);
+
+    // JetStream-consumer-mode overload: the payload's originating js_message
+    // travels with it so the worker can resolve delivery (ack/nak/term)
+    // after processing completes, not just at enqueue time - see
+    // worker_loop()'s four resolution cases. Requires input_js_sub to have
+    // been passed to the constructor.
+    bool enqueue(std::vector<char> payload, nats_asio::js_message js_msg);
 
     // Wait for every accepted publication coroutine to complete.
     asio::awaitable<bool> wait_for_publications(std::chrono::milliseconds timeout);
@@ -96,12 +107,34 @@ private:
 
     void worker_loop(unsigned int worker_id);
 
+    // The element actually carried through m_queue. js_msg is nullopt for
+    // plain queue-group-mode payloads (no ack concept, matches today's
+    // behavior); populated for JetStream-consumer-mode payloads, whose
+    // delivery must be resolved (ack/nak/term) once processing finishes.
+    struct queued_message {
+        std::vector<char> payload;
+        std::optional<nats_asio::js_message> js_msg;
+    };
+    bool enqueue_impl(queued_message qm);
+
+    // Posts an ack()/term() call for a JetStream message onto m_ioc,
+    // detached - same pattern as the existing publish coroutine below,
+    // since ack()/term() are themselves coroutines that need m_conn's I/O
+    // thread, but worker_loop runs on a plain std::thread. Captures m_log
+    // and a copy of m_input_js_sub by value (not `this`), so the posted
+    // coroutine stays valid even if this worker_pool is destroyed while it's
+    // still suspended - the exact same lifetime concern publish_counters
+    // already solves for the publish path.
+    void spawn_ack(nats_asio::js_message msg);
+    void spawn_term(nats_asio::js_message msg);
+
     asio::io_context& m_ioc;
     binary_format m_format;
     const attribute_schema& m_schema;
     subscription_manager& m_sub_mgr;
     nats_asio::iconnection_sptr m_conn;
     std::shared_ptr<spdlog::logger> m_log;
+    nats_asio::ijs_subscription_sptr m_input_js_sub;
 
     unsigned int m_thread_count;
     std::atomic<bool> m_running{false};
@@ -112,7 +145,7 @@ private:
     std::size_t m_publish_max_inflight;
     std::chrono::milliseconds m_publish_backpressure_timeout;
 
-    moodycamel::BlockingConcurrentQueue<std::vector<char>> m_queue;
+    moodycamel::BlockingConcurrentQueue<queued_message> m_queue;
     std::vector<std::thread> m_threads;
     std::mutex m_enqueue_mutex;
     std::atomic<std::size_t> m_queued_messages{0};

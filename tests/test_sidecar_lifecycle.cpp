@@ -7,6 +7,9 @@
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
 #include <nlohmann/json.hpp>
+#include <zerialize/zerialize.hpp>
+#include <zerialize/dynamic.hpp>
+#include <zerialize/protocols/msgpack.hpp>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -43,6 +46,36 @@ std::vector<char> json_payload(const nlohmann::json& j) {
     return std::vector<char>(s.begin(), s.end());
 }
 
+nats_asio::message json_message(const nlohmann::json& body) {
+    nats_asio::message msg;
+    auto s = body.dump();
+    msg.payload.assign(s.begin(), s.end());
+    return msg;
+}
+
+// sample_config()'s one attribute ("temperature", float) is msgpack-encoded
+// (cfg.format defaults to binary_format::msgpack) - a JSON-text payload
+// (json_payload above) is invalid msgpack and would hit the
+// malformed-payload/term() path instead of legitimately matching or not
+// matching, which isn't what a "message reaches worker_pool" test wants.
+std::vector<char> msgpack_temperature_payload(double value) {
+    auto buf = zerialize::serialize<zerialize::MsgPack>(
+        zerialize::dyn::map({{"temperature", value}}));
+    return std::vector<char>(reinterpret_cast<const char*>(buf.data()),
+                             reinterpret_cast<const char*>(buf.data()) + buf.size());
+}
+
+sidecar::config jetstream_config() {
+    sidecar::config cfg = sample_config();
+    cfg.input_stream = "sensor-input";
+    cfg.consumer_durable_name = "sensor-durable";
+    cfg.consumer_deliver_subject = "sensor.deliver";
+    cfg.consumer_deliver_group = "sensor-group";
+    cfg.consumer_max_ack_pending = 500;
+    cfg.consumer_ack_wait_seconds = 15;
+    return cfg;
+}
+
 } // namespace
 
 namespace sidecar {
@@ -77,6 +110,43 @@ struct sidecar_engine_test_access {
 
     static asio::awaitable<bool> subscribe_to_inputs(sidecar::sidecar_engine& engine) {
         return engine.subscribe_to_inputs();
+    }
+
+    // Same as inject_dependencies above, but for JetStream-consumer-mode
+    // tests: wires m_input_js_sub in and constructs worker_pool with it, so
+    // worker_pool's own ack/term resolution logic is reachable through the
+    // engine exactly as it would be in JetStream-consumer mode.
+    static void inject_dependencies_js(sidecar::sidecar_engine& engine,
+                                        nats_asio::iconnection_sptr conn,
+                                        nats_asio::ijs_subscription_sptr js_sub) {
+        engine.m_conn = conn;
+        engine.m_input_js_sub = js_sub;
+        engine.m_lease_mgr = std::make_unique<sidecar::lease_manager>(
+            engine.m_ioc, conn, engine.m_sub_mgr, engine.m_cfg.lease_bucket,
+            engine.m_cfg.lease_ttl_seconds, engine.m_cfg.lease_check_interval_seconds,
+            engine.m_log);
+        engine.m_worker_pool = std::make_unique<sidecar::worker_pool>(
+            engine.m_ioc, engine.m_cfg, engine.m_schema, engine.m_sub_mgr, conn,
+            engine.m_log, js_sub);
+        engine.m_worker_pool->start();
+    }
+
+    static asio::awaitable<bool> ensure_input_stream(sidecar::sidecar_engine& engine) {
+        return engine.ensure_input_stream();
+    }
+
+    static asio::awaitable<bool> subscribe_to_inputs_jetstream(sidecar::sidecar_engine& engine) {
+        return engine.subscribe_to_inputs_jetstream();
+    }
+
+    static asio::awaitable<void> on_js_data_message(sidecar::sidecar_engine& engine,
+                                                      nats_asio::ijs_subscription& sub,
+                                                      const nats_asio::js_message& msg) {
+        return engine.on_js_data_message(sub, msg);
+    }
+
+    static nats_asio::ijs_subscription_sptr input_js_sub(const sidecar::sidecar_engine& engine) {
+        return engine.m_input_js_sub;
     }
 
     static sidecar::subscription_manager& sub_mgr(sidecar::sidecar_engine& engine) {
@@ -633,4 +703,205 @@ TEST(sidecar_engine, on_unsubscribe_request_without_reply_to_does_not_publish) {
                  engine, std::nullopt, std::move(payload))));
 
     EXPECT_FALSE(publish_called);
+}
+
+// --- JetStream-consumer mode: ensure_input_stream() ---
+
+TEST(sidecar_engine, ensure_input_stream_creates_stream_when_missing) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.sensor-input") {
+            co_return std::pair{json_message({{"error", {{"code", 404}}}}), nats_asio::status{}};
+        }
+        if (subject == "$JS.API.STREAM.CREATE.sensor-input") {
+            co_return std::pair{json_message(nlohmann::json::object()), nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_TRUE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_input_stream(engine)));
+}
+
+TEST(sidecar_engine, ensure_input_stream_accepts_existing_stream_with_matching_config) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.sensor-input") {
+            co_return std::pair{
+                json_message({{"config", {{"retention", "workqueue"},
+                                          {"subjects", {"sensor.data"}}}}}),
+                nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_TRUE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_input_stream(engine)));
+}
+
+TEST(sidecar_engine, ensure_input_stream_refuses_mismatched_retention) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    // Existing stream uses "limits" retention, not "workqueue" - refusing
+    // this matters because workqueue retention is what makes ack-based
+    // cleanup (and the single-shared-consumer-group design) actually work;
+    // silently accepting a mismatched stream would be a real correctness
+    // gap, not a cosmetic one.
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.sensor-input") {
+            co_return std::pair{
+                json_message({{"config", {{"retention", "limits"},
+                                          {"subjects", {"sensor.data"}}}}}),
+                nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_FALSE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_input_stream(engine)));
+}
+
+TEST(sidecar_engine, ensure_input_stream_refuses_stream_missing_configured_subject) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    // Existing stream has the right retention policy but doesn't actually
+    // capture cfg.input_subjects - messages published to "sensor.data" would
+    // silently never reach this stream at all.
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.sensor-input") {
+            co_return std::pair{
+                json_message({{"config", {{"retention", "workqueue"},
+                                          {"subjects", {"some.other.subject"}}}}}),
+                nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_FALSE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_input_stream(engine)));
+}
+
+// --- JetStream-consumer mode: subscribe_to_inputs_jetstream() ---
+
+TEST(sidecar_engine, subscribe_to_inputs_jetstream_uses_configured_consumer_settings) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    EXPECT_TRUE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::subscribe_to_inputs_jetstream(engine)));
+
+    ASSERT_EQ(conn->js_subscribe_configs.size(), 1u);
+    const auto& used = conn->js_subscribe_configs.front();
+    EXPECT_EQ(used.stream, "sensor-input");
+    ASSERT_TRUE(used.durable_name.has_value());
+    EXPECT_EQ(*used.durable_name, "sensor-durable");
+    ASSERT_TRUE(used.deliver_subject.has_value());
+    EXPECT_EQ(*used.deliver_subject, "sensor.deliver");
+    ASSERT_TRUE(used.deliver_group.has_value());
+    EXPECT_EQ(*used.deliver_group, "sensor-group");
+    EXPECT_EQ(used.max_ack_pending, 500u);
+    EXPECT_EQ(used.ack_wait, std::chrono::seconds(15));
+    EXPECT_EQ(used.ack, nats_asio::js_ack_policy::explicit_);
+
+    EXPECT_NE(sidecar::sidecar_engine_test_access::input_js_sub(engine), nullptr);
+}
+
+TEST(sidecar_engine, subscribe_to_inputs_jetstream_fails_when_js_subscribe_fails) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+    conn->fail_js_subscribe = [](const nats_asio::js_consumer_config&) { return true; };
+
+    EXPECT_FALSE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::subscribe_to_inputs_jetstream(engine)));
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::input_js_sub(engine), nullptr);
+}
+
+// --- JetStream-consumer mode: on_js_data_message() ---
+
+TEST(sidecar_engine, on_js_data_message_enqueues_into_worker_pool) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+    sidecar::sidecar_engine_test_access::inject_dependencies_js(engine, conn, js_sub);
+
+    nats_asio::js_message msg;
+    msg.msg.payload = msgpack_temperature_payload(21.5);
+    msg.stream_sequence = 42;
+
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, *js_sub, msg)));
+
+    EXPECT_TRUE(sidecar_test::drive_until(
+        ioc,
+        [&] { return sidecar::sidecar_engine_test_access::worker_stats(engine).processed > 0; },
+        std::chrono::seconds(2)));
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::worker_stats(engine).processed, 1u);
+
+    // No active subscriptions in this test - worker_pool's "no active
+    // subscriptions" resolution path acks immediately (see
+    // js_mode_acks_when_message_does_not_match in test_worker_pool.cpp for
+    // the equivalent "legitimately no match" case).
+    EXPECT_TRUE(sidecar_test::drive_until(
+        ioc, [&] { return !js_sub->acked_stream_seqs.empty(); }, std::chrono::seconds(2)));
+    EXPECT_EQ(js_sub->acked_stream_seqs, (std::vector<uint64_t>{42}));
+}
+
+TEST(sidecar_engine, on_js_data_message_before_worker_pool_ready_leaves_message_unacked) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+
+    nats_asio::js_message msg;
+    msg.msg.payload = msgpack_temperature_payload(21.5);
+    msg.stream_sequence = 7;
+
+    // m_worker_pool is intentionally never set up here - the message must
+    // be left unacked (not lost, not force-acked) so ack_wait redelivers it
+    // once the pool is actually ready.
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, *js_sub, msg)));
+
+    EXPECT_TRUE(js_sub->acked_stream_seqs.empty());
+    EXPECT_TRUE(js_sub->termed_stream_seqs.empty());
+}
+
+TEST(sidecar_engine, on_js_data_message_acks_empty_payload_immediately) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, jetstream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+    sidecar::sidecar_engine_test_access::inject_dependencies_js(engine, conn, js_sub);
+
+    nats_asio::js_message msg;
+    msg.stream_sequence = 5;  // msg.msg.payload left empty
+
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, *js_sub, msg)));
+
+    EXPECT_EQ(js_sub->acked_stream_seqs, (std::vector<uint64_t>{5}));
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::worker_stats(engine).processed, 0u)
+        << "an empty payload must never reach worker_pool at all";
 }

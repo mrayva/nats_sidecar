@@ -36,9 +36,11 @@ worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
                          const attribute_schema& schema,
                          subscription_manager& sub_mgr,
                          nats_asio::iconnection_sptr conn,
-                         std::shared_ptr<spdlog::logger> log)
+                         std::shared_ptr<spdlog::logger> log,
+                         nats_asio::ijs_subscription_sptr input_js_sub)
     : m_ioc(ioc), m_format(cfg.format), m_schema(schema),
       m_sub_mgr(sub_mgr), m_conn(std::move(conn)), m_log(std::move(log)),
+      m_input_js_sub(std::move(input_js_sub)),
       m_thread_count(cfg.worker_threads > 0 ? cfg.worker_threads
                                             : std::thread::hardware_concurrency()),
       m_queue_max_messages(cfg.input_queue_max_messages),
@@ -79,25 +81,67 @@ void worker_pool::stop() {
 }
 
 bool worker_pool::enqueue(std::vector<char> payload) {
+    return enqueue_impl(queued_message{std::move(payload), std::nullopt});
+}
+
+bool worker_pool::enqueue(std::vector<char> payload, nats_asio::js_message js_msg) {
+    return enqueue_impl(queued_message{std::move(payload), std::move(js_msg)});
+}
+
+bool worker_pool::enqueue_impl(queued_message qm) {
     std::lock_guard<std::mutex> lock(m_enqueue_mutex);
+    // Backpressure here (queue full/shutting down) intentionally leaves any
+    // JetStream message unacked rather than acking or terming it - ack_wait
+    // will trigger real redelivery once there's room, matching the "leave
+    // unacked on transient failure" rule the rest of worker_loop follows.
     if (!m_accepting.load(std::memory_order_acquire) ||
         m_queued_messages.load(std::memory_order_relaxed) >= m_queue_max_messages ||
-        payload.size() > m_queue_max_bytes - std::min(
+        qm.payload.size() > m_queue_max_bytes - std::min(
             m_queue_max_bytes, m_queued_bytes.load(std::memory_order_relaxed))) {
         m_input_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
-    const auto bytes = payload.size();
+    const auto bytes = qm.payload.size();
     m_queued_messages.fetch_add(1, std::memory_order_relaxed);
     m_queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    if (!m_queue.enqueue(std::move(payload))) {
+    if (!m_queue.enqueue(std::move(qm))) {
         m_queued_messages.fetch_sub(1, std::memory_order_relaxed);
         m_queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         m_input_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     return true;
+}
+
+void worker_pool::spawn_ack(nats_asio::js_message msg) {
+    if (!m_input_js_sub) return;
+    auto js_sub = m_input_js_sub;
+    auto log = m_log;
+    asio::co_spawn(m_ioc,
+        [js_sub = std::move(js_sub), msg = std::move(msg), log]() mutable -> asio::awaitable<void> {
+            auto s = co_await js_sub->ack(msg);
+            if (s.failed()) {
+                log->warn("Failed to ack JetStream input message (stream_seq={}): {}",
+                          msg.stream_sequence, s.error());
+            }
+        },
+        asio::detached);
+}
+
+void worker_pool::spawn_term(nats_asio::js_message msg) {
+    if (!m_input_js_sub) return;
+    auto js_sub = m_input_js_sub;
+    auto log = m_log;
+    asio::co_spawn(m_ioc,
+        [js_sub = std::move(js_sub), msg = std::move(msg), log]() mutable -> asio::awaitable<void> {
+            auto s = co_await js_sub->term(msg);
+            if (s.failed()) {
+                log->warn("Failed to term JetStream input message (stream_seq={}): {}",
+                          msg.stream_sequence, s.error());
+            }
+        },
+        asio::detached);
 }
 
 std::size_t worker_pool::queue_depth() const {
@@ -138,26 +182,32 @@ asio::awaitable<bool> worker_pool::wait_for_publications(
 void worker_pool::worker_loop(unsigned int worker_id) {
     m_log->debug("Worker {} started", worker_id);
 
-    std::vector<char> payload;
+    queued_message qm;
     while (m_running.load(std::memory_order_acquire) ||
            m_queued_messages.load(std::memory_order_acquire) != 0) {
         // Block with timeout to allow checking m_running for graceful shutdown
         bool got = m_queue.wait_dequeue_timed(
-            payload, std::chrono::milliseconds(100));
+            qm, std::chrono::milliseconds(100));
 
         if (!got) continue;
 
         m_queued_messages.fetch_sub(1, std::memory_order_relaxed);
-        m_queued_bytes.fetch_sub(payload.size(), std::memory_order_relaxed);
+        m_queued_bytes.fetch_sub(qm.payload.size(), std::memory_order_relaxed);
 
         // Get current snapshot — lock-free atomic load
         auto snap = m_sub_mgr.snapshot();
         if (!snap || !snap->tree) {
-            payload.clear();
+            // No active subscriptions to check against - legitimately
+            // nothing to do, same as the "no match" case below. Acked (not
+            // left pending): a subscribe request only ever looks at
+            // messages from that point forward, so there's no future
+            // consumer who'd want this message redelivered.
+            if (qm.js_msg) spawn_ack(std::move(*qm.js_msg));
+            qm.payload.clear();
             continue;
         }
 
-        std::span<const char> payload_span(payload.data(), payload.size());
+        std::span<const char> payload_span(qm.payload.data(), qm.payload.size());
 
         std::optional<std::chrono::nanoseconds> search_time;
         auto matches = deserialize_and_match(
@@ -172,13 +222,23 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         m_processed.fetch_add(1, std::memory_order_relaxed);
 
         if (!matches) {
+            // Malformed payload - a poison message that will never succeed
+            // no matter how many times it's redelivered. term(), not ack:
+            // this is a real, visible "permanently gave up" signal (shows
+            // up in js_get_consumer_info's stats) rather than a silent drop.
             m_match_failures.fetch_add(1, std::memory_order_relaxed);
-            payload.clear();
+            if (qm.js_msg) spawn_term(std::move(*qm.js_msg));
+            qm.payload.clear();
             continue;
         }
 
         if (matches->empty()) {
-            payload.clear();
+            // Legitimately processed, nothing matched - ack now. Otherwise
+            // every non-matching message (most real traffic, for any given
+            // filter) would sit unacked until ack_wait and redeliver
+            // forever for no reason.
+            if (qm.js_msg) spawn_ack(std::move(*qm.js_msg));
+            qm.payload.clear();
             continue;
         }
 
@@ -189,7 +249,12 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         if (previous_inflight >= m_publish_max_inflight) {
             m_publish_counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
             m_publish_tasks_dropped.fetch_add(1, std::memory_order_relaxed);
-            payload.clear();
+            // Backpressure at the inflight-publish-task limit: leave any
+            // js_msg unacked (do not ack, do not term) so ack_wait triggers
+            // real redelivery once there's room - this is the actual
+            // mechanism that closes the loss gap plain queue-group mode
+            // had no equivalent of.
+            qm.payload.clear();
             continue;
         }
 
@@ -197,14 +262,21 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         // shared_ptr copy (not a reference to this worker_pool) so the
         // coroutine - which asio::co_spawn detaches onto m_ioc and which may
         // still be suspended after this worker_pool is destroyed - keeps its
-        // target alive for as long as it needs it.
+        // target alive for as long as it needs it. js_sub is captured the
+        // same way, for the same reason, so the ack after a successful
+        // write can happen from inside this same coroutine - acking on the
+        // I/O thread only after the write that made the message durable
+        // downstream actually succeeded is what keeps ack ordered strictly
+        // after publish, not a separate, potentially-racing step.
         auto matched_ids = std::move(*matches);
-        auto payload_copy = std::move(payload);
+        auto payload_copy = std::move(qm.payload);
         auto snap_copy = std::move(snap);
         auto conn = m_conn;
         auto log = m_log;
         auto counters = m_publish_counters;
         auto backpressure_timeout = m_publish_backpressure_timeout;
+        auto js_sub = m_input_js_sub;
+        auto js_msg = std::move(qm.js_msg);
 
         // Post publish work to the ASIO I/O thread
         asio::co_spawn(m_ioc,
@@ -214,8 +286,11 @@ void worker_pool::worker_loop(unsigned int worker_id) {
              conn = std::move(conn),
              log,
              counters,
-             backpressure_timeout]() mutable -> asio::awaitable<void> {
+             backpressure_timeout,
+             js_sub = std::move(js_sub),
+             js_msg = std::move(js_msg)]() mutable -> asio::awaitable<void> {
                 std::span<const char> pub_payload(payload_copy.data(), payload_copy.size());
+                bool publish_ok = false;
                 try {
                     auto frames = build_pub_frames(
                         matched_ids, snap_copy->output_subjects, pub_payload);
@@ -240,18 +315,39 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                         } else {
                             counters->published.fetch_add(frames.count,
                                                           std::memory_order_relaxed);
+                            publish_ok = true;
                         }
+                    } else {
+                        // Every matched id was missing from output_subjects
+                        // (e.g. removed between search and publish) - no
+                        // frames were actually written, but nothing failed
+                        // either; the input message was still legitimately
+                        // handled.
+                        publish_ok = true;
                     }
                 } catch (const std::exception& e) {
                     counters->publish_failures.fetch_add(1, std::memory_order_relaxed);
                     log->error("Publication task failed: {}", e.what());
                 }
                 counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
+
+                // Ack only after a successful write (or a no-op that wasn't
+                // a failure) - a write failure leaves the message unacked,
+                // exactly like the backpressure-drop case above, so
+                // ack_wait triggers real redelivery instead of silent loss.
+                if (js_sub && js_msg && publish_ok) {
+                    auto ack_status = co_await js_sub->ack(*js_msg);
+                    if (ack_status.failed()) {
+                        log->warn("Failed to ack JetStream input message "
+                                  "(stream_seq={}): {}",
+                                  js_msg->stream_sequence, ack_status.error());
+                    }
+                }
             },
             asio::detached
         );
 
-        payload.clear();
+        qm.payload.clear();
     }
 
     m_log->debug("Worker {} stopped", worker_id);

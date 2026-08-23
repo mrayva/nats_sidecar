@@ -37,6 +37,13 @@ std::vector<char> matching_payload(int value) {
                              reinterpret_cast<const char*>(buf.data()) + buf.size());
 }
 
+nats_asio::js_message js_message_with(uint64_t stream_seq, std::vector<char> payload) {
+    nats_asio::js_message msg;
+    msg.msg.payload = std::move(payload);
+    msg.stream_sequence = stream_seq;
+    return msg;
+}
+
 } // namespace
 
 TEST(worker_pool, build_pub_frames_exact_wire_for_single_subscriber) {
@@ -268,4 +275,143 @@ TEST(worker_pool, backpressure_timeout_fails_publish_without_writing) {
     EXPECT_EQ(stats.publish_inflight, 0u);
     EXPECT_EQ(write_raw_calls.load(), 0)
         << "write_raw must not be called once the backpressure wait times out";
+}
+
+// --- JetStream-consumer-mode ack/nak/term resolution ---
+// These four tests cover the four cases the plan's ack-timing rules define:
+// ack-after-successful-publish, ack-on-no-match, term-on-poison-message, and
+// leave-unacked-on-transient-failure (covering both the publish-write-
+// failure and the publish-inflight-backpressure-drop sub-cases).
+
+TEST(worker_pool, js_mode_acks_after_successful_publish) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->on_write_raw = [](std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log(), js_sub);
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(7, matching_payload(42))));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published > 0; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return !js_sub->acked_stream_seqs.empty(); }, std::chrono::seconds(2)));
+    pool.stop();
+
+    EXPECT_EQ(js_sub->acked_stream_seqs, (std::vector<uint64_t>{7}));
+    EXPECT_TRUE(js_sub->nakked_stream_seqs.empty());
+    EXPECT_TRUE(js_sub->termed_stream_seqs.empty());
+}
+
+TEST(worker_pool, js_mode_acks_when_message_does_not_match) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log(), js_sub);
+    pool.start();
+    // value=5 does not satisfy "value > 10" - legitimately processed, no
+    // match, must still be acked (not left to redeliver forever).
+    ASSERT_TRUE(pool.enqueue(matching_payload(5), js_message_with(3, matching_payload(5))));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().processed > 0; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return !js_sub->acked_stream_seqs.empty(); }, std::chrono::seconds(2)));
+    pool.stop();
+
+    EXPECT_EQ(js_sub->acked_stream_seqs, (std::vector<uint64_t>{3}));
+    EXPECT_TRUE(js_sub->termed_stream_seqs.empty());
+}
+
+TEST(worker_pool, js_mode_terms_malformed_payload) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log(), js_sub);
+    pool.start();
+    // 0xc1 is reserved/invalid in MessagePack - a poison message that will
+    // never succeed no matter how many times it's redelivered, so it must be
+    // termed (not acked, not left pending for redelivery).
+    std::vector<char> bad_payload{static_cast<char>(0xc1)};
+    ASSERT_TRUE(pool.enqueue(bad_payload, js_message_with(9, bad_payload)));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().match_failures > 0; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return !js_sub->termed_stream_seqs.empty(); }, std::chrono::seconds(2)));
+    pool.stop();
+
+    EXPECT_EQ(js_sub->termed_stream_seqs, (std::vector<uint64_t>{9}));
+    EXPECT_TRUE(js_sub->acked_stream_seqs.empty());
+    EXPECT_TRUE(js_sub->nakked_stream_seqs.empty());
+}
+
+TEST(worker_pool, js_mode_leaves_unacked_on_publish_write_failure) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->on_write_raw = [](std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status(nats_asio::error_code::connection_closed);
+    };
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log(), js_sub);
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(11, matching_payload(42))));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().publish_failures > 0; }, std::chrono::seconds(2)));
+    // Give the (absent) ack coroutine a moment it can't use, then confirm
+    // nothing was ever acked/nakked/termed - ack_wait is what's relied on to
+    // redeliver a transiently-failed publish, not any action here.
+    ioc.restart();
+    ioc.run_for(std::chrono::milliseconds(50));
+    pool.stop();
+
+    EXPECT_TRUE(js_sub->acked_stream_seqs.empty());
+    EXPECT_TRUE(js_sub->termed_stream_seqs.empty());
+    EXPECT_TRUE(js_sub->nakked_stream_seqs.empty());
+}
+
+TEST(worker_pool, js_mode_leaves_unacked_on_inflight_backpressure_drop) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    cfg.publish_max_inflight = 0;  // forces every match to hit the drop path immediately
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log(), js_sub);
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(13, matching_payload(42))));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().publish_tasks_dropped > 0; }, std::chrono::seconds(2)));
+    ioc.restart();
+    ioc.run_for(std::chrono::milliseconds(50));
+    pool.stop();
+
+    EXPECT_TRUE(js_sub->acked_stream_seqs.empty());
+    EXPECT_TRUE(js_sub->termed_stream_seqs.empty());
+    EXPECT_TRUE(js_sub->nakked_stream_seqs.empty());
 }

@@ -25,6 +25,70 @@ struct fake_subscription : public nats_asio::isubscription {
     uint32_t message_count() const noexcept override { return 0; }
 };
 
+// Fake ijs_subscription returned by fake_connection::js_subscribe() below.
+// Records every ack/nak/term call (by stream_sequence, in call order) so
+// tests can assert exactly what a worker_pool resolution path did, mirroring
+// kv_store's role for the KV hooks - a real, inspectable record rather than
+// just a boolean "did it fail".
+struct fake_js_subscription : public nats_asio::ijs_subscription {
+    nats_asio::js_consumer_info consumer_info;
+    bool active = true;
+
+    std::vector<uint64_t> acked_stream_seqs;
+    std::vector<uint64_t> nakked_stream_seqs;
+    std::vector<uint64_t> termed_stream_seqs;
+
+    // Predicates letting a test force a specific ack/term call to fail,
+    // mirroring fail_kv_put/fail_kv_delete's pattern.
+    std::function<bool(const nats_asio::js_message&)> fail_ack;
+    std::function<bool(const nats_asio::js_message&)> fail_term;
+
+    const nats_asio::js_consumer_info& info() const noexcept override { return consumer_info; }
+    void stop() noexcept override { active = false; }
+    bool is_active() const noexcept override { return active; }
+
+    asio::awaitable<nats_asio::status> ack(const nats_asio::js_message& msg) override {
+        if (fail_ack && fail_ack(msg)) {
+            co_return nats_asio::status(nats_asio::error_code::operation_failed);
+        }
+        acked_stream_seqs.push_back(msg.stream_sequence);
+        co_return nats_asio::status{};
+    }
+    asio::awaitable<nats_asio::status> ack(const nats_asio::js_message_view&) override {
+        co_return nats_asio::status(nats_asio::error_code::operation_failed);
+    }
+    asio::awaitable<nats_asio::status> ack_batch(
+        const std::vector<nats_asio::js_message>& messages) override {
+        for (const auto& m : messages) acked_stream_seqs.push_back(m.stream_sequence);
+        co_return nats_asio::status{};
+    }
+    asio::awaitable<nats_asio::status> nak(
+        const nats_asio::js_message& msg, std::chrono::milliseconds) override {
+        nakked_stream_seqs.push_back(msg.stream_sequence);
+        co_return nats_asio::status{};
+    }
+    asio::awaitable<nats_asio::status> nak(
+        const nats_asio::js_message_view&, std::chrono::milliseconds) override {
+        co_return nats_asio::status(nats_asio::error_code::operation_failed);
+    }
+    asio::awaitable<nats_asio::status> in_progress(const nats_asio::js_message&) override {
+        co_return nats_asio::status{};
+    }
+    asio::awaitable<nats_asio::status> in_progress(const nats_asio::js_message_view&) override {
+        co_return nats_asio::status(nats_asio::error_code::operation_failed);
+    }
+    asio::awaitable<nats_asio::status> term(const nats_asio::js_message& msg) override {
+        if (fail_term && fail_term(msg)) {
+            co_return nats_asio::status(nats_asio::error_code::operation_failed);
+        }
+        termed_stream_seqs.push_back(msg.stream_sequence);
+        co_return nats_asio::status{};
+    }
+    asio::awaitable<nats_asio::status> term(const nats_asio::js_message_view&) override {
+        co_return nats_asio::status(nats_asio::error_code::operation_failed);
+    }
+};
+
 class fake_connection : public nats_asio::iconnection {
 public:
     // --- configurable hooks (nullptr = default "unimplemented" behavior) ---
@@ -44,6 +108,20 @@ public:
     // Always populated regardless of on_subscribe, in call order - lets
     // tests assert which subjects a subscribe loop actually attempted.
     std::vector<std::string> subscribed_subjects;
+
+    // --- JetStream consumer support ---
+    // Set to make js_subscribe() fail (default: succeeds, mirroring
+    // on_subscribe's "opt into failure" pattern rather than
+    // on_request's "opt into success" one, since the JetStream-consumer
+    // path is what most sidecar_engine tests actually want by default).
+    std::function<bool(const nats_asio::js_consumer_config&)> fail_js_subscribe;
+    // The subscription js_subscribe() most recently returned, and the
+    // callback it captured - tests drive simulated delivery by invoking
+    // captured_js_cb directly against *last_js_subscription, the same way a
+    // real js_subscribe_impl would invoke it on message arrival.
+    std::shared_ptr<fake_js_subscription> last_js_subscription;
+    nats_asio::on_js_message_cb captured_js_cb;
+    std::vector<nats_asio::js_consumer_config> js_subscribe_configs;  // call order
 
     // --- in-memory KV store backing kv_put/kv_get/kv_delete/kv_keys ---
     struct kv_record {
@@ -162,12 +240,28 @@ public:
     }
 
     asio::awaitable<std::pair<nats_asio::ijs_subscription_sptr, nats_asio::status>> js_subscribe(
-        const nats_asio::js_consumer_config&, nats_asio::on_js_message_cb) override {
+        const nats_asio::js_consumer_config& config, nats_asio::on_js_message_cb cb) override {
+        js_subscribe_configs.push_back(config);
+        if (fail_js_subscribe && fail_js_subscribe(config)) {
+            co_return std::pair<nats_asio::ijs_subscription_sptr, nats_asio::status>{
+                nullptr, nats_asio::status(nats_asio::error_code::operation_failed)};
+        }
+        auto sub = std::make_shared<fake_js_subscription>();
+        sub->consumer_info.stream = config.stream;
+        sub->consumer_info.name = config.durable_name.value_or("");
+        sub->consumer_info.deliver_subject = config.deliver_subject.value_or("");
+        last_js_subscription = sub;
+        captured_js_cb = std::move(cb);
         co_return std::pair<nats_asio::ijs_subscription_sptr, nats_asio::status>{
-            nullptr, nats_asio::status(nats_asio::error_code::operation_failed)};
+            sub, nats_asio::status{}};
     }
     asio::awaitable<std::pair<nats_asio::ijs_subscription_sptr, nats_asio::status>> js_subscribe(
         const nats_asio::js_consumer_config&, nats_asio::on_js_message_zero_copy_cb) override {
+        // sidecar_engine only ever uses the owned-js_message overload above
+        // (zero-copy can't survive worker_pool's cross-thread async
+        // processing - see js_message_view's own warning) - left
+        // unimplemented here, matching this file's general "only back what
+        // sidecar_engine actually calls" convention.
         co_return std::pair<nats_asio::ijs_subscription_sptr, nats_asio::status>{
             nullptr, nats_asio::status(nats_asio::error_code::operation_failed)};
     }

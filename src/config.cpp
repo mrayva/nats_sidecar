@@ -61,6 +61,13 @@ config load_config(const std::string& path) {
 
     if (auto n = root["input_queue_group"]) cfg.input_queue_group = n.as<std::string>();
 
+    if (auto n = root["input_stream"])             cfg.input_stream = n.as<std::string>();
+    if (auto n = root["consumer_durable_name"])    cfg.consumer_durable_name = n.as<std::string>();
+    if (auto n = root["consumer_deliver_subject"]) cfg.consumer_deliver_subject = n.as<std::string>();
+    if (auto n = root["consumer_deliver_group"])   cfg.consumer_deliver_group = n.as<std::string>();
+    if (auto n = root["consumer_max_ack_pending"]) cfg.consumer_max_ack_pending = n.as<uint64_t>();
+    if (auto n = root["consumer_ack_wait_seconds"]) cfg.consumer_ack_wait_seconds = n.as<uint32_t>();
+
     if (auto n = root["engine"]) {
         auto eng = parse_engine_type(n.as<std::string>());
         if (!eng) throw std::runtime_error("config: invalid 'engine': " + n.as<std::string>());
