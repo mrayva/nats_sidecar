@@ -75,11 +75,20 @@ set(SIDECAR_WARNING_FLAGS -Wall -Wextra -Wpedantic)
 
 # --- FetchContent: nats_asio (header-only, brings zerialize) ---
 include(FetchContent)
+# GIT_SHALLOW is intentionally omitted: it shallow-clones only the current
+# tip of nats_asio's default branch, then tries to `git checkout` the pinned
+# GIT_TAG commit out of that shallow history - this only works while the pin
+# happens to equal the branch tip, and breaks ("fatal: unable to read tree")
+# the moment nats_asio gains even one more commit after the pin was set,
+# which happens routinely since nats_asio is actively developed. Reproduced
+# locally with a from-scratch build (bypassing this repo's own _deps cache,
+# which was masking the break) and confirmed this is the actual root cause
+# of nats_sidecar's CI failing at Configure on every commit since this pin
+# started lagging - not a CI-environment flake.
 FetchContent_Declare(
     nats_asio
     GIT_REPOSITORY https://github.com/mrayva/nats_asio.git
     GIT_TAG        751c8173154c49d2b71af022d0b23a689b1e5906
-    GIT_SHALLOW    TRUE
     SYSTEM
 )
 # Disable nats_asio's own samples/tests - we only need the library
