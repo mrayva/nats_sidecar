@@ -74,7 +74,14 @@ All configuration parameters can be set via CLI flags. When a config file is als
 | `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`) |
 | `--engine ENGINE` | Matching engine (`atree`, `betree`); defaults to `atree` |
 | `--output-prefix PREFIX` | Output subject prefix (defaults to input subject) |
-| `--queue-group GROUP` | Input queue group for load balancing |
+| `--queue-group GROUP` | Input queue group for load balancing (plain, non-durable mode) |
+| `--input-stream NAME` | JetStream stream name for the durable-consumer input mode (see below); enables it when set, alongside the four flags below |
+| `--consumer-durable-name NAME` | Shared JetStream durable consumer name (required with `--input-stream`) |
+| `--consumer-deliver-subject SUBJ` | Fixed, shared push-delivery subject - required, never left to auto-generate (see "Durable JetStream consumer" below for why) |
+| `--consumer-deliver-group GROUP` | Queue group on the delivery subject - the JetStream analog of `--queue-group` |
+| `--consumer-max-ack-pending N` | Flow-control cap on unacked in-flight messages per consumer (default 1000) |
+| `--consumer-ack-wait SECS` | Redelivery timeout for unacked messages (default 30) |
+| `--input-stream-storage file\|memory` | JetStream input-stream storage backend (default `file`); `memory` exists purely for isolating the durable mode's protocol cost from its disk-I/O cost - not for production use, since it loses all persisted messages on a `nats-server` restart |
 | `--subscribe-subject SUBJ` | Subscription request subject |
 | `--unsubscribe-subject SUBJ` | Unsubscription request subject |
 | `--lease-bucket NAME` | NATS KV lease bucket name |
@@ -177,6 +184,17 @@ Send a JSON request to the `subscribe_subject` (request/reply):
 {"expression": "temperature > 30.0 AND location = \"warehouse\"", "client_id": "my-client"}
 ```
 
+Optionally include a client-generated `"id"` (a `uint64`) to broadcast one subscribe request to
+N instances sharing a single control subject, instead of one per-instance-unique subject each:
+every instance that processes it adopts the same id (via `subscription_manager::restore()`, the
+same mechanism that already re-adopts a persisted id on lease-restart) rather than each assigning
+its own from an uncoordinated counter - so all instances converge on the identical output topic
+without needing a reply first. Control-plane setup latency: flat ~13-18ms regardless of N,
+compared to the old per-instance-request design's linear cost (9.1ms->257ms, N=1->32). Omitting
+`"id"` keeps the original per-instance auto-assigned behavior. A genuine id conflict (that id
+already bound to a different expression on an instance) is returned as a real error, not silently
+absorbed.
+
 Response:
 
 ```json
@@ -216,6 +234,55 @@ Response:
 ```
 
 `removed` is `true` if the subscription was fully removed (no remaining lease holders), `false` if other clients still hold leases.
+
+## Durable JetStream consumer: loss-proof input, at a real cost
+
+By default (`--queue-group`), the sidecar consumes its input via a plain core-NATS queue-group
+subscription - simple and fast, but core NATS pub/sub is at-most-once by design: no ack, no
+redelivery, no flow control beyond a hard connection-buffer disconnect. Real stress testing found
+this can lose messages under load (confirmed via `nats-server`'s own "Slow Consumer Detected" log
+line under a JetStream-publish burst).
+
+Setting `--input-stream`/`--consumer-durable-name`/`--consumer-deliver-subject`/
+`--consumer-deliver-group` switches input consumption to a durable JetStream push consumer with
+explicit application-controlled acks instead - additive, not a replacement; `--queue-group` still
+works unchanged when these are unset. Ack timing: a matched-and-published message is acked only
+after the publish write succeeds; a legitimately non-matching message is acked immediately;
+malformed/unparseable input is `term()`'d (not silently dropped) so it never redelivers forever;
+anything left over (backpressure, a transient publish failure) is left unacked so `--consumer-ack-wait`
+triggers real redelivery instead of silent loss. Verified against the exact stress condition that
+found the loss above, 15 real trials: 0/15 stalled, exact ground truth every time.
+
+**The real, measured cost**: roughly 2.6-2.9x slower true end-to-end throughput than
+`--queue-group` mode (e.g. N=16: ~195,770/s plain vs. ~66,771/s durable). Profiled directly with
+`perf` on the real `nats-server` process (differential: plain vs. durable-consumer) to find out
+why, rather than assume:
+
+- It is **not** disk persistence. `--input-stream-storage memory` (an isolation-testing flag,
+  never meant for production - it loses everything on a `nats-server` restart) only recovers 3-6%
+  of the gap. The `perf` profile confirms this precisely: the disk-write function family
+  (`writeMsgRecordLocked`/`writeAt`/`compactWithFloor`/`loadBlock`, ~2.5% combined) shows up only
+  in the file-backed profile and is completely absent from the memory-backed one.
+- It is **not** `(*client).flushOutbound` (the function already root-caused as plain NATS's own
+  connection-scaling ceiling) - that function's *share* drops sharply under the durable-consumer
+  mode (11.55%->3.74% of samples), because other costs grow around it, not because it gets worse.
+- It is **not** `sync.RWMutex` lock contention hiding as blocked/waiting time invisible to
+  `perf`'s on-CPU sampling - a real Go block-profile capture (`nats-server`'s own
+  `prof_block_rate`, not a patched binary) found `RWMutex` accounts for only ~2.5% of total
+  blocking weight; ~97% is benign idle-goroutine parking, not lock contention.
+- It **is** genuinely new/growing work spread across JetStream's own tracking machinery -
+  roughly 15% of the profile is symbols absent (or much smaller) in plain mode: `ackReplyInfo`
+  (ack processing), `Sublist.match` (consumer re-matching), `ipQueue.push` (internal queueing),
+  and - the single largest identified cluster, larger than any one named function - Go hash-map
+  operations (`aeshashbody`/`maps.Iter.Next`/`mapaccess2_faststr`/`mapassign_faststr`, ~6%
+  combined, with `mapdelete_faststr` right alongside them), consistent with per-message
+  ack/redelivery state being tracked in a live map keyed by stream sequence number. This is a
+  broad, diffuse tax across the durable-consumer protocol's bookkeeping, not one concentrated hot
+  spot - there's no single obvious fix to claw the 2.6-2.9x back.
+
+**Practical takeaway**: use `--queue-group` when raw throughput matters more than delivery
+guarantees; use the durable-consumer flags when losing data is unacceptable and ~2.6-2.9x lower
+throughput is an acceptable price for a real, verified loss-proof mode.
 
 ## Schema Generation
 
