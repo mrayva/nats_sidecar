@@ -39,6 +39,45 @@ enum class engine_type {
     betree
 };
 
+// One independent input source: a named group of subjects, feeding either a
+// plain core-NATS queue-group subscribe ("core") or a durable JetStream
+// consumer ("js", the default - the loss-proof mode). A process can run any
+// number of these simultaneously, each choosing its own mode/subjects, all
+// funneling into the same shared matching tree and output_prefix (see
+// config::output_prefix) - "connections" is purely an input-side concept,
+// not a separate NATS TCP connection or a separate output namespace.
+struct input_connection {
+    // Required, non-empty, unique among connections. Used in logs and to
+    // scope stream/durable/deliver_subject collision checks.
+    std::string name;
+
+    // "js" (default) or "core".
+    std::string mode = "js";
+
+    std::vector<std::string> subjects;
+
+    // core mode only: optional load-balancing group.
+    std::string queue_group;
+
+    // js mode only - same semantics as the legacy flat fields below.
+    // consumer_durable_name and consumer_deliver_subject are both required;
+    // deliver_subject in particular must be an explicit, fixed value shared
+    // by every instance, never left to auto-generate (nats_asio generates a
+    // random per-connection inbox if unset, which would silently break
+    // multi-instance load distribution rather than error out).
+    std::string stream;
+    std::string consumer_durable_name;
+    std::string consumer_deliver_subject;
+    std::string consumer_deliver_group;   // JetStream analog of queue_group
+    uint64_t consumer_max_ack_pending = 1000;
+    uint32_t consumer_ack_wait_seconds = 30;
+    // "file" (default, real durability) or "memory" (throughput-isolation
+    // tool only - loses everything on nats-server restart/crash).
+    std::string stream_storage = "file";
+
+    bool jetstream() const { return mode == "js"; }
+};
+
 struct config {
     // NATS connection
     std::string nats_address = "127.0.0.1";
@@ -47,40 +86,35 @@ struct config {
     std::string tls_key;
     std::string tls_ca;
 
-    // Input streams - core NATS subjects with binary messages, all sharing
-    // this config's one attribute schema. Every message from every
-    // configured subject is matched against the same subscription tree.
-    std::vector<std::string> input_subjects;
-    binary_format format = binary_format::msgpack;
-    std::string input_queue_group;  // optional load-balancing across sidecars
+    // Multiple independent input connections (mixed js/core mode), the
+    // current, preferred way to configure input. When non-empty,
+    // effective_connections() below returns this list verbatim and every
+    // legacy flat field below is ignored (load_config() rejects a config
+    // file that sets both, to avoid ambiguous merge semantics).
+    std::vector<input_connection> connections;
 
-    // Durable JetStream consumer input mode - loss-proof alternative to the
-    // plain queue-group subscribe above, additive (input_queue_group stays
-    // available and unchanged when this isn't set). Core NATS plain pub/sub
-    // is at-most-once by design (no ack, no redelivery); this mode gets a
-    // real delivery guarantee via explicit acks and max_ack_pending flow
-    // control. Enabled by setting input_stream (non-empty); when enabled,
-    // consumer_durable_name and consumer_deliver_subject are both required -
-    // deliver_subject in particular must be an explicit, fixed value shared
-    // by every instance, never left to auto-generate (nats_asio generates a
-    // random per-connection inbox if unset, which would silently break
-    // multi-instance load distribution rather than error out).
+    // --- Legacy single-connection fields (deprecated but still functional) ---
+    // Only ever consumed via effective_connections() below, never read
+    // directly by sidecar_engine/worker_pool - kept for config-file/CLI
+    // back-compat with the pre-multi-connection single-input-source shape.
+    std::vector<std::string> input_subjects;
+    std::string input_queue_group;  // optional load-balancing across sidecars
     std::string input_stream;
     std::string consumer_durable_name;
     std::string consumer_deliver_subject;
     std::string consumer_deliver_group;   // JetStream analog of input_queue_group
     uint64_t consumer_max_ack_pending = 1000;
     uint32_t consumer_ack_wait_seconds = 30;
-    // "file" (default, real durability) or "memory" (throughput-isolation
-    // tool only - loses everything on nats-server restart/crash, exists to
-    // measure how much of JetStream's cost is disk I/O vs ack/flow-control
-    // protocol overhead, not for production use).
     std::string input_stream_storage = "file";
 
-    // Output - matched messages published to <output_prefix>.<BE-ID>
-    // Defaults to the single input subject if there is exactly one; must
-    // be set explicitly when input_subjects has more than one entry, since
-    // there is no unambiguous default to pick among them.
+    binary_format format = binary_format::msgpack;
+
+    // Output - matched messages published to <output_prefix>.<BE-ID>,
+    // shared by every input connection (a client's boolean expression
+    // matches a message regardless of which connection it arrived on).
+    // Defaults to the single input subject if there is exactly one across
+    // all connections; must be set explicitly otherwise, since there is no
+    // unambiguous default to pick among them.
     std::string output_prefix;
 
     // Subscription management - clients send requests here
@@ -113,7 +147,14 @@ struct config {
     std::size_t publish_max_inflight = 1024;
     uint32_t publish_backpressure_timeout_ms = 5000;
 
-    bool jetstream_consumer_enabled() const { return !input_stream.empty(); }
+    // Returns `connections` verbatim if non-empty; otherwise synthesizes
+    // exactly one connection (name "default", mode "js" if input_stream is
+    // set else "core") from the legacy flat fields above, reproducing the
+    // pre-multi-connection single-input-source behavior exactly. This is
+    // the only place the legacy flat fields should be read after config
+    // construction - sidecar_engine, worker_pool, and cli.cpp's validation
+    // all call this instead of touching the flat fields directly.
+    std::vector<input_connection> effective_connections() const;
 };
 
 // Parse config from YAML file. Throws on error.

@@ -31,33 +31,37 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
         co_return;
     }
 
-    if (m_cfg.jetstream_consumer_enabled()) {
-        // Provision the stream and subscribe *before* worker_pool exists,
-        // not after - m_input_js_sub is passed into worker_pool's
-        // constructor so it's fully initialized before worker threads ever
-        // start (the same happens-before guarantee m_conn/m_log already
-        // rely on), rather than a late setter that worker threads could
-        // race against. No message can arrive in the gap between
-        // js_subscribe() returning and worker_pool being constructed below:
-        // this coroutine runs on the single-threaded ioc and never yields
-        // to it (no co_await) between the two, so nothing can interleave.
-        if (!co_await ensure_input_stream()) {
-            m_log->error("Failed to provision input stream '{}'; refusing unsafe startup",
-                        m_cfg.input_stream);
+    auto conns = m_cfg.effective_connections();
+
+    // Provision every JetStream stream before subscribing to anything -
+    // fail startup outright on a real config mismatch rather than partially
+    // starting. Each js message now carries its own js_sub (see
+    // worker_pool::queued_message), so - unlike before this connection list
+    // existed - worker_pool no longer needs any subscription handle at
+    // construction time; only ordering constraint left is that every stream
+    // is provisioned before we start accepting control-plane traffic below.
+    for (const auto& c : conns) {
+        if (!c.jetstream()) continue;
+        if (!co_await ensure_input_stream(c)) {
+            m_log->error("Failed to provision input stream '{}' (connection '{}'); "
+                        "refusing unsafe startup", c.stream, c.name);
             m_ioc.stop();
             co_return;
         }
-        if (!co_await subscribe_to_inputs_jetstream()) co_return;
+    }
 
-        m_worker_pool = std::make_unique<worker_pool>(
-            m_ioc, m_cfg, m_schema, m_sub_mgr, m_conn, m_log, m_input_js_sub);
-        m_worker_pool->start();
-    } else {
-        m_worker_pool = std::make_unique<worker_pool>(
-            m_ioc, m_cfg, m_schema, m_sub_mgr, m_conn, m_log);
-        m_worker_pool->start();
+    m_worker_pool = std::make_unique<worker_pool>(
+        m_ioc, m_cfg, m_schema, m_sub_mgr, m_conn, m_log);
+    m_worker_pool->start();
 
-        if (!co_await subscribe_to_inputs()) co_return;
+    for (const auto& c : conns) {
+        if (c.jetstream()) {
+            auto js_sub = co_await subscribe_to_inputs_jetstream(c);
+            if (!js_sub) co_return;  // already logged + m_ioc.stop() inside
+            m_input_js_subs.push_back(std::move(js_sub));
+        } else {
+            if (!co_await subscribe_to_inputs(c)) co_return;
+        }
     }
 
     // Subscribe to subscription control subject (request/reply)
@@ -123,7 +127,7 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
 void sidecar_engine::stop_workers() {
     m_shutting_down.store(true, std::memory_order_relaxed);
     for (auto& sub : m_data_subs) { if (sub) sub->cancel(); }
-    if (m_input_js_sub) m_input_js_sub->stop();
+    for (auto& js_sub : m_input_js_subs) { if (js_sub) js_sub->stop(); }
     if (m_subscribe_sub) m_subscribe_sub->cancel();
     if (m_unsubscribe_sub) m_unsubscribe_sub->cancel();
     if (m_lease_mgr) m_lease_mgr->stop();
@@ -145,16 +149,17 @@ asio::awaitable<bool> sidecar_engine::wait_for_publications(
     co_return co_await m_worker_pool->wait_for_publications(timeout);
 }
 
-asio::awaitable<bool> sidecar_engine::subscribe_to_inputs() {
-    // Subscribe to every configured input data subject - all share this
-    // engine's one on_data_message() callback and one subscription_manager,
-    // so messages from any of them are matched against the same tree.
+asio::awaitable<bool> sidecar_engine::subscribe_to_inputs(input_connection conn) {
+    // Subscribe to every subject of this one core-mode connection - all
+    // share this engine's one on_data_message() callback and one
+    // subscription_manager, so messages from any connection (js or core)
+    // are matched against the same tree.
     nats_asio::subscribe_options data_opts;
-    if (!m_cfg.input_queue_group.empty()) {
-        data_opts.queue_group = m_cfg.input_queue_group;
+    if (!conn.queue_group.empty()) {
+        data_opts.queue_group = conn.queue_group;
     }
 
-    for (const auto& subject : m_cfg.input_subjects) {
+    for (const auto& subject : conn.subjects) {
         auto [data_sub, data_status] = co_await m_conn->subscribe(
             subject,
             [this](auto sub, auto reply_to, auto payload) {
@@ -164,13 +169,13 @@ asio::awaitable<bool> sidecar_engine::subscribe_to_inputs() {
         );
 
         if (data_status.failed()) {
-            m_log->error("Failed to subscribe to input subject '{}': {}",
-                        subject, data_status.error());
+            m_log->error("Failed to subscribe to input subject '{}' (connection '{}'): {}",
+                        subject, conn.name, data_status.error());
             m_ioc.stop();
             co_return false;
         }
         m_data_subs.push_back(std::move(data_sub));
-        m_log->info("Subscribed to input subject '{}'", subject);
+        m_log->info("Subscribed to input subject '{}' (connection '{}')", subject, conn.name);
     }
     co_return true;
 }
@@ -197,10 +202,10 @@ asio::awaitable<void> sidecar_engine::on_data_message(
     }
 }
 
-asio::awaitable<bool> sidecar_engine::ensure_input_stream() {
+asio::awaitable<bool> sidecar_engine::ensure_input_stream(input_connection conn) {
     constexpr auto timeout = std::chrono::seconds(5);
 
-    const std::string info_subject = "$JS.API.STREAM.INFO." + m_cfg.input_stream;
+    const std::string info_subject = "$JS.API.STREAM.INFO." + conn.stream;
     const std::string empty_payload = "{}";
     auto [info_reply, info_status] = co_await m_conn->request(
         info_subject,
@@ -208,8 +213,8 @@ asio::awaitable<bool> sidecar_engine::ensure_input_stream() {
         timeout);
 
     if (info_status.failed()) {
-        m_log->error("Failed to inspect input stream '{}': {}",
-                     m_cfg.input_stream, info_status.error());
+        m_log->error("Failed to inspect input stream '{}' (connection '{}'): {}",
+                     conn.stream, conn.name, info_status.error());
         co_return false;
     }
 
@@ -224,22 +229,24 @@ asio::awaitable<bool> sidecar_engine::ensure_input_stream() {
         co_return false;
     }
 
-    if (!missing) co_return validate_existing_input_stream(info);
-    co_return co_await create_input_stream(timeout);
+    if (!missing) co_return validate_existing_input_stream(conn, info);
+    co_return co_await create_input_stream(conn, timeout);
 }
 
-bool sidecar_engine::validate_existing_input_stream(const nlohmann::json& info) const {
+bool sidecar_engine::validate_existing_input_stream(
+    const input_connection& conn, const nlohmann::json& info) const {
     if (info.contains("error") || !info.contains("config")) {
         auto description = info.contains("error")
             ? info["error"].value("description", "stream info failed")
             : std::string("missing stream config");
-        m_log->error("Failed to inspect input stream '{}': {}", m_cfg.input_stream, description);
+        m_log->error("Failed to inspect input stream '{}' (connection '{}'): {}",
+                     conn.stream, conn.name, description);
         return false;
     }
 
-    const auto& cfg = info["config"];
-    const auto retention = cfg.value("retention", std::string{});
-    const auto subjects = cfg.value("subjects", std::vector<std::string>{});
+    const auto& stream_cfg = info["config"];
+    const auto retention = stream_cfg.value("retention", std::string{});
+    const auto subjects = stream_cfg.value("subjects", std::vector<std::string>{});
 
     // "workqueue" retention is what makes ack-based cleanup work at all
     // (a message is removed once its one logical consumer acks it) and is
@@ -249,33 +256,34 @@ bool sidecar_engine::validate_existing_input_stream(const nlohmann::json& info) 
     // not a cosmetic difference.
     if (retention != "workqueue") {
         m_log->error(
-            "Input stream '{}' has retention='{}', expected 'workqueue' - "
+            "Input stream '{}' (connection '{}') has retention='{}', expected 'workqueue' - "
             "refusing to use a stream not configured for ack-based cleanup",
-            m_cfg.input_stream, retention);
+            conn.stream, conn.name, retention);
         return false;
     }
 
-    for (const auto& subject : m_cfg.input_subjects) {
+    for (const auto& subject : conn.subjects) {
         if (std::find(subjects.begin(), subjects.end(), subject) == subjects.end()) {
             m_log->error(
-                "Input stream '{}' does not capture configured input subject '{}' "
-                "(stream subjects: {})",
-                m_cfg.input_stream, subject, subjects.empty() ? "<none>" : subjects.front());
+                "Input stream '{}' (connection '{}') does not capture configured input "
+                "subject '{}' (stream subjects: {})",
+                conn.stream, conn.name, subject, subjects.empty() ? "<none>" : subjects.front());
             return false;
         }
     }
 
-    m_log->info("Validated JetStream input stream '{}' ({} subject(s), retention=workqueue)",
-               m_cfg.input_stream, m_cfg.input_subjects.size());
+    m_log->info("Validated JetStream input stream '{}' (connection '{}', {} subject(s), "
+               "retention=workqueue)", conn.stream, conn.name, conn.subjects.size());
     return true;
 }
 
-asio::awaitable<bool> sidecar_engine::create_input_stream(std::chrono::milliseconds timeout) {
+asio::awaitable<bool> sidecar_engine::create_input_stream(
+    const input_connection& conn, std::chrono::milliseconds timeout) {
     nlohmann::json stream_config = {
-        {"name", m_cfg.input_stream},
-        {"subjects", m_cfg.input_subjects},
+        {"name", conn.stream},
+        {"subjects", conn.subjects},
         {"retention", "workqueue"},
-        {"storage", m_cfg.input_stream_storage},
+        {"storage", conn.stream_storage},
         {"max_msgs", -1},
         {"max_bytes", -1},
         {"max_age", 0},
@@ -285,11 +293,11 @@ asio::awaitable<bool> sidecar_engine::create_input_stream(std::chrono::milliseco
     };
     std::string payload_str = stream_config.dump();
     auto [create_reply, create_status] = co_await m_conn->request(
-        "$JS.API.STREAM.CREATE." + m_cfg.input_stream,
+        "$JS.API.STREAM.CREATE." + conn.stream,
         std::span<const char>(payload_str.data(), payload_str.size()), timeout);
     if (create_status.failed()) {
-        m_log->error("Failed to create input stream '{}': {}",
-                     m_cfg.input_stream, create_status.error());
+        m_log->error("Failed to create input stream '{}' (connection '{}'): {}",
+                     conn.stream, conn.name, create_status.error());
         co_return false;
     }
 
@@ -297,7 +305,8 @@ asio::awaitable<bool> sidecar_engine::create_input_stream(std::chrono::milliseco
         auto response = nlohmann::json::parse(
             std::string_view(create_reply.payload.data(), create_reply.payload.size()));
         if (response.contains("error")) {
-            m_log->error("Failed to create input stream '{}': {}", m_cfg.input_stream,
+            m_log->error("Failed to create input stream '{}' (connection '{}'): {}",
+                        conn.stream, conn.name,
                         response["error"].value("description", "unknown error"));
             co_return false;
         }
@@ -306,61 +315,67 @@ asio::awaitable<bool> sidecar_engine::create_input_stream(std::chrono::milliseco
         co_return false;
     }
 
-    m_log->info("Created JetStream input stream '{}' ({} subject(s), retention=workqueue)",
-               m_cfg.input_stream, m_cfg.input_subjects.size());
+    m_log->info("Created JetStream input stream '{}' (connection '{}', {} subject(s), "
+               "retention=workqueue)", conn.stream, conn.name, conn.subjects.size());
     co_return true;
 }
 
-asio::awaitable<bool> sidecar_engine::subscribe_to_inputs_jetstream() {
+asio::awaitable<nats_asio::ijs_subscription_sptr> sidecar_engine::subscribe_to_inputs_jetstream(
+    input_connection conn) {
     nats_asio::js_consumer_config js_cfg;
-    js_cfg.stream = m_cfg.input_stream;
-    js_cfg.durable_name = m_cfg.consumer_durable_name;
+    js_cfg.stream = conn.stream;
+    js_cfg.durable_name = conn.consumer_durable_name;
     // deliver_subject is required (validated in finalize_and_validate_config)
     // and must never be left unset - see config.hpp's comment on why an
     // auto-generated inbox would silently break multi-instance sharing.
-    js_cfg.deliver_subject = m_cfg.consumer_deliver_subject;
-    if (!m_cfg.consumer_deliver_group.empty()) {
-        js_cfg.deliver_group = m_cfg.consumer_deliver_group;
+    js_cfg.deliver_subject = conn.consumer_deliver_subject;
+    if (!conn.consumer_deliver_group.empty()) {
+        js_cfg.deliver_group = conn.consumer_deliver_group;
     }
     js_cfg.ack = nats_asio::js_ack_policy::explicit_;
-    js_cfg.ack_wait = std::chrono::seconds(m_cfg.consumer_ack_wait_seconds);
-    js_cfg.max_ack_pending = m_cfg.consumer_max_ack_pending;
+    js_cfg.ack_wait = std::chrono::seconds(conn.consumer_ack_wait_seconds);
+    js_cfg.max_ack_pending = conn.consumer_max_ack_pending;
 
+    // js_sub is captured by value once available below (see the second
+    // co_await this triggers via nats_asio's own retry/reconnect internals)
+    // so every callback for this connection resolves ack/nak/term against
+    // this connection's own subscription, never a shared/ambiguous one.
+    auto self_sub = std::make_shared<nats_asio::ijs_subscription_sptr>();
     auto [js_sub, js_status] = co_await m_conn->js_subscribe(
         js_cfg,
-        [this](nats_asio::ijs_subscription& sub, const nats_asio::js_message& msg) {
-            return on_js_data_message(sub, msg);
+        [this, self_sub](nats_asio::ijs_subscription& /*sub*/, const nats_asio::js_message& msg) {
+            return on_js_data_message(*self_sub, msg);
         });
 
     if (js_status.failed()) {
         m_log->error(
-            "Failed to subscribe to JetStream input (stream='{}', durable='{}', "
-            "deliver_subject='{}'): {}",
-            m_cfg.input_stream, m_cfg.consumer_durable_name,
-            m_cfg.consumer_deliver_subject, js_status.error());
+            "Failed to subscribe to JetStream input (connection='{}', stream='{}', "
+            "durable='{}', deliver_subject='{}'): {}",
+            conn.name, conn.stream, conn.consumer_durable_name,
+            conn.consumer_deliver_subject, js_status.error());
         m_ioc.stop();
-        co_return false;
+        co_return nullptr;
     }
-    m_input_js_sub = std::move(js_sub);
+    *self_sub = js_sub;
     m_log->info(
-        "Subscribed to JetStream input stream '{}' (durable='{}', deliver_subject='{}', "
-        "deliver_group='{}', max_ack_pending={}, ack_wait={}s)",
-        m_cfg.input_stream, m_cfg.consumer_durable_name, m_cfg.consumer_deliver_subject,
-        m_cfg.consumer_deliver_group.empty() ? "<none>" : m_cfg.consumer_deliver_group,
-        m_cfg.consumer_max_ack_pending, m_cfg.consumer_ack_wait_seconds);
-    co_return true;
+        "Subscribed to JetStream input stream '{}' (connection='{}', durable='{}', "
+        "deliver_subject='{}', deliver_group='{}', max_ack_pending={}, ack_wait={}s)",
+        conn.stream, conn.name, conn.consumer_durable_name, conn.consumer_deliver_subject,
+        conn.consumer_deliver_group.empty() ? "<none>" : conn.consumer_deliver_group,
+        conn.consumer_max_ack_pending, conn.consumer_ack_wait_seconds);
+    co_return js_sub;
 }
 
 asio::awaitable<void> sidecar_engine::on_js_data_message(
-    nats_asio::ijs_subscription& /*sub*/, const nats_asio::js_message& msg)
+    nats_asio::ijs_subscription_sptr js_sub, const nats_asio::js_message& msg)
 {
     m_messages_received++;
 
     if (msg.msg.payload.empty()) {
         // A real delivered message with nothing to process - ack now
         // rather than leave it to redeliver forever for no reason.
-        if (m_input_js_sub) {
-            auto s = co_await m_input_js_sub->ack(msg);
+        if (js_sub) {
+            auto s = co_await js_sub->ack(msg);
             if (s.failed()) {
                 m_log->warn("Failed to ack empty JetStream input message: {}", s.error());
             }
@@ -371,18 +386,18 @@ asio::awaitable<void> sidecar_engine::on_js_data_message(
     if (!m_worker_pool) {
         // Startup-ordering edge case that shouldn't occur in practice (the
         // JetStream subscribe only starts once worker_pool has been
-        // constructed with this subscription already wired in) - leave
-        // unacked rather than lose it; ack_wait will trigger redelivery
-        // once the pool is actually ready.
+        // constructed) - leave unacked rather than lose it; ack_wait will
+        // trigger redelivery once the pool is actually ready.
         m_log->warn("Received JetStream data before worker pool initialization; "
                     "message will redeliver");
         co_return;
     }
 
-    // Copy the payload and the owned js_message for worker processing.
-    // ack/nak/term happen later, from worker_pool's own resolution logic,
-    // once match+publish has actually completed - not here.
-    if (!m_worker_pool->enqueue(msg.msg.payload, msg)) {
+    // Copy the payload and the owned js_message (plus this connection's own
+    // js_sub) for worker processing. ack/nak/term happen later, from
+    // worker_pool's own resolution logic, once match+publish has actually
+    // completed - not here.
+    if (!m_worker_pool->enqueue(msg.msg.payload, msg, js_sub)) {
         // Backpressure at worker_pool's own queue limit - leave unacked,
         // same "let ack_wait redeliver" rule worker_loop's own
         // publish-inflight backpressure path follows.

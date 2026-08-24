@@ -31,6 +31,88 @@ std::optional<attribute_type> parse_attribute_type(const std::string& s) {
     return std::nullopt;
 }
 
+std::vector<input_connection> config::effective_connections() const {
+    if (!connections.empty()) return connections;
+
+    input_connection c;
+    c.name = "default";
+    c.mode = input_stream.empty() ? "core" : "js";
+    c.subjects = input_subjects;
+    c.queue_group = input_queue_group;
+    c.stream = input_stream;
+    c.consumer_durable_name = consumer_durable_name;
+    c.consumer_deliver_subject = consumer_deliver_subject;
+    c.consumer_deliver_group = consumer_deliver_group;
+    c.consumer_max_ack_pending = consumer_max_ack_pending;
+    c.consumer_ack_wait_seconds = consumer_ack_wait_seconds;
+    c.stream_storage = input_stream_storage;
+    return {std::move(c)};
+}
+
+namespace {
+
+// Whether the YAML root has any legacy flat input field set - used to
+// reject a config file that mixes the new `connections:` block with the
+// old flat shape, since merging the two would be ambiguous.
+bool has_legacy_input_fields(const YAML::Node& root) {
+    static constexpr const char* legacy_keys[] = {
+        "input_subjects", "input_queue_group", "input_stream",
+        "consumer_durable_name", "consumer_deliver_subject",
+        "consumer_deliver_group", "consumer_max_ack_pending",
+        "consumer_ack_wait_seconds", "input_stream_storage"
+    };
+    for (const auto* key : legacy_keys) {
+        if (root[key]) return true;
+    }
+    return false;
+}
+
+input_connection parse_connection(const YAML::Node& node) {
+    input_connection c;
+
+    if (auto n = node["name"]) {
+        c.name = n.as<std::string>();
+    }
+    if (c.name.empty()) {
+        throw std::runtime_error("config: every entry in 'connections' requires a non-empty 'name'");
+    }
+
+    if (auto n = node["mode"]) {
+        c.mode = n.as<std::string>();
+        if (c.mode != "js" && c.mode != "core") {
+            throw std::runtime_error(
+                "config: connection '" + c.name + "' has invalid mode '" + c.mode +
+                "' (expected 'js' or 'core')");
+        }
+    }
+
+    if (auto n = node["subjects"]) {
+        if (!n.IsSequence()) {
+            throw std::runtime_error(
+                "config: connection '" + c.name + "' 'subjects' must be a list");
+        }
+        for (const auto& item : n) c.subjects.push_back(item.as<std::string>());
+    }
+    if (c.subjects.empty()) {
+        throw std::runtime_error(
+            "config: connection '" + c.name + "' must have at least one subject");
+    }
+
+    if (auto n = node["queue_group"]) c.queue_group = n.as<std::string>();
+
+    if (auto n = node["stream"])                   c.stream = n.as<std::string>();
+    if (auto n = node["consumer_durable_name"])    c.consumer_durable_name = n.as<std::string>();
+    if (auto n = node["consumer_deliver_subject"]) c.consumer_deliver_subject = n.as<std::string>();
+    if (auto n = node["consumer_deliver_group"])   c.consumer_deliver_group = n.as<std::string>();
+    if (auto n = node["consumer_max_ack_pending"])  c.consumer_max_ack_pending = n.as<uint64_t>();
+    if (auto n = node["consumer_ack_wait_seconds"]) c.consumer_ack_wait_seconds = n.as<uint32_t>();
+    if (auto n = node["stream_storage"])            c.stream_storage = n.as<std::string>();
+
+    return c;
+}
+
+} // namespace
+
 config load_config(const std::string& path) {
     YAML::Node root = YAML::LoadFile(path);
     config cfg;
@@ -42,15 +124,38 @@ config load_config(const std::string& path) {
     if (auto n = root["tls_key"])      cfg.tls_key  = n.as<std::string>();
     if (auto n = root["tls_ca"])       cfg.tls_ca   = n.as<std::string>();
 
-    // Input
-    if (auto n = root["input_subjects"]) {
-        if (!n.IsSequence()) throw std::runtime_error("config: 'input_subjects' must be a list");
-        for (const auto& item : n) cfg.input_subjects.push_back(item.as<std::string>());
+    // Input - either the new 'connections' list (preferred) or the legacy
+    // flat single-connection fields, never both in the same file.
+    if (auto n = root["connections"]) {
+        if (has_legacy_input_fields(root)) {
+            throw std::runtime_error(
+                "config: 'connections' cannot be combined with the legacy flat input "
+                "fields (input_subjects, input_stream, input_queue_group, "
+                "consumer_durable_name, consumer_deliver_subject, consumer_deliver_group, "
+                "consumer_max_ack_pending, consumer_ack_wait_seconds, "
+                "input_stream_storage) - use one shape or the other");
+        }
+        if (!n.IsSequence()) throw std::runtime_error("config: 'connections' must be a list");
+        for (const auto& item : n) cfg.connections.push_back(parse_connection(item));
+        if (cfg.connections.empty()) {
+            throw std::runtime_error("config: 'connections' must not be empty");
+        }
+        for (std::size_t i = 0; i < cfg.connections.size(); ++i) {
+            for (std::size_t j = i + 1; j < cfg.connections.size(); ++j) {
+                if (cfg.connections[i].name == cfg.connections[j].name) {
+                    throw std::runtime_error(
+                        "config: duplicate connection name '" + cfg.connections[i].name + "'");
+                }
+            }
+        }
+    } else if (auto legacy = root["input_subjects"]) {
+        if (!legacy.IsSequence()) throw std::runtime_error("config: 'input_subjects' must be a list");
+        for (const auto& item : legacy) cfg.input_subjects.push_back(item.as<std::string>());
         if (cfg.input_subjects.empty()) {
             throw std::runtime_error("config: 'input_subjects' must not be empty");
         }
     } else {
-        throw std::runtime_error("config: 'input_subjects' is required");
+        throw std::runtime_error("config: either 'connections' or 'input_subjects' is required");
     }
 
     if (auto n = root["format"]) {
@@ -75,15 +180,21 @@ config load_config(const std::string& path) {
         cfg.engine = *eng;
     }
 
-    // Output
+    // Output - shared by every connection. Defaults to the single subject
+    // when exactly one is configured in total (across every connection);
+    // finalize_and_validate_config() raises a clear error otherwise rather
+    // than silently picking one as the default.
     if (auto n = root["output_prefix"]) {
         cfg.output_prefix = n.as<std::string>();
-    } else if (cfg.input_subjects.size() == 1) {
-        cfg.output_prefix = cfg.input_subjects.front();
+    } else {
+        std::size_t total_subjects = 0;
+        std::string only_subject;
+        for (const auto& c : cfg.effective_connections()) {
+            total_subjects += c.subjects.size();
+            if (total_subjects == 1) only_subject = c.subjects.front();
+        }
+        if (total_subjects == 1) cfg.output_prefix = only_subject;
     }
-    // else: left empty here: finalize_and_validate_config() (shared with the
-    // CLI path) raises a clear error for the multi-subject case rather than
-    // silently picking one input subject as the default.
 
     // Subscription subjects
     if (auto n = root["subscribe_subject"])   cfg.subscribe_subject   = n.as<std::string>();

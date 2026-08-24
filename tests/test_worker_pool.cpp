@@ -296,9 +296,9 @@ TEST(worker_pool, js_mode_acks_after_successful_publish) {
     };
     auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
 
-    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log(), js_sub);
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
     pool.start();
-    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(7, matching_payload(42))));
+    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(7, matching_payload(42)), js_sub));
 
     ASSERT_TRUE(drive_until(
         ioc, [&] { return pool.get_stats().published > 0; }, std::chrono::seconds(2)));
@@ -319,11 +319,11 @@ TEST(worker_pool, js_mode_acks_when_message_does_not_match) {
     subscriptions.subscribe("value > 10", "client-1");
 
     auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
-    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log(), js_sub);
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
     pool.start();
     // value=5 does not satisfy "value > 10" - legitimately processed, no
     // match, must still be acked (not left to redeliver forever).
-    ASSERT_TRUE(pool.enqueue(matching_payload(5), js_message_with(3, matching_payload(5))));
+    ASSERT_TRUE(pool.enqueue(matching_payload(5), js_message_with(3, matching_payload(5)), js_sub));
 
     ASSERT_TRUE(drive_until(
         ioc, [&] { return pool.get_stats().processed > 0; }, std::chrono::seconds(2)));
@@ -342,13 +342,13 @@ TEST(worker_pool, js_mode_terms_malformed_payload) {
     sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
 
     auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
-    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log(), js_sub);
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
     pool.start();
     // 0xc1 is reserved/invalid in MessagePack - a poison message that will
     // never succeed no matter how many times it's redelivered, so it must be
     // termed (not acked, not left pending for redelivery).
     std::vector<char> bad_payload{static_cast<char>(0xc1)};
-    ASSERT_TRUE(pool.enqueue(bad_payload, js_message_with(9, bad_payload)));
+    ASSERT_TRUE(pool.enqueue(bad_payload, js_message_with(9, bad_payload), js_sub));
 
     ASSERT_TRUE(drive_until(
         ioc, [&] { return pool.get_stats().match_failures > 0; }, std::chrono::seconds(2)));
@@ -374,9 +374,9 @@ TEST(worker_pool, js_mode_leaves_unacked_on_publish_write_failure) {
     };
     auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
 
-    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log(), js_sub);
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
     pool.start();
-    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(11, matching_payload(42))));
+    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(11, matching_payload(42)), js_sub));
 
     ASSERT_TRUE(drive_until(
         ioc, [&] { return pool.get_stats().publish_failures > 0; }, std::chrono::seconds(2)));
@@ -392,6 +392,40 @@ TEST(worker_pool, js_mode_leaves_unacked_on_publish_write_failure) {
     EXPECT_TRUE(js_sub->nakked_stream_seqs.empty());
 }
 
+TEST(worker_pool, js_mode_acks_resolve_against_each_messages_own_connection) {
+    // Two independent js-mode connections feeding the same worker_pool (the
+    // multi-connection design: one pool-wide queue, per-message js_sub) -
+    // each message must ack against its own connection's subscription, not
+    // whichever one happens to be "the" pool-wide handle (there is no such
+    // thing anymore).
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    // No active subscriptions - both messages hit the "no active
+    // subscriptions" resolution path, which acks immediately (see
+    // js_mode_acks_when_message_does_not_match above).
+
+    auto js_sub_a = std::make_shared<sidecar_test::fake_js_subscription>();
+    auto js_sub_b = std::make_shared<sidecar_test::fake_js_subscription>();
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(1), js_message_with(100, matching_payload(1)), js_sub_a));
+    ASSERT_TRUE(pool.enqueue(matching_payload(2), js_message_with(200, matching_payload(2)), js_sub_b));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().processed >= 2; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(drive_until(
+        ioc,
+        [&] { return !js_sub_a->acked_stream_seqs.empty() && !js_sub_b->acked_stream_seqs.empty(); },
+        std::chrono::seconds(2)));
+    pool.stop();
+
+    EXPECT_EQ(js_sub_a->acked_stream_seqs, (std::vector<uint64_t>{100}));
+    EXPECT_EQ(js_sub_b->acked_stream_seqs, (std::vector<uint64_t>{200}));
+}
+
 TEST(worker_pool, js_mode_leaves_unacked_on_inflight_backpressure_drop) {
     asio::io_context ioc(1);
     auto cfg = worker_config();
@@ -401,9 +435,9 @@ TEST(worker_pool, js_mode_leaves_unacked_on_inflight_backpressure_drop) {
     subscriptions.subscribe("value > 10", "client-1");
 
     auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
-    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log(), js_sub);
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
     pool.start();
-    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(13, matching_payload(42))));
+    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(13, matching_payload(42)), js_sub));
 
     ASSERT_TRUE(drive_until(
         ioc, [&] { return pool.get_stats().publish_tasks_dropped > 0; }, std::chrono::seconds(2)));

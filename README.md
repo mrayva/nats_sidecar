@@ -65,6 +65,10 @@ The executable is placed at `build/bin/nats_sidecar`.
 
 All configuration parameters can be set via CLI flags. When a config file is also provided, CLI flags take precedence.
 
+The input-related flags below (`--input-subject` through `--input-stream-storage`) only apply to
+the legacy single-connection config shape - they're rejected if the config file defines
+`connections:` (see "Multiple input connections"). Every other flag works with either shape.
+
 | Flag | Description |
 |------|-------------|
 | `-c, --config PATH` | Path to YAML config file |
@@ -106,7 +110,8 @@ All configuration parameters can be set via CLI flags. When a config file is als
 
 The sidecar can be configured via a YAML file, CLI flags, or a combination of both. When both are provided, CLI flags override the corresponding YAML values. A config file is not required — all parameters can be supplied via CLI.
 
-The only required settings are `input_subjects` (at least one) and at least one attribute definition. Everything else has sensible defaults.
+The only required settings are at least one input subject (via `connections` or the legacy
+`input_subjects`) and at least one attribute definition. Everything else has sensible defaults.
 
 See [`config/example.yaml`](config/example.yaml) for a full annotated example. Key settings:
 
@@ -119,12 +124,16 @@ nats_port: 4222
 # one attribute schema below - `-i`/`--input-subject` is repeatable on the
 # CLI for the same effect. With more than one subject, output_prefix must
 # be set explicitly (see below); with exactly one, it defaults to that
-# subject.
+# subject. This is the legacy single-connection shape; see "Multiple input
+# connections" below for running several independently-configured inputs
+# (mixing durable and best-effort mode) in one process.
 input_subjects: ["sensor.data"]
 format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
 engine: atree             # atree | betree
 
-# Output: matched messages published to <output_prefix>.<subscription_id>
+# Output: matched messages published to <output_prefix>.<subscription_id>,
+# shared by every input connection - a client's subscribed expression
+# matches a message regardless of which connection it arrived on.
 output_prefix: "sensor.filtered"
 
 # Subscription management (request/reply)
@@ -152,6 +161,59 @@ input_queue_max_bytes: 67108864
 publish_max_inflight: 1024
 publish_backpressure_timeout_ms: 5000
 ```
+
+### Multiple input connections
+
+A single process can consume from any number of independently configured input connections at
+once, each choosing its own mode - `js` (durable JetStream consumer, the default) or `core`
+(plain queue-group, best-effort) - instead of the whole process being one mode or the other. This
+is the config-file-only `connections:` list, an alternative to (not combinable with) the flat
+`input_subjects`/`input_stream`/etc. fields above:
+
+```yaml
+connections:
+  - name: orders            # required, unique among connections
+    mode: js                 # "js" (default) or "core" - omit for js
+    subjects: ["orders.in"]
+    stream: ORDERS_STREAM
+    consumer_durable_name: orders-durable
+    consumer_deliver_subject: orders.deliver
+    consumer_deliver_group: orders-group    # optional
+    consumer_max_ack_pending: 1000          # optional, default shown
+    consumer_ack_wait_seconds: 30           # optional, default shown
+    stream_storage: file                    # optional, "file" | "memory"
+
+  - name: telemetry
+    mode: core
+    subjects: ["telemetry.in"]
+    queue_group: telemetry-workers          # optional
+
+output_prefix: "matched"    # still one shared value - see below
+attributes:
+  - name: value
+    type: integer
+```
+
+A realistic use: durable delivery for subjects where losing a message is unacceptable (orders),
+best-effort for everything else (telemetry/heartbeats), in one sidecar process instead of two.
+
+Every connection matches against the **same** shared matching tree, attribute schema, and
+`output_prefix` - a client subscribes once and gets matches regardless of which connection they
+arrived on. Only the input side (subjects, mode, and JetStream-specific settings) is
+per-connection; `subscribe_subject`/`unsubscribe_subject`/`output_prefix`/`attributes`/`engine`
+stay process-wide, exactly as in the single-connection shape. All connections also still share
+one underlying NATS connection - `connections` is not a way to talk to multiple NATS servers.
+
+`stream`, `consumer_durable_name`, and `consumer_deliver_subject` must each be unique across every
+`js`-mode connection, and no subject may be repeated across any two connections regardless of
+mode - both are rejected at startup with a clear error rather than silently double-enqueuing or
+merging two unrelated durable consumers.
+
+CLI single-value flags (`--input-subject`, `--input-stream`, `--consumer-durable-name`, etc.) only
+apply to the legacy single-connection shape; they're rejected with an error if the loaded config
+file already defines `connections:`, since there's no way to know which named connection a bare
+flag should target. Every other flag (`--workers`, `--log-level`, `--lease-ttl`, ...) still works
+normally alongside `connections:`.
 
 ### Attribute Types
 
@@ -237,16 +299,20 @@ Response:
 
 ## Durable JetStream consumer: loss-proof input, at a real cost
 
-By default (`--queue-group`), the sidecar consumes its input via a plain core-NATS queue-group
-subscription - simple and fast, but core NATS pub/sub is at-most-once by design: no ack, no
-redelivery, no flow control beyond a hard connection-buffer disconnect. Real stress testing found
-this can lose messages under load (confirmed via `nats-server`'s own "Slow Consumer Detected" log
-line under a JetStream-publish burst).
+By default (`--queue-group`, or a `connections:` entry with `mode: core`), the sidecar consumes
+its input via a plain core-NATS queue-group subscription - simple and fast, but core NATS pub/sub
+is at-most-once by design: no ack, no redelivery, no flow control beyond a hard connection-buffer
+disconnect. Real stress testing found this can lose messages under load (confirmed via
+`nats-server`'s own "Slow Consumer Detected" log line under a JetStream-publish burst).
 
 Setting `--input-stream`/`--consumer-durable-name`/`--consumer-deliver-subject`/
-`--consumer-deliver-group` switches input consumption to a durable JetStream push consumer with
-explicit application-controlled acks instead - additive, not a replacement; `--queue-group` still
-works unchanged when these are unset. Ack timing: a matched-and-published message is acked only
+`--consumer-deliver-group` (or, for the `connections:` shape, `mode: js` - the default - with
+`stream`/`consumer_durable_name`/`consumer_deliver_subject`/`consumer_deliver_group`) switches
+input consumption to a durable JetStream push consumer with explicit application-controlled acks
+instead - additive, not a replacement; plain/core mode still works unchanged on connections that
+don't opt in. This choice is made independently per connection: one process can run some
+connections in durable `js` mode and others in best-effort `core` mode at once (see "Multiple
+input connections" above). Ack timing: a matched-and-published message is acked only
 after the publish write succeeds; a legitimately non-matching message is acked immediately;
 malformed/unparseable input is `term()`'d (not silently dropped) so it never redelivers forever;
 anything left over (backpressure, a transient publish failure) is left unacked so `--consumer-ack-wait`

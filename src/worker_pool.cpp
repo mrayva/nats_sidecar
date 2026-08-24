@@ -36,11 +36,9 @@ worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
                          const attribute_schema& schema,
                          subscription_manager& sub_mgr,
                          nats_asio::iconnection_sptr conn,
-                         std::shared_ptr<spdlog::logger> log,
-                         nats_asio::ijs_subscription_sptr input_js_sub)
+                         std::shared_ptr<spdlog::logger> log)
     : m_ioc(ioc), m_format(cfg.format), m_schema(schema),
       m_sub_mgr(sub_mgr), m_conn(std::move(conn)), m_log(std::move(log)),
-      m_input_js_sub(std::move(input_js_sub)),
       m_thread_count(cfg.worker_threads > 0 ? cfg.worker_threads
                                             : std::thread::hardware_concurrency()),
       m_queue_max_messages(cfg.input_queue_max_messages),
@@ -81,11 +79,12 @@ void worker_pool::stop() {
 }
 
 bool worker_pool::enqueue(std::vector<char> payload) {
-    return enqueue_impl(queued_message{std::move(payload), std::nullopt});
+    return enqueue_impl(queued_message{std::move(payload), std::nullopt, nullptr});
 }
 
-bool worker_pool::enqueue(std::vector<char> payload, nats_asio::js_message js_msg) {
-    return enqueue_impl(queued_message{std::move(payload), std::move(js_msg)});
+bool worker_pool::enqueue(std::vector<char> payload, nats_asio::js_message js_msg,
+                          nats_asio::ijs_subscription_sptr js_sub) {
+    return enqueue_impl(queued_message{std::move(payload), std::move(js_msg), std::move(js_sub)});
 }
 
 bool worker_pool::enqueue_impl(queued_message qm) {
@@ -114,9 +113,8 @@ bool worker_pool::enqueue_impl(queued_message qm) {
     return true;
 }
 
-void worker_pool::spawn_ack(nats_asio::js_message msg) {
-    if (!m_input_js_sub) return;
-    auto js_sub = m_input_js_sub;
+void worker_pool::spawn_ack(nats_asio::ijs_subscription_sptr js_sub, nats_asio::js_message msg) {
+    if (!js_sub) return;
     auto log = m_log;
     asio::co_spawn(m_ioc,
         [js_sub = std::move(js_sub), msg = std::move(msg), log]() mutable -> asio::awaitable<void> {
@@ -129,9 +127,8 @@ void worker_pool::spawn_ack(nats_asio::js_message msg) {
         asio::detached);
 }
 
-void worker_pool::spawn_term(nats_asio::js_message msg) {
-    if (!m_input_js_sub) return;
-    auto js_sub = m_input_js_sub;
+void worker_pool::spawn_term(nats_asio::ijs_subscription_sptr js_sub, nats_asio::js_message msg) {
+    if (!js_sub) return;
     auto log = m_log;
     asio::co_spawn(m_ioc,
         [js_sub = std::move(js_sub), msg = std::move(msg), log]() mutable -> asio::awaitable<void> {
@@ -202,7 +199,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
             // left pending): a subscribe request only ever looks at
             // messages from that point forward, so there's no future
             // consumer who'd want this message redelivered.
-            if (qm.js_msg) spawn_ack(std::move(*qm.js_msg));
+            if (qm.js_msg) spawn_ack(qm.js_sub, std::move(*qm.js_msg));
             qm.payload.clear();
             continue;
         }
@@ -227,7 +224,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
             // this is a real, visible "permanently gave up" signal (shows
             // up in js_get_consumer_info's stats) rather than a silent drop.
             m_match_failures.fetch_add(1, std::memory_order_relaxed);
-            if (qm.js_msg) spawn_term(std::move(*qm.js_msg));
+            if (qm.js_msg) spawn_term(qm.js_sub, std::move(*qm.js_msg));
             qm.payload.clear();
             continue;
         }
@@ -237,7 +234,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
             // every non-matching message (most real traffic, for any given
             // filter) would sit unacked until ack_wait and redeliver
             // forever for no reason.
-            if (qm.js_msg) spawn_ack(std::move(*qm.js_msg));
+            if (qm.js_msg) spawn_ack(qm.js_sub, std::move(*qm.js_msg));
             qm.payload.clear();
             continue;
         }
@@ -275,7 +272,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         auto log = m_log;
         auto counters = m_publish_counters;
         auto backpressure_timeout = m_publish_backpressure_timeout;
-        auto js_sub = m_input_js_sub;
+        auto js_sub = qm.js_sub;
         auto js_msg = std::move(qm.js_msg);
 
         // Post publish work to the ASIO I/O thread

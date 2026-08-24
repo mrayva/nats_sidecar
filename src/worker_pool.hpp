@@ -59,8 +59,7 @@ public:
                 const attribute_schema& schema,
                 subscription_manager& sub_mgr,
                 nats_asio::iconnection_sptr conn,
-                std::shared_ptr<spdlog::logger> log,
-                nats_asio::ijs_subscription_sptr input_js_sub = nullptr);
+                std::shared_ptr<spdlog::logger> log);
     ~worker_pool();
 
     // Spawn N worker threads. Must be called once.
@@ -76,11 +75,14 @@ public:
     bool enqueue(std::vector<char> payload);
 
     // JetStream-consumer-mode overload: the payload's originating js_message
-    // travels with it so the worker can resolve delivery (ack/nak/term)
+    // and the specific connection's own js_sub travel with it so the worker
+    // can resolve delivery (ack/nak/term) against the *right* consumer
     // after processing completes, not just at enqueue time - see
-    // worker_loop()'s four resolution cases. Requires input_js_sub to have
-    // been passed to the constructor.
-    bool enqueue(std::vector<char> payload, nats_asio::js_message js_msg);
+    // worker_loop()'s four resolution cases. A process can have any number
+    // of js-mode connections live at once, each with its own js_sub, so
+    // this is per-message rather than a single pool-wide handle.
+    bool enqueue(std::vector<char> payload, nats_asio::js_message js_msg,
+                 nats_asio::ijs_subscription_sptr js_sub);
 
     // Wait for every accepted publication coroutine to complete.
     asio::awaitable<bool> wait_for_publications(std::chrono::milliseconds timeout);
@@ -107,13 +109,16 @@ private:
 
     void worker_loop(unsigned int worker_id);
 
-    // The element actually carried through m_queue. js_msg is nullopt for
-    // plain queue-group-mode payloads (no ack concept, matches today's
-    // behavior); populated for JetStream-consumer-mode payloads, whose
-    // delivery must be resolved (ack/nak/term) once processing finishes.
+    // The element actually carried through m_queue. js_msg/js_sub are both
+    // nullopt/null for plain queue-group-mode payloads (no ack concept,
+    // matches today's behavior); both populated for JetStream-consumer-mode
+    // payloads, whose delivery must be resolved (ack/nak/term) - against
+    // this specific js_sub, not any other live connection's - once
+    // processing finishes.
     struct queued_message {
         std::vector<char> payload;
         std::optional<nats_asio::js_message> js_msg;
+        nats_asio::ijs_subscription_sptr js_sub;
     };
     bool enqueue_impl(queued_message qm);
 
@@ -121,12 +126,12 @@ private:
     // detached - same pattern as the existing publish coroutine below,
     // since ack()/term() are themselves coroutines that need m_conn's I/O
     // thread, but worker_loop runs on a plain std::thread. Captures m_log
-    // and a copy of m_input_js_sub by value (not `this`), so the posted
-    // coroutine stays valid even if this worker_pool is destroyed while it's
-    // still suspended - the exact same lifetime concern publish_counters
-    // already solves for the publish path.
-    void spawn_ack(nats_asio::js_message msg);
-    void spawn_term(nats_asio::js_message msg);
+    // and the given js_sub by value (not `this`), so the posted coroutine
+    // stays valid even if this worker_pool is destroyed while it's still
+    // suspended - the exact same lifetime concern publish_counters already
+    // solves for the publish path.
+    void spawn_ack(nats_asio::ijs_subscription_sptr js_sub, nats_asio::js_message msg);
+    void spawn_term(nats_asio::ijs_subscription_sptr js_sub, nats_asio::js_message msg);
 
     asio::io_context& m_ioc;
     binary_format m_format;
@@ -134,7 +139,6 @@ private:
     subscription_manager& m_sub_mgr;
     nats_asio::iconnection_sptr m_conn;
     std::shared_ptr<spdlog::logger> m_log;
-    nats_asio::ijs_subscription_sptr m_input_js_sub;
 
     unsigned int m_thread_count;
     std::atomic<bool> m_running{false};

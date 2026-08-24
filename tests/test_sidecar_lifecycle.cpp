@@ -108,45 +108,72 @@ struct sidecar_engine_test_access {
         engine.m_worker_pool->start();
     }
 
+    // Tests exercise the single (legacy-synthesized) connection, so this
+    // resolves it once via effective_connections() rather than requiring
+    // every call site to build an input_connection by hand.
+    static sidecar::input_connection only_connection(const sidecar::sidecar_engine& engine) {
+        return engine.m_cfg.effective_connections().front();
+    }
+
+    static asio::awaitable<bool> subscribe_to_inputs(sidecar::sidecar_engine& engine,
+                                                       sidecar::input_connection conn) {
+        return engine.subscribe_to_inputs(std::move(conn));
+    }
+
     static asio::awaitable<bool> subscribe_to_inputs(sidecar::sidecar_engine& engine) {
-        return engine.subscribe_to_inputs();
+        return subscribe_to_inputs(engine, only_connection(engine));
     }
 
     // Same as inject_dependencies above, but for JetStream-consumer-mode
-    // tests: wires m_input_js_sub in and constructs worker_pool with it, so
+    // tests: wires m_input_js_subs in and constructs worker_pool, so
     // worker_pool's own ack/term resolution logic is reachable through the
     // engine exactly as it would be in JetStream-consumer mode.
     static void inject_dependencies_js(sidecar::sidecar_engine& engine,
                                         nats_asio::iconnection_sptr conn,
                                         nats_asio::ijs_subscription_sptr js_sub) {
         engine.m_conn = conn;
-        engine.m_input_js_sub = js_sub;
+        engine.m_input_js_subs.push_back(js_sub);
         engine.m_lease_mgr = std::make_unique<sidecar::lease_manager>(
             engine.m_ioc, conn, engine.m_sub_mgr, engine.m_cfg.lease_bucket,
             engine.m_cfg.lease_ttl_seconds, engine.m_cfg.lease_check_interval_seconds,
             engine.m_log);
         engine.m_worker_pool = std::make_unique<sidecar::worker_pool>(
             engine.m_ioc, engine.m_cfg, engine.m_schema, engine.m_sub_mgr, conn,
-            engine.m_log, js_sub);
+            engine.m_log);
         engine.m_worker_pool->start();
     }
 
+    static asio::awaitable<bool> ensure_input_stream(sidecar::sidecar_engine& engine,
+                                                       sidecar::input_connection conn) {
+        return engine.ensure_input_stream(std::move(conn));
+    }
+
     static asio::awaitable<bool> ensure_input_stream(sidecar::sidecar_engine& engine) {
-        return engine.ensure_input_stream();
+        return ensure_input_stream(engine, only_connection(engine));
+    }
+
+    // Returns the new js_sub directly (rather than pushing into
+    // m_input_js_subs itself) so a multi-connection test can hold onto each
+    // connection's own handle distinctly.
+    static asio::awaitable<nats_asio::ijs_subscription_sptr> subscribe_to_inputs_jetstream(
+        sidecar::sidecar_engine& engine, sidecar::input_connection conn) {
+        return engine.subscribe_to_inputs_jetstream(std::move(conn));
     }
 
     static asio::awaitable<bool> subscribe_to_inputs_jetstream(sidecar::sidecar_engine& engine) {
-        return engine.subscribe_to_inputs_jetstream();
+        auto js_sub = co_await subscribe_to_inputs_jetstream(engine, only_connection(engine));
+        if (js_sub) engine.m_input_js_subs.push_back(js_sub);
+        co_return js_sub != nullptr;
     }
 
     static asio::awaitable<void> on_js_data_message(sidecar::sidecar_engine& engine,
-                                                      nats_asio::ijs_subscription& sub,
+                                                      nats_asio::ijs_subscription_sptr js_sub,
                                                       const nats_asio::js_message& msg) {
-        return engine.on_js_data_message(sub, msg);
+        return engine.on_js_data_message(js_sub, msg);
     }
 
     static nats_asio::ijs_subscription_sptr input_js_sub(const sidecar::sidecar_engine& engine) {
-        return engine.m_input_js_sub;
+        return engine.m_input_js_subs.empty() ? nullptr : engine.m_input_js_subs.front();
     }
 
     static sidecar::subscription_manager& sub_mgr(sidecar::sidecar_engine& engine) {
@@ -852,7 +879,7 @@ TEST(sidecar_engine, on_js_data_message_enqueues_into_worker_pool) {
     msg.stream_sequence = 42;
 
     ASSERT_TRUE(run_void_to_completion(
-        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, *js_sub, msg)));
+        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, js_sub, msg)));
 
     EXPECT_TRUE(sidecar_test::drive_until(
         ioc,
@@ -882,7 +909,7 @@ TEST(sidecar_engine, on_js_data_message_before_worker_pool_ready_leaves_message_
     // be left unacked (not lost, not force-acked) so ack_wait redelivers it
     // once the pool is actually ready.
     ASSERT_TRUE(run_void_to_completion(
-        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, *js_sub, msg)));
+        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, js_sub, msg)));
 
     EXPECT_TRUE(js_sub->acked_stream_seqs.empty());
     EXPECT_TRUE(js_sub->termed_stream_seqs.empty());
@@ -899,9 +926,93 @@ TEST(sidecar_engine, on_js_data_message_acks_empty_payload_immediately) {
     msg.stream_sequence = 5;  // msg.msg.payload left empty
 
     ASSERT_TRUE(run_void_to_completion(
-        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, *js_sub, msg)));
+        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, js_sub, msg)));
 
     EXPECT_EQ(js_sub->acked_stream_seqs, (std::vector<uint64_t>{5}));
     EXPECT_EQ(sidecar::sidecar_engine_test_access::worker_stats(engine).processed, 0u)
         << "an empty payload must never reach worker_pool at all";
+}
+
+// --- Multiple connections: one js-mode, one core-mode, live together ---
+
+TEST(sidecar_engine, mixed_js_and_core_connections_share_matching_tree_and_only_js_acks) {
+    asio::io_context ioc(1);
+
+    sidecar::input_connection orders;
+    orders.name = "orders";
+    orders.mode = "js";
+    orders.subjects = {"orders.in"};
+    orders.stream = "orders-input";
+    orders.consumer_durable_name = "orders-durable";
+    orders.consumer_deliver_subject = "orders.deliver";
+
+    sidecar::input_connection telemetry;
+    telemetry.name = "telemetry";
+    telemetry.mode = "core";
+    telemetry.subjects = {"telemetry.in"};
+
+    auto cfg = sample_config();
+    cfg.input_subjects.clear();
+    cfg.connections = {orders, telemetry};
+
+    sidecar::sidecar_engine engine(ioc, cfg, make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.orders-input") {
+            co_return std::pair{json_message({{"error", {{"code", 404}}}}), nats_asio::status{}};
+        }
+        if (subject == "$JS.API.STREAM.CREATE.orders-input") {
+            co_return std::pair{json_message(nlohmann::json::object()), nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+    conn->on_subscribe = [](std::string_view, nats_asio::on_message_cb,
+                             nats_asio::subscribe_options)
+        -> asio::awaitable<std::pair<nats_asio::isubscription_sptr, nats_asio::status>> {
+        co_return std::pair<nats_asio::isubscription_sptr, nats_asio::status>{
+            std::make_shared<sidecar_test::fake_subscription>(), nats_asio::status{}};
+    };
+
+    ASSERT_TRUE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_input_stream(engine, orders)));
+    auto js_sub_iface = run_to_completion<nats_asio::ijs_subscription_sptr>(
+        ioc, sidecar::sidecar_engine_test_access::subscribe_to_inputs_jetstream(engine, orders));
+    ASSERT_NE(js_sub_iface, nullptr);
+    auto js_sub = std::static_pointer_cast<sidecar_test::fake_js_subscription>(js_sub_iface);
+    ASSERT_TRUE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::subscribe_to_inputs(engine, telemetry)));
+
+    // One expression, active regardless of which connection a message
+    // arrives on - both connections share this engine's one
+    // subscription_manager/matching tree and one output_prefix.
+    sidecar::sidecar_engine_test_access::sub_mgr(engine).subscribe("temperature > 10.0", "client-1");
+
+    nats_asio::js_message js_msg;
+    js_msg.msg.payload = msgpack_temperature_payload(21.5);
+    js_msg.stream_sequence = 99;
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_js_data_message(engine, js_sub, js_msg)));
+
+    auto core_payload = msgpack_temperature_payload(30.0);
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_data_message(
+                 engine, std::span<const char>(core_payload.data(), core_payload.size()))));
+
+    EXPECT_TRUE(sidecar_test::drive_until(
+        ioc,
+        [&] { return sidecar::sidecar_engine_test_access::worker_stats(engine).processed >= 2; },
+        std::chrono::seconds(2)));
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::worker_stats(engine).processed, 2u);
+    EXPECT_EQ(sidecar::sidecar_engine_test_access::worker_stats(engine).matched, 2u)
+        << "both connections' messages matched the same active subscription";
+
+    // Only the JetStream-mode message has anything to ack; the core-mode
+    // message has no ack concept at all (matches today's at-most-once
+    // behavior) and js_sub must never see it.
+    EXPECT_TRUE(sidecar_test::drive_until(
+        ioc, [&] { return !js_sub->acked_stream_seqs.empty(); }, std::chrono::seconds(2)));
+    EXPECT_EQ(js_sub->acked_stream_seqs, (std::vector<uint64_t>{99}));
 }

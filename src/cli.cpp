@@ -2,6 +2,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <thread>
+#include <unordered_map>
 
 namespace sidecar {
 
@@ -64,6 +65,26 @@ cxxopts::Options build_cli_options() {
 }
 
 std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::ParseResult& result) {
+    // Single-value input overrides only make sense against the legacy
+    // single-connection shape - reject them outright when the config file
+    // already defines a 'connections' list, since there's no way to know
+    // which named connection a bare flag like --input-stream should target.
+    static constexpr const char* legacy_input_flags[] = {
+        "input-subject", "queue-group", "input-stream", "input-stream-storage",
+        "consumer-durable-name", "consumer-deliver-subject", "consumer-deliver-group",
+        "consumer-max-ack-pending", "consumer-ack-wait"
+    };
+    if (!cfg.connections.empty()) {
+        for (const auto* flag : legacy_input_flags) {
+            if (result.count(flag)) {
+                return fmt::format(
+                    "--{} cannot be used together with a config file 'connections' list "
+                    "(ambiguous which connection it targets) - edit the config file instead",
+                    flag);
+            }
+        }
+    }
+
     if (result.count("address"))              cfg.nats_address = result["address"].as<std::string>();
     if (result.count("port"))                 cfg.nats_port = result["port"].as<uint16_t>();
     if (result.count("input-subject"))        cfg.input_subjects = result["input-subject"].as<std::vector<std::string>>();
@@ -130,21 +151,33 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
 }
 
 std::optional<std::string> finalize_and_validate_config(config& cfg) {
+    auto conns = cfg.effective_connections();
+
+    std::size_t total_subjects = 0;
+    for (const auto& c : conns) total_subjects += c.subjects.size();
+
     // Default output_prefix to the single input subject if still empty and
-    // unambiguous; with more than one input subject there's no sane default.
-    if (cfg.output_prefix.empty() && cfg.input_subjects.size() == 1) {
-        cfg.output_prefix = cfg.input_subjects.front();
+    // unambiguous; with more than one input subject total there's no sane
+    // default.
+    if (cfg.output_prefix.empty() && total_subjects == 1) {
+        for (const auto& c : conns) {
+            if (!c.subjects.empty()) { cfg.output_prefix = c.subjects.front(); break; }
+        }
     }
 
-    if (cfg.input_subjects.empty()) {
+    if (conns.empty() || total_subjects == 0) {
         return "at least one input subject is required (via config file's "
-               "input_subjects or --input-subject)";
+               "'connections'/'input_subjects', or --input-subject)";
     }
     if (cfg.output_prefix.empty()) {
+        std::vector<std::string> all_subjects;
+        for (const auto& c : conns) {
+            all_subjects.insert(all_subjects.end(), c.subjects.begin(), c.subjects.end());
+        }
         return fmt::format(
             "output_prefix is required when more than one input subject is configured "
             "(got {} input subjects: {}) - there is no unambiguous default to pick among them",
-            cfg.input_subjects.size(), fmt::join(cfg.input_subjects, ", "));
+            total_subjects, fmt::join(all_subjects, ", "));
     }
     if (cfg.attributes.empty()) {
         return "At least one attribute is required (via config file or --attr)";
@@ -156,29 +189,73 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
         return "Lease TTL and all queue/publication limits must be greater than zero";
     }
 
-    // JetStream durable-consumer mode: consumer_durable_name and
-    // consumer_deliver_subject are both required, not defaulted. In
-    // particular, an unset deliver_subject would make nats_asio generate a
-    // random per-connection inbox - each instance would silently rebind the
-    // shared durable consumer to a different target, breaking multi-instance
-    // load distribution without any error. Fail loudly here instead.
-    if (cfg.jetstream_consumer_enabled()) {
-        if (cfg.consumer_durable_name.empty()) {
-            return "consumer_durable_name is required when input_stream is set";
+    // Per-connection JetStream durable-consumer validation:
+    // consumer_durable_name and consumer_deliver_subject are both required,
+    // not defaulted. In particular, an unset deliver_subject would make
+    // nats_asio generate a random per-connection inbox - each instance would
+    // silently rebind the shared durable consumer to a different target,
+    // breaking multi-instance load distribution without any error. Fail
+    // loudly here instead.
+    for (const auto& c : conns) {
+        if (!c.jetstream()) continue;
+        if (c.consumer_durable_name.empty()) {
+            return fmt::format("connection '{}': consumer_durable_name is required in js mode", c.name);
         }
-        if (cfg.consumer_deliver_subject.empty()) {
-            return "consumer_deliver_subject is required when input_stream is set "
-                   "(it must be a fixed value shared by every instance - never left "
-                   "unset, which would silently break multi-instance load distribution)";
+        if (c.consumer_deliver_subject.empty()) {
+            return fmt::format(
+                "connection '{}': consumer_deliver_subject is required in js mode "
+                "(it must be a fixed value shared by every instance - never left "
+                "unset, which would silently break multi-instance load distribution)",
+                c.name);
         }
-        if (cfg.consumer_max_ack_pending == 0) {
-            return "consumer_max_ack_pending must be greater than zero";
+        if (c.consumer_max_ack_pending == 0) {
+            return fmt::format("connection '{}': consumer_max_ack_pending must be greater than zero", c.name);
         }
-        if (cfg.consumer_ack_wait_seconds == 0) {
-            return "consumer_ack_wait_seconds must be greater than zero";
+        if (c.consumer_ack_wait_seconds == 0) {
+            return fmt::format("connection '{}': consumer_ack_wait_seconds must be greater than zero", c.name);
         }
-        if (cfg.input_stream_storage != "file" && cfg.input_stream_storage != "memory") {
-            return "input_stream_storage must be 'file' or 'memory'";
+        if (c.stream_storage != "file" && c.stream_storage != "memory") {
+            return fmt::format("connection '{}': stream_storage must be 'file' or 'memory'", c.name);
+        }
+    }
+
+    // Cross-connection uniqueness: a collision in any of these would either
+    // silently merge two unrelated durable consumers onto the same stream,
+    // or double-enqueue the same message into matching.
+    std::unordered_map<std::string, std::string> seen_streams, seen_durables, seen_delivers;
+    std::unordered_map<std::string, std::string> seen_subjects;
+    for (const auto& c : conns) {
+        if (c.jetstream()) {
+            if (!c.stream.empty()) {
+                auto [it, inserted] = seen_streams.emplace(c.stream, c.name);
+                if (!inserted) {
+                    return fmt::format("connections '{}' and '{}' both use stream '{}'",
+                                        it->second, c.name, c.stream);
+                }
+            }
+            {
+                auto [it, inserted] = seen_durables.emplace(c.consumer_durable_name, c.name);
+                if (!inserted) {
+                    return fmt::format(
+                        "connections '{}' and '{}' both use consumer_durable_name '{}'",
+                        it->second, c.name, c.consumer_durable_name);
+                }
+            }
+            {
+                auto [it, inserted] = seen_delivers.emplace(c.consumer_deliver_subject, c.name);
+                if (!inserted) {
+                    return fmt::format(
+                        "connections '{}' and '{}' both use consumer_deliver_subject '{}'",
+                        it->second, c.name, c.consumer_deliver_subject);
+                }
+            }
+        }
+        for (const auto& subject : c.subjects) {
+            auto [it, inserted] = seen_subjects.emplace(subject, c.name);
+            if (!inserted) {
+                return fmt::format("connections '{}' and '{}' both subscribe to subject '{}'",
+                                    it->second, c.name, subject);
+            }
         }
     }
 

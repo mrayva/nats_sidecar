@@ -281,3 +281,160 @@ TEST(cli, effective_worker_count_is_at_least_one_when_auto) {
     cfg.worker_threads = 0;
     EXPECT_GE(sidecar::effective_worker_count(cfg), 1u);
 }
+
+// --- finalize_and_validate_config: multiple connections ---
+
+TEST(cli, finalize_and_validate_config_validates_every_js_connection) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "js";
+    a.subjects = {"a.in"};
+    // consumer_durable_name/consumer_deliver_subject intentionally left unset
+    cfg.connections = {a};
+    cfg.output_prefix = "matched";
+    cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("consumer_durable_name"), std::string::npos);
+    EXPECT_NE(err->find("'a'"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_duplicate_stream_across_connections_errors) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.subjects = {"a.in"};
+    a.stream = "SHARED";
+    a.consumer_durable_name = "a-durable";
+    a.consumer_deliver_subject = "a.deliver";
+    sidecar::input_connection b = a;
+    b.name = "b";
+    b.subjects = {"b.in"};
+    b.consumer_durable_name = "b-durable";
+    b.consumer_deliver_subject = "b.deliver";
+    cfg.connections = {a, b};
+    cfg.output_prefix = "matched";
+    cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("stream 'SHARED'"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_duplicate_durable_name_across_connections_errors) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.subjects = {"a.in"};
+    a.stream = "STREAM_A";
+    a.consumer_durable_name = "shared-durable";
+    a.consumer_deliver_subject = "a.deliver";
+    sidecar::input_connection b = a;
+    b.name = "b";
+    b.subjects = {"b.in"};
+    b.stream = "STREAM_B";
+    b.consumer_deliver_subject = "b.deliver";
+    cfg.connections = {a, b};
+    cfg.output_prefix = "matched";
+    cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("consumer_durable_name 'shared-durable'"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_duplicate_deliver_subject_across_connections_errors) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.subjects = {"a.in"};
+    a.stream = "STREAM_A";
+    a.consumer_durable_name = "a-durable";
+    a.consumer_deliver_subject = "shared.deliver";
+    sidecar::input_connection b = a;
+    b.name = "b";
+    b.subjects = {"b.in"};
+    b.stream = "STREAM_B";
+    b.consumer_durable_name = "b-durable";
+    cfg.connections = {a, b};
+    cfg.output_prefix = "matched";
+    cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("consumer_deliver_subject 'shared.deliver'"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_overlapping_subjects_across_connections_errors) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"shared.subject"};
+    sidecar::input_connection b;
+    b.name = "b";
+    b.mode = "core";
+    b.subjects = {"shared.subject"};
+    cfg.connections = {a, b};
+    cfg.output_prefix = "matched";
+    cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("shared.subject"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_accepts_valid_mixed_mode_connections) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "orders";
+    a.mode = "js";
+    a.subjects = {"orders.in"};
+    a.stream = "ORDERS";
+    a.consumer_durable_name = "orders-durable";
+    a.consumer_deliver_subject = "orders.deliver";
+    sidecar::input_connection b;
+    b.name = "telemetry";
+    b.mode = "core";
+    b.subjects = {"telemetry.in"};
+    cfg.connections = {a, b};
+    cfg.output_prefix = "matched";
+    cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
+
+    EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
+}
+
+// --- apply_cli_overrides: legacy input flags rejected alongside 'connections' ---
+
+TEST(cli, apply_cli_overrides_rejects_input_subject_flag_when_connections_configured) {
+    auto options = sidecar::build_cli_options();
+    auto result = parse_args(options, {"--input-subject", "sensor.data"});
+
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.subjects = {"a.in"};
+    cfg.connections = {a};
+
+    auto err = sidecar::apply_cli_overrides(cfg, result);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("input-subject"), std::string::npos);
+    EXPECT_NE(err->find("connections"), std::string::npos);
+}
+
+TEST(cli, apply_cli_overrides_allows_unrelated_flags_when_connections_configured) {
+    auto options = sidecar::build_cli_options();
+    auto result = parse_args(options, {"--log-level", "debug"});
+
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.subjects = {"a.in"};
+    cfg.connections = {a};
+
+    auto err = sidecar::apply_cli_overrides(cfg, result);
+    ASSERT_FALSE(err.has_value()) << *err;
+    EXPECT_EQ(cfg.log_level, "debug");
+}

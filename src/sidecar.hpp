@@ -38,12 +38,14 @@ public:
 private:
     friend struct sidecar_engine_test_access;
 
-    // Subscribes to every configured input subject, wiring each to
-    // on_data_message(). Returns false (having already logged and stopped
-    // the ioc) on the first subscription failure. Plain queue-group mode
-    // only - mutually exclusive with subscribe_to_inputs_jetstream() below,
-    // selected by cfg.jetstream_consumer_enabled().
-    asio::awaitable<bool> subscribe_to_inputs();
+    // Subscribes to every subject of one core-mode connection, wiring each
+    // to on_data_message(). Returns false (having already logged and
+    // stopped the ioc) on the first subscription failure. Takes conn by
+    // value (not const&): as a coroutine parameter it lives in the
+    // coroutine frame across suspension points, so it must not depend on
+    // the caller's own object outliving the whole call - see conns in
+    // start()'s loop and the equivalent test-access shims.
+    asio::awaitable<bool> subscribe_to_inputs(input_connection conn);
 
     // Callback: incoming data message on the input subject
     asio::awaitable<void> on_data_message(
@@ -52,29 +54,34 @@ private:
         std::span<const char> payload);
 
     // Durable JetStream consumer input path (loss-proof alternative to
-    // subscribe_to_inputs()'s plain queue-group subscribe - see config.hpp's
-    // jetstream_consumer_enabled()). Provisions/validates the JetStream
-    // stream backing cfg.input_stream, following
+    // subscribe_to_inputs()'s plain queue-group subscribe - selected per
+    // connection by input_connection::jetstream()). Provisions/validates
+    // the JetStream stream backing conn.stream, following
     // lease_manager::ensure_bucket()'s exact idiom (nats_asio has no
     // dedicated stream-creation API): hand-rolled $JS.API.STREAM.INFO/CREATE
     // request/reply, fail startup outright on a real config mismatch, no
     // auto-repair.
-    asio::awaitable<bool> ensure_input_stream();
-    bool validate_existing_input_stream(const nlohmann::json& info) const;
-    asio::awaitable<bool> create_input_stream(std::chrono::milliseconds timeout);
+    // conn by value here too, same coroutine-frame-lifetime reasoning as
+    // subscribe_to_inputs() above.
+    asio::awaitable<bool> ensure_input_stream(input_connection conn);
+    bool validate_existing_input_stream(const input_connection& conn, const nlohmann::json& info) const;
+    asio::awaitable<bool> create_input_stream(const input_connection& conn, std::chrono::milliseconds timeout);
 
     // Subscribes via a durable JetStream push consumer instead of a plain
-    // queue-group subscribe. Sets m_input_js_sub on success. Returns false
-    // (having already logged and stopped the ioc) on failure.
-    asio::awaitable<bool> subscribe_to_inputs_jetstream();
+    // queue-group subscribe. Returns the new subscription on success
+    // (nullptr on failure, having already logged and stopped the ioc).
+    // conn by value, same reasoning as subscribe_to_inputs() above.
+    asio::awaitable<nats_asio::ijs_subscription_sptr> subscribe_to_inputs_jetstream(input_connection conn);
 
     // Callback: incoming JetStream data message. Owned (not zero-copy),
     // because ack/nak/term happen well after this callback returns - inside
     // worker_pool's own resolution logic, once match+publish has actually
     // completed - and js_message_view's zero-copy guarantee doesn't survive
-    // that long.
+    // that long. js_sub is this specific connection's own subscription
+    // handle (captured per-connection at subscribe time), passed through to
+    // worker_pool so ack/nak/term resolve against the right consumer.
     asio::awaitable<void> on_js_data_message(
-        nats_asio::ijs_subscription& sub, const nats_asio::js_message& msg);
+        nats_asio::ijs_subscription_sptr js_sub, const nats_asio::js_message& msg);
 
     // Callback: subscription request from a client (request/reply pattern)
     asio::awaitable<void> on_subscribe_request(
@@ -97,7 +104,9 @@ private:
 
     nats_asio::iconnection_sptr m_conn;
     std::vector<nats_asio::isubscription_sptr> m_data_subs;
-    nats_asio::ijs_subscription_sptr m_input_js_sub;  // set only in JetStream-consumer mode
+    // One entry per js-mode connection (in cfg.effective_connections() order
+    // restricted to js-mode entries) - empty when no connection uses js mode.
+    std::vector<nats_asio::ijs_subscription_sptr> m_input_js_subs;
     nats_asio::isubscription_sptr m_subscribe_sub;
     nats_asio::isubscription_sptr m_unsubscribe_sub;
     subscription_manager m_sub_mgr;

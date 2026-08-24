@@ -241,3 +241,176 @@ attributes:
 TEST(config_loading, nonexistent_file_throws) {
     EXPECT_THROW(sidecar::load_config("/nonexistent/path/does-not-exist.yaml"), std::exception);
 }
+
+// --- effective_connections(): back-compat synthesis from legacy flat fields ---
+
+TEST(config_loading, effective_connections_synthesizes_core_mode_from_legacy_fields) {
+    sidecar::config cfg;
+    cfg.input_subjects = {"sensor.data"};
+    cfg.input_queue_group = "workers";
+
+    auto conns = cfg.effective_connections();
+    ASSERT_EQ(conns.size(), 1u);
+    EXPECT_EQ(conns[0].name, "default");
+    EXPECT_EQ(conns[0].mode, "core");
+    EXPECT_FALSE(conns[0].jetstream());
+    EXPECT_EQ(conns[0].subjects, (std::vector<std::string>{"sensor.data"}));
+    EXPECT_EQ(conns[0].queue_group, "workers");
+}
+
+TEST(config_loading, effective_connections_synthesizes_js_mode_when_input_stream_set) {
+    sidecar::config cfg;
+    cfg.input_subjects = {"sensor.data"};
+    cfg.input_stream = "sensor-input";
+    cfg.consumer_durable_name = "sensor-durable";
+    cfg.consumer_deliver_subject = "sensor.deliver";
+    cfg.consumer_max_ack_pending = 250;
+    cfg.consumer_ack_wait_seconds = 20;
+    cfg.input_stream_storage = "memory";
+
+    auto conns = cfg.effective_connections();
+    ASSERT_EQ(conns.size(), 1u);
+    EXPECT_EQ(conns[0].mode, "js");
+    EXPECT_TRUE(conns[0].jetstream());
+    EXPECT_EQ(conns[0].stream, "sensor-input");
+    EXPECT_EQ(conns[0].consumer_durable_name, "sensor-durable");
+    EXPECT_EQ(conns[0].consumer_deliver_subject, "sensor.deliver");
+    EXPECT_EQ(conns[0].consumer_max_ack_pending, 250u);
+    EXPECT_EQ(conns[0].consumer_ack_wait_seconds, 20u);
+    EXPECT_EQ(conns[0].stream_storage, "memory");
+}
+
+TEST(config_loading, effective_connections_returns_explicit_list_verbatim) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.subjects = {"x"};
+    cfg.connections = {a};
+
+    auto conns = cfg.effective_connections();
+    ASSERT_EQ(conns.size(), 1u);
+    EXPECT_EQ(conns[0].name, "a");
+}
+
+// --- 'connections:' YAML parsing ---
+
+TEST(config_loading, parses_connections_with_mixed_js_and_core_modes) {
+    temp_yaml_file file(R"(
+connections:
+  - name: orders
+    subjects: [orders.in]
+    stream: ORDERS
+    consumer_durable_name: orders-durable
+    consumer_deliver_subject: orders.deliver
+  - name: telemetry
+    mode: core
+    subjects: [telemetry.in]
+    queue_group: telemetry-workers
+output_prefix: matched
+attributes:
+  - name: temperature
+    type: float
+)");
+    auto cfg = sidecar::load_config(file.path());
+    ASSERT_EQ(cfg.connections.size(), 2u);
+
+    EXPECT_EQ(cfg.connections[0].name, "orders");
+    EXPECT_EQ(cfg.connections[0].mode, "js");  // default
+    EXPECT_TRUE(cfg.connections[0].jetstream());
+    EXPECT_EQ(cfg.connections[0].subjects, (std::vector<std::string>{"orders.in"}));
+    EXPECT_EQ(cfg.connections[0].stream, "ORDERS");
+    EXPECT_EQ(cfg.connections[0].consumer_durable_name, "orders-durable");
+    EXPECT_EQ(cfg.connections[0].consumer_deliver_subject, "orders.deliver");
+
+    EXPECT_EQ(cfg.connections[1].name, "telemetry");
+    EXPECT_EQ(cfg.connections[1].mode, "core");
+    EXPECT_FALSE(cfg.connections[1].jetstream());
+    EXPECT_EQ(cfg.connections[1].subjects, (std::vector<std::string>{"telemetry.in"}));
+    EXPECT_EQ(cfg.connections[1].queue_group, "telemetry-workers");
+}
+
+TEST(config_loading, connections_combined_with_legacy_input_subjects_throws) {
+    temp_yaml_file file(R"(
+connections:
+  - name: a
+    mode: core
+    subjects: [a.in]
+input_subjects: [legacy.in]
+output_prefix: matched
+attributes:
+  - name: temperature
+    type: float
+)");
+    EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
+}
+
+TEST(config_loading, connection_missing_name_throws) {
+    temp_yaml_file file(R"(
+connections:
+  - mode: core
+    subjects: [a.in]
+output_prefix: matched
+attributes:
+  - name: temperature
+    type: float
+)");
+    EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
+}
+
+TEST(config_loading, connection_invalid_mode_throws) {
+    temp_yaml_file file(R"(
+connections:
+  - name: a
+    mode: not-a-real-mode
+    subjects: [a.in]
+output_prefix: matched
+attributes:
+  - name: temperature
+    type: float
+)");
+    EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
+}
+
+TEST(config_loading, connection_missing_subjects_throws) {
+    temp_yaml_file file(R"(
+connections:
+  - name: a
+    mode: core
+output_prefix: matched
+attributes:
+  - name: temperature
+    type: float
+)");
+    EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
+}
+
+TEST(config_loading, duplicate_connection_names_throw) {
+    temp_yaml_file file(R"(
+connections:
+  - name: a
+    mode: core
+    subjects: [a.in]
+  - name: a
+    mode: core
+    subjects: [b.in]
+output_prefix: matched
+attributes:
+  - name: temperature
+    type: float
+)");
+    EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
+}
+
+TEST(config_loading, output_prefix_defaults_across_connections_when_exactly_one_subject_total) {
+    temp_yaml_file file(R"(
+connections:
+  - name: a
+    mode: core
+    subjects: [only.subject]
+attributes:
+  - name: temperature
+    type: float
+)");
+    auto cfg = sidecar::load_config(file.path());
+    EXPECT_EQ(cfg.output_prefix, "only.subject");
+}
