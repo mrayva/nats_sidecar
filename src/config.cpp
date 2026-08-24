@@ -67,6 +67,7 @@ config load_config(const std::string& path) {
     if (auto n = root["consumer_deliver_group"])   cfg.consumer_deliver_group = n.as<std::string>();
     if (auto n = root["consumer_max_ack_pending"]) cfg.consumer_max_ack_pending = n.as<uint64_t>();
     if (auto n = root["consumer_ack_wait_seconds"]) cfg.consumer_ack_wait_seconds = n.as<uint32_t>();
+    if (auto n = root["input_stream_storage"])     cfg.input_stream_storage = n.as<std::string>();
 
     if (auto n = root["engine"]) {
         auto eng = parse_engine_type(n.as<std::string>());

@@ -275,7 +275,7 @@ asio::awaitable<bool> sidecar_engine::create_input_stream(std::chrono::milliseco
         {"name", m_cfg.input_stream},
         {"subjects", m_cfg.input_subjects},
         {"retention", "workqueue"},
-        {"storage", "file"},
+        {"storage", m_cfg.input_stream_storage},
         {"max_msgs", -1},
         {"max_bytes", -1},
         {"max_age", 0},

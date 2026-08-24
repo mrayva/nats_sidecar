@@ -71,6 +71,11 @@ struct config {
     std::string consumer_deliver_group;   // JetStream analog of input_queue_group
     uint64_t consumer_max_ack_pending = 1000;
     uint32_t consumer_ack_wait_seconds = 30;
+    // "file" (default, real durability) or "memory" (throughput-isolation
+    // tool only - loses everything on nats-server restart/crash, exists to
+    // measure how much of JetStream's cost is disk I/O vs ack/flow-control
+    // protocol overhead, not for production use).
+    std::string input_stream_storage = "file";
 
     // Output - matched messages published to <output_prefix>.<BE-ID>
     // Defaults to the single input subject if there is exactly one; must

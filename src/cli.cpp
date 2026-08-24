@@ -36,6 +36,10 @@ cxxopts::Options build_cli_options() {
                                       "(flow control)", cxxopts::value<uint64_t>())
         ("consumer-ack-wait", "Ack wait timeout in seconds before redelivery",
                                cxxopts::value<uint32_t>())
+        ("input-stream-storage", "JetStream input stream storage backend: file (default, "
+                                  "real durability) or memory (throughput-isolation only, "
+                                  "loses everything on nats-server restart)",
+                                  cxxopts::value<std::string>())
         ("subscribe-subject", "Subscription request subject", cxxopts::value<std::string>())
         ("unsubscribe-subject", "Unsubscription request subject", cxxopts::value<std::string>())
         ("lease-bucket", "NATS KV lease bucket name", cxxopts::value<std::string>())
@@ -66,6 +70,7 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("output-prefix"))        cfg.output_prefix = result["output-prefix"].as<std::string>();
     if (result.count("queue-group"))          cfg.input_queue_group = result["queue-group"].as<std::string>();
     if (result.count("input-stream"))              cfg.input_stream = result["input-stream"].as<std::string>();
+    if (result.count("input-stream-storage"))      cfg.input_stream_storage = result["input-stream-storage"].as<std::string>();
     if (result.count("consumer-durable-name"))     cfg.consumer_durable_name = result["consumer-durable-name"].as<std::string>();
     if (result.count("consumer-deliver-subject"))  cfg.consumer_deliver_subject = result["consumer-deliver-subject"].as<std::string>();
     if (result.count("consumer-deliver-group"))    cfg.consumer_deliver_group = result["consumer-deliver-group"].as<std::string>();
@@ -171,6 +176,9 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
         }
         if (cfg.consumer_ack_wait_seconds == 0) {
             return "consumer_ack_wait_seconds must be greater than zero";
+        }
+        if (cfg.input_stream_storage != "file" && cfg.input_stream_storage != "memory") {
+            return "input_stream_storage must be 'file' or 'memory'";
         }
     }
 
