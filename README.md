@@ -350,6 +350,120 @@ why, rather than assume:
 guarantees; use the durable-consumer flags when losing data is unacceptable and ~2.6-2.9x lower
 throughput is an acceptable price for a real, verified loss-proof mode.
 
+## Operational note: cycling a whole table through core-mode connections
+
+A real use case motivating multiple input connections (see "Multiple input connections" above):
+replacing ad-hoc application-side `SELECT`s against a Postgres table with a continuous periodic
+flush - a DB-side driver republishes the table's rows (or just the changed subset) to per-category
+NATS subjects, and one or more `nats_sidecar` instances apply real client-side content filters on
+top, so clients get a live, continuously-updated, filtered view instead of hitting the database
+directly. Tested end to end against a real 115M-row NYSE trade table
+(`nyse_eqy_us_all_trade_20260102`, ~19 real exchange codes), publishing every row via `pgnats`'s
+`nats_publish_from_sql.py` to `nyse.exchange.<code>` subjects, consumed by `nats_sidecar` through a
+single `mode: core` connection subscribed to the wildcard `nyse.exchange.>` - one connection, no
+per-exchange connection entries needed at all (see the `connections:` example above).
+
+**A single core-mode instance cannot sustain a real full-table cycle.** `pgnats`'s single
+unbatched, row-by-row publisher runs at ~130-480k rows/s (see below); one `nats_sidecar` instance,
+even with an active content-based subscription doing real matching, sustains only ~24-25k
+messages/s of actual delivered throughput. That mismatch overflows `nats-server`'s per-connection
+buffer (`max_pending`, default 64MB) and it force-disconnects the sidecar with "Slow Consumer
+Detected" - repeatedly, roughly every 10 seconds, for the entire run, never stabilizing. Since core
+NATS pub/sub is at-most-once, every message published during a disconnect window is gone for good.
+Measured against 2 full cycles (230M row-publish attempts): **~82% of everything published was
+lost** (41.4M of 230M received), split further by a second, independent bottleneck -
+`publish_max_inflight`'s output-side backpressure cap silently dropped ~40% of the messages that
+*did* survive and match a filter, before they ever reached a subscriber.
+
+**Raising `nats-server`'s `max_pending` (and `publish_max_inflight`) makes this worse, not
+better.** With `max_pending` at 512MB (8x default), `pgnats` ran completely unthrottled at ~480k
+rows/s (3.7x faster - the smaller buffer had accidentally been throttling the publisher via its
+disconnect/reconnect churn) and blew through the bigger buffer even faster in wall-clock terms.
+Worse, the connection didn't just hiccup this time - `nats_asio` logged `connection timeout: 2
+pings without response` 90 seconds in and **never reconnected**, leaving the sidecar completely
+dead until manually restarted. One Slow Consumer event instead of 175, but a permanent stall
+instead of a self-healing (if lossy) trickle - a strictly worse failure mode.
+
+**The real fix is parallel core-mode instances behind a shared queue group, not bigger buffers.**
+Every instance uses the identical config (same `connections:` block, same `queue_group:` value) -
+`nats-server` load-balances data deliveries one-message-to-one-instance across the group, while
+every instance still independently receives the shared broadcast control-plane requests (see
+"Multiple input connections"), so they all converge on the same matching tree regardless of which
+one processed a given message. Measured with `worker_threads: 1` per instance (to keep total
+thread count sane at higher N) and default `nats-server` limits, three clean, non-overlapping,
+verified-uncontaminated full-table cycles:
+
+| instances | cycle duration | throughput | delivered | Slow Consumer events |
+|---:|---:|---:|---:|---:|
+| 8  | 341s | 337,300 rows/s | 115,020,848 / 115,020,848 (100%) | 0 |
+| 16 | 361s | 318,616 rows/s | 115,020,848 / 115,020,848 (100%) | 0 |
+| 24 | 358s | 321,288 rows/s | 115,020,848 / 115,020,848 (100%) | 0 |
+
+Zero loss, zero disconnects, at every N tested - not a partial mitigation, a complete fix.
+Verified two independent ways each run: summing every instance's own `received` counter, and
+cross-checking against `nats-server`'s own `out_msgs` varz counter (matched to within ~0.0002%,
+the residual being control-plane/lease traffic, not lost data).
+
+**Throughput stops improving past N=8** (337k/319k/321k rows/s is flat within noise). Once there
+are enough parallel consumers to keep any single connection's backlog small enough to never trip
+Slow Consumer, the ceiling moves entirely to the *publisher* - `pgnats`'s single unbatched,
+one-Postgres-connection, row-by-row publish loop.
+
+**Parallelizing the publisher alone reintroduces the exact same problem - consumer and publisher
+parallelism have to scale together, not independently.** Fixing the consumer side at N=8 (the
+setup that gave zero loss above) and increasing `nats_publish_from_sql.py --workers` instead
+(still one-row-per-message - `--batch-size` is a separate, *incompatible* lever, see below):
+
+| `--workers` | publish rate | delivered | lost | Slow Consumer events |
+|---:|---:|---:|---:|---:|
+| 4  | 299,533 rows/s | 99.6% | 0.42% | 2 |
+| 8  | 340,298 rows/s | 87.4% | 12.62% | 65 |
+| 16 | 458,250 rows/s | 60.3% | 39.72% | 178 |
+
+N=8 consumers happened to sit almost exactly at the ceiling of one *unparallelized* publisher
+connection (~320-340k rows/s) - that's why it looked like a clean fix. The moment the publisher
+gets parallelized past that, the same Slow-Consumer-disconnect mechanism reappears and scales
+right back up with publish rate (2 -> 65 -> 178 events), because the *consumer* side was never
+scaled to match.
+
+**Co-scaling both sides closes most, but not all, of the gap - and finds a real, hardware-bounded
+ceiling.** Holding `--workers 8` (a burstier ~340-363k rows/s, from 8 concurrent publish
+connections instead of 1) and raising the consumer count to match:
+
+| `--workers` | instances | publish rate | delivered | lost | Slow Consumer events |
+|---:|---:|---:|---:|---:|---:|
+| 8  | 8  | 340,298 rows/s | 87.4%  | 12.62% | 65 |
+| 8  | 16 | 362,842 rows/s | 99.17% | 0.83%  | 4  |
+| 8  | 24 | 362,842 rows/s | 99.81% | 0.19%  | 1  |
+| 16 | 24 | 391,227 rows/s | 91.37% | 8.63%  | 44 |
+
+Tripling the consumer count (8->24) for the same `--workers 8` load gets loss down from 12.6% to
+0.19% - real, substantial improvement, but not a clean zero even at 3x, because N concurrent
+publish connections create more simultaneous burst pressure than a linear "N consumers per
+publish worker" model would predict. Pushing the publisher further (`--workers 16`, ~391k rows/s)
+overwhelms even N=24 consumers again (8.63% loss) - this host has 24 logical/12 physical CPUs, and
+N=24 core-mode instances (`worker_threads: 1` each) already uses all of it; going higher would
+mean real oversubscription, not just more config.
+
+**Practical, hardware-bounded conclusion for this box**: the highest *reliable* (not just fast)
+full-table-cycling throughput found is ~360k rows/s, using `--workers 8` paired with N=24
+core-mode sidecar instances (~0.2% residual loss). Going faster than that on this hardware would
+need either more CPU cores (to add consumer instances without oversubscribing) or `nats_sidecar`
+gaining columnar-batch matching support so `--batch-size` becomes usable - not more tuning of the
+current knobs.
+
+`nats_publish_from_sql.py --batch-size` (opt-in row batching, collapses N rows into one columnar
+message per subject: `{"col1":[v,v,...],"col2":[v,v,...]}` instead of one row-object message per
+row) was deliberately **not** tested against this sidecar setup - it changes the wire format in a
+way `nats_sidecar`'s current per-message scalar-attribute matching can't interpret as multiple
+candidate rows (it would need columnar-unbatching support added to `worker_pool`/the matching
+path first, not built as part of this investigation).
+
+**Practical takeaway for a periodic full-table/snapshot flush**: run N≈8 core-mode instances
+sharing one `queue_group`, leave `nats-server`'s `max_pending` and the sidecar's
+`publish_max_inflight` at their defaults, and don't reach for bigger buffers as a fix - they mask
+the real throughput mismatch and can turn a lossy-but-self-healing failure into a permanent one.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
