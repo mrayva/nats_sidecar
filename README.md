@@ -452,6 +452,21 @@ need either more CPU cores (to add consumer instances without oversubscribing) o
 gaining columnar-batch matching support so `--batch-size` becomes usable - not more tuning of the
 current knobs.
 
+**Fixing the consumer count at N=12 (this host's physical core count) and sweeping `--workers`
+down instead pinpoints the boundary precisely**, rather than just bracketing it from above:
+
+| `--workers` | instances | publish rate | delivered | lost | Slow Consumer events |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 12 | 349,607 rows/s | 98.96%  | 1.04%  | 5 |
+| 6 | 12 | 345,408 rows/s | 100.00% | 0.00%  | 0 |
+| 4 | 12 | 340,298 rows/s | 100.00% | ~0.00% | 0 |
+
+N=12 is exactly-loss-free through `--workers 6` (~345k rows/s) and tips into real, measurable loss
+at `--workers 8` (~350k rows/s, 5 disconnects) - a sharp, real threshold, not a gradual one, and
+notably right where the *publish rate itself* barely changed (345k -> 350k) but the *connection
+count* did (6 -> 8 concurrent publishers) - reinforcing that burst concurrency, not just average
+throughput, is what actually trips Slow Consumer.
+
 `nats_publish_from_sql.py --batch-size` (opt-in row batching, collapses N rows into one columnar
 message per subject: `{"col1":[v,v,...],"col2":[v,v,...]}` instead of one row-object message per
 row) was deliberately **not** tested against this sidecar setup - it changes the wire format in a
@@ -459,10 +474,14 @@ way `nats_sidecar`'s current per-message scalar-attribute matching can't interpr
 candidate rows (it would need columnar-unbatching support added to `worker_pool`/the matching
 path first, not built as part of this investigation).
 
-**Practical takeaway for a periodic full-table/snapshot flush**: run N≈8 core-mode instances
-sharing one `queue_group`, leave `nats-server`'s `max_pending` and the sidecar's
-`publish_max_inflight` at their defaults, and don't reach for bigger buffers as a fix - they mask
-the real throughput mismatch and can turn a lossy-but-self-healing failure into a permanent one.
+**Practical takeaway for a periodic full-table/snapshot flush**: N=12 core-mode instances sharing
+one `queue_group`, paired with `--workers` in the 4-6 range, is the cleanest reliable
+(zero-measured-loss) setup found on this host - already ~14x this session's original single-
+instance ceiling (~24-25k msgs/s). Push instances toward N=24 with `--workers 8` for more raw
+throughput (~360k rows/s) at a small, real, non-zero loss cost. Either way, leave `nats-server`'s
+`max_pending` and the sidecar's `publish_max_inflight` at their defaults, and don't reach for
+bigger buffers as a fix - they mask the real throughput mismatch and can turn a lossy-but-self-
+healing failure into a permanent one.
 
 ## Schema Generation
 
