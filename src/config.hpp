@@ -126,6 +126,12 @@ struct config {
     uint32_t lease_ttl_seconds = 3600;
     uint32_t lease_check_interval_seconds = 60;
 
+    // Subscription-id registry via NATS KV (subscription_registry) - the
+    // authoritative expression -> id mapping shared by every sidecar
+    // instance, replacing client-supplied subscribe-request ids. Entries are
+    // permanent (no TTL), so there is no check-interval field to go with it.
+    std::string registry_bucket = "sidecar-subscriptions";
+
     // Boolean-expression attribute schema
     std::vector<attribute_def> attributes;
 

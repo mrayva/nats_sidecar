@@ -136,6 +136,7 @@ add_library(sidecar_lib STATIC
     src/matching_engine.cpp
     src/schema_generator.cpp
     src/subscription_manager.cpp
+    src/subscription_registry.cpp
     src/lease_manager.cpp
     src/worker_pool.cpp
     src/sidecar.cpp
@@ -189,6 +190,7 @@ if(SIDECAR_BUILD_TESTS)
         tests/test_schema_generator.cpp
         tests/test_sidecar_lifecycle.cpp
         tests/test_subscription_manager.cpp
+        tests/test_subscription_registry.cpp
         tests/test_worker_pool.cpp
     )
     target_link_libraries(sidecar_test

@@ -31,6 +31,17 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
         co_return;
     }
 
+    // Provision/validate the subscription-id registry bucket - shared by
+    // every instance in a fleet, replacing client-supplied subscribe-request
+    // ids (see subscription_registry.hpp).
+    m_registry = std::make_unique<subscription_registry>(
+        m_conn, m_cfg.registry_bucket, m_log);
+    if (!co_await m_registry->ensure_bucket()) {
+        m_log->error("Subscription registry failed to start; refusing unsafe startup");
+        m_ioc.stop();
+        co_return;
+    }
+
     auto conns = m_cfg.effective_connections();
 
     // Provision every JetStream stream before subscribing to anything -
@@ -433,29 +444,35 @@ asio::awaitable<void> sidecar_engine::on_subscribe_request(
             }
         }
 
-        // A client that wants to broadcast this request to every instance
-        // sharing one control subject (fan-out, not queue group) must supply
-        // its own ID rather than let each instance's uncoordinated
-        // m_next_id++ counter assign one - otherwise two instances handling
-        // the same expression independently could land on different IDs and
-        // thus different output topics, with no way for the client to know
-        // which instance said what. When "id" is present, restore() is used
-        // instead of subscribe(): it adopts the given ID if the expression
-        // matches (idempotent, safe to replay), or fails if that ID is
-        // already bound to a *different* expression on this instance - a
-        // real conflict, surfaced below as an error reply, not silently
-        // absorbed. Omitting "id" keeps the original per-instance-assigned
-        // behavior for callers still using one control subject per instance.
+        // Every instance in a fleet must converge on the same subscription
+        // id/output topic for a given expression, since data messages are
+        // load-balanced across instances behind a shared queue group. If
+        // this instance already knows the expression, the local fast path
+        // (subscribe()) is enough - no coordination needed. Otherwise the
+        // id must come from the shared subscription_registry (NATS-KV
+        // backed, atomic), never invented locally: every instance/request
+        // for a brand-new expression converges on the same id by
+        // construction, regardless of order, with no client coordination
+        // required. See subscription_registry.hpp for the full design.
         uint64_t sub_id;
-        if (auto id_it = req.find("id"); id_it != req.end()) {
-            sub_id = id_it->get<uint64_t>();
-            if (!m_sub_mgr.restore(sub_id, expression, client_id)) {
-                throw std::runtime_error(
-                    "subscription id " + std::to_string(sub_id) +
-                    " is already bound to a different expression on this instance");
-            }
-        } else {
+        if (m_sub_mgr.find_by_expression(expression)) {
             sub_id = m_sub_mgr.subscribe(expression, client_id);
+        } else {
+            auto [id, reg_status] = co_await m_registry->resolve_id(expression);
+            if (reg_status.failed()) {
+                throw std::runtime_error(
+                    "failed to resolve subscription id: " + reg_status.error());
+            }
+            if (!m_sub_mgr.restore(id, expression, client_id)) {
+                // Should be unreachable: the registry never hands out the
+                // same id for two different expressions (see
+                // subscription_registry::resolve_id's collision guard), so
+                // this local restore() can only fail here on a real bug.
+                throw std::runtime_error(
+                    "registry-resolved id " + std::to_string(id) +
+                    " conflicts with local subscription state");
+            }
+            sub_id = id;
         }
         if (!co_await m_lease_mgr->persist_lease(sub_id, expression, client_id)) {
             if (!already_held) m_sub_mgr.remove_lease(sub_id, client_id);

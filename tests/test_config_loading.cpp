@@ -58,6 +58,7 @@ attributes:
     EXPECT_EQ(cfg.format, sidecar::binary_format::msgpack);
     EXPECT_EQ(cfg.lease_bucket, "sidecar-leases");
     EXPECT_EQ(cfg.lease_ttl_seconds, 3600u);
+    EXPECT_EQ(cfg.registry_bucket, "sidecar-subscriptions");
 }
 
 TEST(config_loading, explicit_output_prefix_overrides_default) {
@@ -83,6 +84,7 @@ unsubscribe_subject: custom.unsubscribe
 lease_bucket: my-leases
 lease_ttl_seconds: 120
 lease_check_interval_seconds: 5
+registry_bucket: my-registry
 stats_interval_seconds: 30
 log_level: debug
 worker_threads: 4
@@ -105,6 +107,7 @@ attributes:
     EXPECT_EQ(cfg.lease_bucket, "my-leases");
     EXPECT_EQ(cfg.lease_ttl_seconds, 120u);
     EXPECT_EQ(cfg.lease_check_interval_seconds, 5u);
+    EXPECT_EQ(cfg.registry_bucket, "my-registry");
     EXPECT_EQ(cfg.stats_interval_seconds, 30);
     EXPECT_EQ(cfg.log_level, "debug");
     EXPECT_EQ(cfg.worker_threads, 4u);

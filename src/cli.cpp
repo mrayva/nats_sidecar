@@ -46,6 +46,7 @@ cxxopts::Options build_cli_options() {
         ("lease-bucket", "NATS KV lease bucket name", cxxopts::value<std::string>())
         ("lease-ttl", "Lease TTL in seconds", cxxopts::value<uint32_t>())
         ("lease-check-interval", "Lease reconciliation interval in seconds", cxxopts::value<uint32_t>())
+        ("registry-bucket", "NATS KV subscription-id registry bucket name", cxxopts::value<std::string>())
         ("attr", "Attribute as name:type (repeatable)", cxxopts::value<std::vector<std::string>>())
         ("workers", "Worker thread count (0 = auto)", cxxopts::value<unsigned int>())
         ("input-queue-max-messages", "Maximum queued input messages", cxxopts::value<std::size_t>())
@@ -102,6 +103,7 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("lease-bucket"))         cfg.lease_bucket = result["lease-bucket"].as<std::string>();
     if (result.count("lease-ttl"))            cfg.lease_ttl_seconds = result["lease-ttl"].as<uint32_t>();
     if (result.count("lease-check-interval")) cfg.lease_check_interval_seconds = result["lease-check-interval"].as<uint32_t>();
+    if (result.count("registry-bucket"))      cfg.registry_bucket = result["registry-bucket"].as<std::string>();
     if (result.count("workers"))              cfg.worker_threads = result["workers"].as<unsigned int>();
     if (result.count("input-queue-max-messages")) cfg.input_queue_max_messages = result["input-queue-max-messages"].as<std::size_t>();
     if (result.count("input-queue-max-bytes")) cfg.input_queue_max_bytes = result["input-queue-max-bytes"].as<std::size_t>();

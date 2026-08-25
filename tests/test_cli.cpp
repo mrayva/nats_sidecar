@@ -27,6 +27,7 @@ TEST(cli, apply_cli_overrides_applies_all_flags) {
         "--lease-bucket", "my-leases",
         "--lease-ttl", "120",
         "--lease-check-interval", "5",
+        "--registry-bucket", "my-registry",
         "--workers", "4",
         "--input-queue-max-messages", "500",
         "--input-queue-max-bytes", "1048576",
@@ -55,6 +56,7 @@ TEST(cli, apply_cli_overrides_applies_all_flags) {
     EXPECT_EQ(cfg.lease_bucket, "my-leases");
     EXPECT_EQ(cfg.lease_ttl_seconds, 120u);
     EXPECT_EQ(cfg.lease_check_interval_seconds, 5u);
+    EXPECT_EQ(cfg.registry_bucket, "my-registry");
     EXPECT_EQ(cfg.worker_threads, 4u);
     EXPECT_EQ(cfg.input_queue_max_messages, 500u);
     EXPECT_EQ(cfg.input_queue_max_bytes, 1048576u);
@@ -94,6 +96,7 @@ TEST(cli, apply_cli_overrides_leaves_unset_fields_at_default) {
     EXPECT_EQ(cfg.nats_address, defaults.nats_address);
     EXPECT_EQ(cfg.nats_port, defaults.nats_port);
     EXPECT_EQ(cfg.lease_bucket, defaults.lease_bucket);
+    EXPECT_EQ(cfg.registry_bucket, defaults.registry_bucket);
     EXPECT_EQ(cfg.format, defaults.format);
 }
 

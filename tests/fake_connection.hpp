@@ -138,6 +138,8 @@ public:
     // persist/delete failure.
     std::function<bool(std::string_view bucket, std::string_view key)> fail_kv_put;
     std::function<bool(std::string_view bucket, std::string_view key)> fail_kv_delete;
+    std::function<bool(std::string_view bucket, std::string_view key)> fail_kv_create;
+    std::function<bool(std::string_view bucket, std::string_view key)> fail_kv_update;
 
     static std::string kv_key(std::string_view bucket, std::string_view key) {
         return std::string(bucket) + "/" + std::string(key);
@@ -338,6 +340,10 @@ public:
     asio::awaitable<std::pair<uint64_t, nats_asio::status>> kv_create(
         std::string_view bucket, std::string_view key, std::span<const char> value,
         std::chrono::milliseconds timeout) override {
+        if (fail_kv_create && fail_kv_create(bucket, key)) {
+            co_return std::pair<uint64_t, nats_asio::status>{
+                0, nats_asio::status(nats_asio::error_code::operation_failed)};
+        }
         auto it = kv_store.find(kv_key(bucket, key));
         if (it != kv_store.end() && it->second.op == nats_asio::kv_entry::operation::put) {
             co_return std::pair<uint64_t, nats_asio::status>{
@@ -348,6 +354,10 @@ public:
     asio::awaitable<std::pair<uint64_t, nats_asio::status>> kv_update(
         std::string_view bucket, std::string_view key, std::span<const char> value, uint64_t revision,
         std::chrono::milliseconds timeout) override {
+        if (fail_kv_update && fail_kv_update(bucket, key)) {
+            co_return std::pair<uint64_t, nats_asio::status>{
+                0, nats_asio::status(nats_asio::error_code::operation_failed)};
+        }
         auto it = kv_store.find(kv_key(bucket, key));
         if (it == kv_store.end() || it->second.revision != revision) {
             co_return std::pair<uint64_t, nats_asio::status>{

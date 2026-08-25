@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "event_bridge.hpp"
 #include "subscription_manager.hpp"
+#include "subscription_registry.hpp"
 #include "lease_manager.hpp"
 #include "worker_pool.hpp"
 #include <nats_asio/nats_asio.hpp>
@@ -112,6 +113,7 @@ private:
     subscription_manager m_sub_mgr;
     attribute_schema m_schema;
     std::unique_ptr<lease_manager> m_lease_mgr;
+    std::unique_ptr<subscription_registry> m_registry;
     std::unique_ptr<worker_pool> m_worker_pool;
     std::unique_ptr<asio::steady_timer> m_stats_timer;
 

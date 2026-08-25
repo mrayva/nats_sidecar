@@ -145,6 +145,11 @@ lease_bucket: "sidecar-leases"
 lease_ttl_seconds: 3600
 lease_check_interval_seconds: 60
 
+# Subscription-id registry (NATS KV) - the authoritative expression -> id
+# mapping shared by every instance in a fleet. Entries are permanent (no
+# TTL), so there's no check-interval field to go with it.
+registry_bucket: "sidecar-subscriptions"
+
 # Attribute schema for boolean expressions
 attributes:
   - name: temperature
@@ -246,16 +251,26 @@ Send a JSON request to the `subscribe_subject` (request/reply):
 {"expression": "temperature > 30.0 AND location = \"warehouse\"", "client_id": "my-client"}
 ```
 
-Optionally include a client-generated `"id"` (a `uint64`) to broadcast one subscribe request to
-N instances sharing a single control subject, instead of one per-instance-unique subject each:
-every instance that processes it adopts the same id (via `subscription_manager::restore()`, the
-same mechanism that already re-adopts a persisted id on lease-restart) rather than each assigning
-its own from an uncoordinated counter - so all instances converge on the identical output topic
-without needing a reply first. Control-plane setup latency: flat ~13-18ms regardless of N,
-compared to the old per-instance-request design's linear cost (9.1ms->257ms, N=1->32). Omitting
-`"id"` keeps the original per-instance auto-assigned behavior. A genuine id conflict (that id
-already bound to a different expression on an instance) is returned as a real error, not silently
-absorbed.
+There is no client-supplied id in this request - the subscription id is always assigned by the
+shared `registry_bucket` (a NATS JetStream KV bucket every instance talks to), which is what lets
+a broadcast subscribe request - published once to a control subject that N instances behind a
+shared data-plane `queue_group` all independently receive - converge on the identical id/output
+topic without any coordination between clients or instances. The mechanism: the first instance
+(anywhere, at any time) to see a given expression does an atomic `kv_create` on the registry; the
+KV revision NATS itself assigns on that create *is* the subscription id, so there's no separate
+counter to keep in sync. Every other instance/request for the same expression reads back that same
+revision via `kv_get`. Registry entries are never deleted, so an expression's id/output topic is
+stable for the life of the registry bucket, not just for the life of one subscription - a
+resubscribe to a previously fully-unsubscribed expression gets back its original id, not a new one.
+An earlier revision of this design let clients supply their own id to achieve the same convergence;
+that turned out to have two real bugs (a legitimate collision between two clients' independently-
+chosen ids hard-failed instead of merging, and a first-registration race could leave instances
+permanently disagreeing) which this registry-based design eliminates by construction.
+
+(This design adds one or two extra synchronous NATS round trips - `kv_create`, sometimes followed
+by a `kv_get` - on the first-ever-subscribe path, before `persist_lease`'s own round trip. The
+previous design's measured control-plane latency numbers no longer apply and haven't yet been
+re-benchmarked under this design.)
 
 Response:
 
@@ -276,10 +291,10 @@ client should then:
 2. Repeat the same subscribe request before the TTL expires. This is idempotent
    and refreshes the server-owned lease record.
 
-The sidecar creates the KV bucket when it is absent and validates its TTL and
-history settings when it already exists. A configuration mismatch fails startup.
-Lease records contain enough metadata to restore active subscriptions with their
-original IDs after a sidecar restart.
+The sidecar creates both the lease bucket and the `registry_bucket` when absent, and validates
+their settings when they already exist (TTL/history for leases, history for the registry - which
+has no TTL of its own). A configuration mismatch fails startup. Lease records contain enough
+metadata to restore active subscriptions with their original IDs after a sidecar restart.
 
 ### Unsubscribe
 

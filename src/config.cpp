@@ -205,6 +205,9 @@ config load_config(const std::string& path) {
     if (auto n = root["lease_ttl_seconds"])             cfg.lease_ttl_seconds = n.as<uint32_t>();
     if (auto n = root["lease_check_interval_seconds"])  cfg.lease_check_interval_seconds = n.as<uint32_t>();
 
+    // Subscription-id registry
+    if (auto n = root["registry_bucket"]) cfg.registry_bucket = n.as<std::string>();
+
     // Attributes (required)
     if (auto attrs = root["attributes"]) {
         if (!attrs.IsSequence()) throw std::runtime_error("config: 'attributes' must be a list");
