@@ -1120,6 +1120,46 @@ rows/s between the two runs, a confound unrelated to this change) - the qualitat
 number. A clean re-measurement of all 4 formats' absolute throughput is a natural follow-up, not
 done in this pass.
 
+**Went one step further on the same call path.** Removing the strlen scan still left
+`FfiEventBuilder::values.clear()` (end of every `atree_search()`) dropping every
+`(String, EventAttributeValue)` tuple, and the next row's `with_*()` call immediately
+re-allocating a fresh heap `String` via `.to_owned()` for the *same* attribute name - the strlen
+fix removed the scan but not the malloc/free pair around it, and the name is invariant across an
+entire batch in the common case (one schema attribute set on every row). **Fixed in
+`mrayva/a-tree`@`318917b`**: `FfiEventBuilder` now tracks `values_used` (how many slots are live
+for the *current* row) separately from the backing `Vec`'s actual size - a slot left over from a
+longer previous row gets its existing `String` buffer cleared and refilled via `push_str()` in
+place instead of being dropped and reallocated, reaching zero allocation once the `Vec`/`String`s
+have grown to a batch's steady-state size. A new test
+(`reused_slot_correctly_overwrites_a_shorter_or_longer_attribute_name`) specifically exercises the
+buffer-reuse path with names of different lengths in the same slot, on top of the existing
+stale-value-leak test (still passing - a shorter row genuinely doesn't see a longer previous row's
+leftover attributes, since every reader respects `values_used`, never `.len()`). All 15 a-tree-ffi
+unit tests + C smoke + C++ smoke (**unchanged** - still no C++ API surface change) pass.
+`nats_sidecar` pin bump `7afeebb`, full 260-test suite passes unchanged.
+
+**Measured real**: re-profiled msgpack again. `EventBuilder::with_float` +
+`atree_event_builder_with_float` (the two symbols the strlen fix left as msgpack's #2/#3 hottest,
+combined ~18.8%) collapsed to `push_attr` + `EventBuilder::with_float` at combined ~5.8% -
+`atree_event_builder_with_float` itself no longer registers separately in the top 20 at all.
+`_int_malloc`/`cfree` are visibly quieter too. Absolute throughput moved in the same noisy-but-
+positive direction as the strlen fix (~10,834 -> ~11,566 batches/s, one 10s sample each side - real
+signal, not a rigorous multi-sample measurement) - the profile-share collapse is the reliable
+finding here, same as with the strlen fix itself.
+
+**Fixed a related CMake gap found while bumping the pin twice in a row for this work,
+`nats_sidecar`@`7afeebb`.** `BuildAtree.cmake`'s Rust build step was an `add_custom_command` keyed
+only on its output path (`liba_tree_ffi.a`) with no `DEPENDS` on the actual source - `make` silently
+skipped invoking `cargo build` at all once that file already existed in a reused build directory,
+even after a pin bump changed the fetched source underneath it (caught needing a manual
+`cargo build` workaround twice this session). Switched to a plain custom *target* - unlike an
+`OUTPUT`-tracked custom command, a target's `COMMAND`s run unconditionally on every build
+invocation, so `cargo build`'s own fast (~0.3-0.8s), correct incremental staleness detection
+decides instead of CMake trying to replicate it. Verified using this session's own second pin bump
+as the test case: reconfigured, ran `make` alone (no manual workaround) in both `build/` and
+`build-perf/` - both correctly showed `Compiling a-tree-ffi` and relinked. A following no-op
+`make` completes in ~0.2s, confirming negligible steady-state cost.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
