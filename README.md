@@ -795,6 +795,32 @@ engine sits behind it - at N=12/columnar scale, that unpack/serialize cost domin
 factor. A matching-engine choice would be expected to matter more under conditions where search
 itself is the bottleneck (e.g. many more concurrent expressions per instance) - not measured here.
 
+**Re-ran the same N=12/`--workers 24` full-table benchmark once more with both perf fixes in place**
+(`columnar_rows()` replacing `expand_columnar()`, plus `write_value()`'s raw-copy fast path) - the
+single-instance profiling above already measured each fix in isolation; this confirms what they add
+up to at full N=12 fleet scale, rather than assuming the single-instance numbers simply multiply:
+
+| | before either fix | `columnar_rows()` only | both fixes |
+|---|---:|---:|---:|
+| batches processed | 124,157 (53.9%) | 139,881 (60.8%) | 145,606 (63.2%) |
+| batches dropped (local input queue full) | 106,107 (46.1%) | 90,380 (39.2%) | 84,661 (36.8%) |
+| rows matched (`price > 500.0`) | 3,212,038 | 3,733,599 | 3,426,161 |
+| publish-side aggregate rate | 9.13M rows/s | 10.28M rows/s | 9.88M rows/s |
+
+Every instance's own `received`/`processed`/`input_dropped` counters reconcile exactly (230,267 =
+145,606 + 84,661, summed across all 12 instances) - as before, confirming NATS itself delivered
+every batch to some instance (100%, zero loss in transit) and the drop is entirely local
+input-queue capacity, not a transport issue. Processed share climbed again (60.8% -> 63.2%), a
+further real improvement on top of the `columnar_rows()` fix alone - consistent with, though this
+run's publish rate was itself ~4% lower than the `columnar_rows()`-only run (9.88M vs. 10.28M
+rows/s, ordinary run-to-run publish jitter, not a controlled variable), which if anything works
+*against* seeing a higher processed share here, not for it. **Matches the single-instance profiling
+finding exactly**: the raw-copy fast path was measured there as real-but-narrow (didn't move
+single-instance batches/s outside noise, at this one-attribute schema) - here too, it adds a real
+but modest further gain (60.8% -> 63.2%) on top of `columnar_rows()`'s much larger jump
+(53.9% -> 60.8%), not a second dramatic step change. Both fixes are additive, not redundant, and
+neither regresses the other.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
