@@ -48,7 +48,7 @@ bool populate_event(
     event_sink& builder,
     const attribute_schema& schema,
     Reader& reader,
-    std::shared_ptr<spdlog::logger> log)
+    const std::shared_ptr<spdlog::logger>& log)
 {
     if (!reader.isMap()) {
         if (log) log->debug("event_bridge: payload is not a map");
@@ -163,7 +163,7 @@ std::optional<std::vector<uint64_t>> match_message(
     const attribute_schema& schema,
     Reader& reader,
     event_sink& event,
-    std::shared_ptr<spdlog::logger> log,
+    const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out = nullptr)
 {
     if (!populate_event(event, schema, reader, log)) {
@@ -193,7 +193,7 @@ std::optional<std::vector<uint64_t>> match_message(
     const matching_engine& tree,
     const attribute_schema& schema,
     Reader& reader,
-    std::shared_ptr<spdlog::logger> log,
+    const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out = nullptr)
 {
     auto event = tree.make_event();
@@ -207,7 +207,7 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,
-    std::shared_ptr<spdlog::logger> log,
+    const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out = nullptr);
 
 // One row of a columnar batch that matched at least one subscription.
@@ -261,7 +261,7 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,
-    std::shared_ptr<spdlog::logger> log,
+    const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out = nullptr,
     std::size_t* rows_searched_out = nullptr);
 

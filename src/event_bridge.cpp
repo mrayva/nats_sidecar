@@ -7,7 +7,7 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,
-    std::shared_ptr<spdlog::logger> log,
+    const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out)
 {
     try {
@@ -58,7 +58,7 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     const matching_engine& tree,
     const attribute_schema& schema,
     std::span<const uint8_t> bytes,
-    std::shared_ptr<spdlog::logger> log,
+    const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out,
     std::size_t* rows_searched_out)
 {
@@ -154,7 +154,7 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,
-    std::shared_ptr<spdlog::logger> log,
+    const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out,
     std::size_t* rows_searched_out)
 {
