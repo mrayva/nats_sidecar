@@ -8,7 +8,7 @@ include(FetchContent)
 FetchContent_Declare(
     atree
     GIT_REPOSITORY https://github.com/mrayva/a-tree.git
-    GIT_TAG        57650d08b71357e028df167aecbbc676c8f87495
+    GIT_TAG        318917bc9e2ec276664d69d6ab83f66b2c55ede2
     GIT_SHALLOW    TRUE
     SYSTEM
 )
@@ -35,16 +35,32 @@ endif()
 set(ATREE_LIB_DIR ${ATREE_FFI_DIR}/target/${ATREE_CARGO_PROFILE})
 set(ATREE_STATIC_LIB ${ATREE_LIB_DIR}/liba_tree_ffi.a)
 
-# Custom command: build the Rust FFI crate
-add_custom_command(
-    OUTPUT ${ATREE_STATIC_LIB}
+# Build the Rust FFI crate via a custom TARGET, not an OUTPUT-tracked
+# add_custom_command. A custom_command only re-runs its COMMAND when a
+# declared DEPENDS file is newer than OUTPUT (${ATREE_STATIC_LIB}) - but
+# there's no practical way to enumerate every source file this staticlib
+# actually depends on (this crate's own src/, plus its path-dependency on
+# the sibling a-tree crate's src/, which FetchContent re-populates in
+# place on every pin bump - a checkout doesn't reliably bump every
+# touched file's mtime relative to an already-built .a sitting in the
+# same reused build directory). Caught 2026-08-27: after bumping the pin,
+# `make` reported "Built target atree_ffi_build" without ever invoking
+# `cargo build` on the new source, needing a manual `cargo build` in
+# ${ATREE_FFI_DIR} as a workaround before the fix below.
+#
+# A custom TARGET's COMMAND(s) - unlike add_custom_command's OUTPUT-gated
+# one - run unconditionally on every build invocation, regardless of file
+# timestamps. `cargo build` is already fast when nothing changed
+# (~0.3-0.8s) and does its own correct, fine-grained incremental staleness
+# detection internally - the fix is to stop trying to replicate that
+# inside CMake and just let cargo decide, every time.
+add_custom_target(atree_ffi_build
     COMMAND cargo build ${ATREE_CARGO_FLAGS}
     WORKING_DIRECTORY ${ATREE_FFI_DIR}
+    BYPRODUCTS ${ATREE_STATIC_LIB}
     COMMENT "Building a-tree FFI via cargo (${ATREE_CARGO_PROFILE})..."
     VERBATIM
 )
-
-add_custom_target(atree_ffi_build DEPENDS ${ATREE_STATIC_LIB})
 
 # Imported library target
 add_library(atree_ffi STATIC IMPORTED GLOBAL)
