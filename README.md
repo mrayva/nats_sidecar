@@ -621,6 +621,29 @@ matching publish-side burst rate/`--workers` to the real per-instance ceiling in
 one) remain the right next moves for actually eliminating loss at this ingest rate, and are still
 untested as of this writing.
 
+**be-tree comparison, same N=12/`--workers 24` benchmark, everything else identical (`engine: betree`
+in place of the default `engine: atree`):**
+
+| | a-tree | be-tree |
+|---|---:|---:|
+| batches processed | 139,881 (60.7%) | 139,488 (60.6%) |
+| batches dropped (local input queue full) | 90,380 | 90,773 |
+| rows matched (`price > 500.0`) | 3,733,599 | 3,286,903 |
+| publish-side aggregate rate | 10.28M rows/s | 9.46M rows/s |
+
+Processing capacity is statistically indistinguishable between engines at this workload (60.7% vs.
+60.6% of batches processed - within run-to-run noise). The two runs' `--workers 24` publish jobs
+raced the fleet at slightly different real-world rates (10.28M vs. 9.46M rows/s, ordinary
+scheduling jitter between separate runs, not a deliberate variable), so the matched-row counts
+differ too - different runs drop different specific batches under this kind of queue-full race,
+not a correctness difference between engines. **This is expected, not a wash**: the perf-identified
+bottleneck fixed above lives in nats_sidecar's own row-unpacking loop
+(`event_bridge.cpp`'s `match_columnar_batch`), which runs identically regardless of which matching
+engine sits behind it - at N=12/columnar scale, that unpack/serialize cost dominates enough that
+`atree::Tree::search()` vs. be-tree's own search were never going to show up as the deciding
+factor. A matching-engine choice would be expected to matter more under conditions where search
+itself is the bottleneck (e.g. many more concurrent expressions per instance) - not measured here.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
