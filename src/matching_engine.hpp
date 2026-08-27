@@ -39,6 +39,48 @@ template<class V>
 using string_view_lookup_map =
     std::unordered_map<std::string, V, transparent_string_hash, std::equal_to<>>;
 
+// A tiny, linear-scan (name, value) list - an alternative to
+// string_view_lookup_map<V> for a map that's small and built once at
+// startup (a handful of attributes, matching a-tree-ffi's own "Vec, not
+// HashMap - schemas are small" reasoning for the identical shape of
+// problem), then looked up by string_view many times on the hot path. For
+// that size, a hash computation's fixed per-call overhead outweighs a
+// short linear scan comparing string_views directly - real, measured cost:
+// profiling nats_sidecar's single-instance columnar-batch workload found
+// betree_event_sink::index_for() (which does exactly this lookup once per
+// (row, attribute) pair) at ~2.3% of total CPU, using
+// string_view_lookup_map. Only used where that's been specifically
+// measured to matter (betree_event_sink's own attribute-name-to-index
+// map) - not a blanket replacement for string_view_lookup_map elsewhere.
+template<class V>
+class small_attr_map {
+public:
+    // Insert-or-update; matches string_view_lookup_map's operator[]=
+    // construction-time usage shape closely enough without actually
+    // needing operator[] itself (this class never needs "insert a
+    // default-constructed V and hand back a mutable reference to it").
+    void set(std::string name, V value) {
+        for (auto& [n, v] : m_entries) {
+            if (n == name) { v = std::move(value); return; }
+        }
+        m_entries.emplace_back(std::move(name), std::move(value));
+    }
+
+    // Returns nullptr on a miss, mirroring string_view_lookup_map::find()
+    // returning end() - callers already null/end()-check either way.
+    const V* find(std::string_view name) const {
+        for (const auto& [n, v] : m_entries) {
+            if (n == name) return &v;
+        }
+        return nullptr;
+    }
+
+    std::size_t size() const { return m_entries.size(); }
+
+private:
+    std::vector<std::pair<std::string, V>> m_entries;
+};
+
 // Engine-agnostic event sink. event_bridge populates one of these per
 // incoming message instead of writing directly into a concrete
 // atree::EventBuilder / be::Event. Attribute names are std::string_view,

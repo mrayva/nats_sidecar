@@ -110,7 +110,7 @@ private:
 // atree::EventBuilder) - indices are assigned in schema-declaration order
 // and looked up by name here to keep event_sink's interface uniform.
 be::Tree build_betree(const std::vector<attribute_def>& attributes,
-                       string_view_lookup_map<std::size_t>& indices_out)
+                       small_attr_map<std::size_t>& indices_out)
 {
     be::Tree tree;
     std::size_t idx = 0;
@@ -135,14 +135,14 @@ be::Tree build_betree(const std::vector<attribute_def>& attributes,
                 tree.add_integer_list(attr.name, true, kBetreeIntMin, kBetreeIntMax);
                 break;
         }
-        indices_out[attr.name] = idx++;
+        indices_out.set(attr.name, idx++);
     }
     return tree;
 }
 
 class betree_event_sink : public event_sink {
 public:
-    betree_event_sink(be::Event event, const string_view_lookup_map<std::size_t>& indices)
+    betree_event_sink(be::Event event, const small_attr_map<std::size_t>& indices)
         : m_event(std::move(event)), m_indices(indices),
           m_touched(m_indices.size(), false), m_spares(m_indices.size(), nullptr) {}
 
@@ -271,11 +271,11 @@ public:
 
 private:
     std::size_t index_for(std::string_view name) const {
-        auto it = m_indices.find(name);
-        if (it == m_indices.end()) {
+        const std::size_t* idx = m_indices.find(name);
+        if (idx == nullptr) {
             throw matching_engine_error("unknown attribute: " + std::string(name));
         }
-        return it->second;
+        return *idx;
     }
 
     betree_variable* take_spare(std::size_t idx) {
@@ -301,14 +301,14 @@ private:
     }
 
     be::Event m_event;
-    const string_view_lookup_map<std::size_t>& m_indices;
+    const small_attr_map<std::size_t>& m_indices;
     std::vector<bool> m_touched;
     std::vector<betree_variable*> m_spares;
 };
 
 class betree_matching_engine : public matching_engine {
 public:
-    betree_matching_engine(be::Tree tree, string_view_lookup_map<std::size_t> indices)
+    betree_matching_engine(be::Tree tree, small_attr_map<std::size_t> indices)
         : m_tree(std::move(tree)), m_indices(std::move(indices)) {}
 
     void insert(uint64_t id, const std::string& expression) override {
@@ -335,12 +335,11 @@ public:
     // needs it - gets an event that's always "blank" and ready for the next
     // row's with_*() calls, exactly as if make_event() had just been called
     // again. This eliminates betree_make_event()'s own per-row allocation
-    // (the outer struct + variable-pointer array) for a reusing caller;
-    // it does NOT touch the per-attribute betree_make_*_variable() cost
-    // (still paid on every with_*() call regardless) - that's the separate,
-    // riskier "Increment B" lever (would need a new be-tree C API to update
-    // an existing variable's value in place instead of allocating a fresh
-    // one), not attempted here.
+    // (the outer struct + variable-pointer array) for a reusing caller.
+    // "Increment B" (betree_event_sink's own with_boolean/with_integer/
+    // with_float, see their doc comments) separately covers the
+    // per-attribute betree_make_*_variable() cost this method's own reset
+    // doesn't touch.
     std::vector<uint64_t> search(event_sink& event) const override {
         auto& sink = static_cast<betree_event_sink&>(event);
         try {
@@ -366,7 +365,7 @@ public:
 
 private:
     be::Tree m_tree;
-    string_view_lookup_map<std::size_t> m_indices;
+    small_attr_map<std::size_t> m_indices;
 };
 
 } // namespace
@@ -378,7 +377,7 @@ std::unique_ptr<matching_engine> build_matching_engine(
         case engine_type::atree:
             return std::make_unique<atree_matching_engine>(build_atree(attributes));
         case engine_type::betree: {
-            string_view_lookup_map<std::size_t> indices;
+            small_attr_map<std::size_t> indices;
             auto tree = build_betree(attributes, indices);
             return std::make_unique<betree_matching_engine>(std::move(tree), std::move(indices));
         }
