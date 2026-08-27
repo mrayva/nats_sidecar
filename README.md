@@ -1003,6 +1003,33 @@ that untouched - see above). This is the **current, accurate picture** - the "st
 indistinguishable" language earlier in this file describes a snapshot from *before* this
 investigation's a-tree-specific work and should be read as historical, not current.
 
+**Fixed the `__strcmp_evex` piece directly, in be-tree itself.** Traced it to
+`fill_event()` (`mrayva/be-tree`'s `src/tree.cpp`, called on every `betree_search_with_event()` -
+i.e. every single row): it unconditionally re-resolved every variable's internal id via
+`try_get_id_for_attr()` - lowercase the whole name, then a *linear `strcmp` scan over every
+attribute in the schema* - even for variables `betree_set_variable()` had already resolved
+correctly and cheaply moments earlier, straight from `event->config->attr_domains[index]`, no
+string comparison at all. Every event this codebase's own index-based `Event::set_*()` C++ wrapper
+builds (the only way nats_sidecar ever builds one) already has that id resolved by the time
+`fill_event()` runs - it was being thrown away and recomputed identically via the slow path, on
+every attribute, every row. **`mrayva/be-tree`@`3d13dd3`**: `fill_event()` now only falls back to
+the name-based scan when the id is still genuinely unresolved (e.g. an event parsed from JSON,
+which starts that way) - zero behavior change for that path, skips straight past the scan for
+everything else. Verified against be-tree's own full test suite (24 CTest targets, 100% pass) -
+including `cpp_wrapper_smoke`'s index-vs-JSON parity check and its explicit
+reuse-with-a-replaced-value-then-re-search scenario, exactly the case this change's correctness
+depends on. **No nats_sidecar code changes needed, only the pin bump.**
+
+**Measured real**: single-instance throughput ~5,900-5,970 -> **~6,300 batches/s, roughly a 7%
+gain** - `__strcmp_evex` and `tolower` both drop out of the profile's top symbols entirely,
+narrowing (not closing) the gap to a-tree from ~15% to roughly ~8%. `betree_make_float_variable`
+(6.69%) - the per-attribute-set native allocation `try_get_id_for_attr` sat next to, not itself -
+is now be-tree's single largest remaining symbol: a further, bigger, and meaningfully riskier lever
+than this one (it would mean either a new be-tree API for updating an existing variable's value in
+place instead of allocating a fresh one, or reusing variable objects across searches the way
+a-tree's `EventBuilder` now does - not attempted here, offered as a next step rather than pulled in
+unprompted).
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
