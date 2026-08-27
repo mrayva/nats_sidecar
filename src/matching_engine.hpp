@@ -85,12 +85,19 @@ public:
     // atree_matching_engine::search() routes through below): reusing one
     // event_sink across a whole columnar batch instead of allocating a
     // fresh one per row is a real, separately-measured cost eliminated for
-    // every row after the batch's first. be-tree's own Event allocates a
-    // fresh native variable object on every individual attribute set via
-    // its underlying C library, and this codebase doesn't have enough
-    // visibility into whether replacing an already-set slot's variable is
-    // memory-safe to risk it - stays at its original default (false),
-    // meaning callers must keep making a fresh event_sink per row for it.
+    // every row after the batch's first. be-tree's own event *container*
+    // (the outer struct + variable-pointer array betree_make_event()
+    // allocates) is also true for the same reason now -
+    // betree_matching_engine::search() resets it via Event::clear(), which
+    // is just betree_set_variable(event, index, nullptr) - the same
+    // existing, already-exercised primitive with_undefined() already used,
+    // not new/unverified code. What's still NOT reused: be-tree allocates a
+    // fresh native *variable* object on every individual attribute set via
+    // its underlying C library regardless of whether the event container
+    // itself is fresh or recycled, and updating an already-set slot's
+    // variable in place instead of allocating a new one would need new
+    // be-tree C API this codebase doesn't have yet - a separate, riskier
+    // lever, not attempted here. Defaults false for any other engine.
     virtual bool reuses_events() const { return false; }
 };
 

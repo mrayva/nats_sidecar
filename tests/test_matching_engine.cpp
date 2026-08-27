@@ -52,6 +52,56 @@ TEST_P(matching_engine_test, simple_comparison_matches) {
     EXPECT_FALSE(contains(match(*engine, {50.0, 100, "AAPL", true}), 1));
 }
 
+// Runs against both engines - for a-tree this re-confirms existing
+// behavior (reuses_events() already true), for be-tree this is the new
+// case this test exists for (matching_engine::reuses_events()'s
+// "Increment A" - see its own doc comment): a caller that keeps reusing
+// the same event_sink across many searches (matching how
+// event_bridge.cpp's match_columnar_batch() actually uses it for a
+// columnar batch's rows) instead of a fresh one every time. The risk:
+// a value set on one search must not still be visible on the next one if
+// it isn't set again - checked here with a sink reused across three
+// searches, the second deliberately setting *fewer* attributes than the
+// first (mirroring a batch where not every row sets every attribute),
+// against expressions chosen so a leaked stale value would flip the
+// answer rather than coincidentally agree with the correct one.
+TEST_P(matching_engine_test, event_sink_reused_across_searches_has_no_stale_values) {
+    auto engine = sidecar::build_matching_engine(GetParam(), trade_attributes());
+    engine->insert(1, "trade_volume > 1000");
+    engine->insert(2, "tags one of (\"urgent\")");
+
+    auto sink = engine->make_event();
+
+    // First search: sets every attribute, including volume and tags -
+    // both expressions match.
+    sink->with_float("trade_price", 10.0);
+    sink->with_integer("trade_volume", 2000);
+    sink->with_string("symbol", "AAPL");
+    sink->with_boolean("active", true);
+    sink->with_string_list("tags", {"urgent"});
+    auto r1 = engine->search(*sink);
+    EXPECT_TRUE(contains(r1, 1));
+    EXPECT_TRUE(contains(r1, 2));
+
+    // Second search, the SAME sink object: only sets price this time -
+    // trade_volume and tags are left unset. If either leaked from the
+    // first search, this would incorrectly still match.
+    sink->with_float("trade_price", 20.0);
+    auto r2 = engine->search(*sink);
+    EXPECT_FALSE(contains(r2, 1))
+        << "trade_volume leaked from a prior search on a reused event_sink";
+    EXPECT_FALSE(contains(r2, 2))
+        << "tags leaked from a prior search on a reused event_sink";
+
+    // Third search, same sink again: set volume back above the threshold -
+    // proves the sink is genuinely reusable more than once, not just
+    // resettable a single time.
+    sink->with_integer("trade_volume", 5000);
+    auto r3 = engine->search(*sink);
+    EXPECT_TRUE(contains(r3, 1));
+    EXPECT_FALSE(contains(r3, 2));
+}
+
 TEST_P(matching_engine_test, and_or_combinators) {
     auto engine = sidecar::build_matching_engine(GetParam(), trade_attributes());
     engine->insert(1, "trade_price > 50.0 and trade_volume > 1000");

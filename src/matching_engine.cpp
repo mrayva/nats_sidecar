@@ -170,6 +170,23 @@ public:
 
     be::Event& native() { return m_event; }
 
+    // Clears every attribute slot back to unset, so this same event_sink
+    // can be safely reused for the next row's populate_event() calls
+    // instead of a fresh one being allocated - see reuses_events()'s own
+    // doc comment (matching_engine.hpp) for why this is safe: Event::clear()
+    // (betree_cpp.hpp) is just betree_set_variable(event, index, nullptr),
+    // an existing, already-exercised be-tree primitive (every with_undefined()
+    // call already goes through it) - not new, unverified C code. Called
+    // unconditionally after every search() (success or failure) rather than
+    // only for slots this row didn't set, so a row with fewer attributes
+    // than a previous one can never see that previous row's leftover value
+    // - the same blanket-reset principle a-tree's own event recycling uses.
+    void reset() {
+        for (std::size_t i = 0; i < m_indices.size(); ++i) {
+            m_event.clear(i);
+        }
+    }
+
 private:
     std::size_t index_for(std::string_view name) const {
         auto it = m_indices.find(name);
@@ -204,14 +221,42 @@ public:
         return std::make_unique<betree_event_sink>(m_tree.make_event(), m_indices);
     }
 
+    // Increment A of the be-tree reuse work (see matching_engine.hpp's
+    // reuses_events() doc comment): resets `sink` right after every search
+    // (success or failure) instead of leaving that to the caller, so a
+    // caller that keeps reusing the same event_sink across many rows (see
+    // reuses_events() below) - and only the latter actually
+    // needs it - gets an event that's always "blank" and ready for the next
+    // row's with_*() calls, exactly as if make_event() had just been called
+    // again. This eliminates betree_make_event()'s own per-row allocation
+    // (the outer struct + variable-pointer array) for a reusing caller;
+    // it does NOT touch the per-attribute betree_make_*_variable() cost
+    // (still paid on every with_*() call regardless) - that's the separate,
+    // riskier "Increment B" lever (would need a new be-tree C API to update
+    // an existing variable's value in place instead of allocating a fresh
+    // one), not attempted here.
     std::vector<uint64_t> search(event_sink& event) const override {
         auto& sink = static_cast<betree_event_sink&>(event);
         try {
-            return m_tree.search(sink.native()).matched_subs;
+            auto matched = m_tree.search(sink.native()).matched_subs;
+            sink.reset();
+            return matched;
         } catch (const std::exception& e) {
+            sink.reset();
             throw matching_engine_error(e.what());
         }
     }
+
+    // be-tree's Event::clear() (called by betree_event_sink::reset() above)
+    // is an existing, already-exercised be-tree primitive - just
+    // betree_set_variable(event, index, nullptr), the same call every
+    // with_undefined() already makes - not new, unverified C code, so
+    // reusing the event *container* this way carries none of the
+    // per-attribute-variable memory-safety uncertainty this method's
+    // default (false) exists to avoid. Only the outer event allocation
+    // (betree_make_event()'s bmalloc+bcalloc) is avoided by this - see
+    // search()'s own comment for what's still NOT covered.
+    bool reuses_events() const override { return true; }
 
 private:
     be::Tree m_tree;
