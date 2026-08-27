@@ -1071,6 +1071,55 @@ fields per row, and the read-side columnar/matching-engine work still dominates 
 top 15 symbols are the same functions in nearly the same proportions before and after). A wider
 schema or higher match rate would show a larger effect.
 
+**Profiled all 4 prioritized formats (msgpack, cbor, beve, flexbuffers) side by side to find each
+one's own top hot functions** - single instance, same real 115,020,848-row NYSE backlog, current
+binary (every fix above applied), `format:`/`--format` swapped per run:
+
+| rank | msgpack | cbor | beve | flexbuffers |
+|---|---|---|---|---|
+| 1 | `mp_skip` (12.78%) | `CborDeserializer::KeysView::iterator::read_head` (8.02%) | `ColumnarRows<Beve>::advance` (10.23%) | `__strlen_evex` (7.36%) |
+| 2 | `EventBuilder::with_float` (9.64%) | `EventBuilder::with_float` (6.94%) | `shared_ptr::_M_release` (6.61%) | `EventBuilder::with_float` (7.30%) |
+| 3 | `atree_search` (6.26%) | `KeysView::iterator::skip` (5.62%) | `EventBuilder::with_float` (6.26%) | `atree_search` (5.28%) |
+| 4 | `__strlen_evex` (5.96%) | `atree_search` (5.44%) | `atree_search` (5.30%) | `match_message<Flex>` (4.07%) |
+| 5 | `ColumnarRows<MsgPack>::advance` (4.87%) | `__strlen_evex` (3.78%) | `shared_ptr::_M_add_ref_copy` (4.94%) | `alloc::Vec::from_elem` (3.96%) |
+
+Each format's #1 spot is its own read-side unpacking cost (msgpack's `mp_skip`/CBOR's key-iteration/
+BEVE's `ColumnarRows::advance` sequential walk), exactly as expected given the earlier per-format
+architecture analysis. The one truly interesting cross-cutting finding: `__strlen_evex` (libc) sat
+in **every single format's** top 5 (traced with `perf report -g` to confirm it's the same call path
+in all four - not a coincidence). BEVE's own list additionally surfaces its `shared_ptr`
+refcounting (`glz::lazy_beve_document` is wrapped in a `shared_ptr`) as a real, BEVE-specific cost
+not present in the other three - not yet investigated further.
+
+**Fixed the shared `__strlen_evex` cost - it wasn't format-specific at all.** Traced its call graph:
+every format routes through `atree_event_builder_with_float()` (`a-tree-ffi`'s C ABI), which read
+its `name` parameter via `CStr::from_ptr(name).to_str()` - a `strlen()` scan for the null
+terminator, on every single row, even though (a) the C++ caller (`atree.hpp`'s
+`EventBuilder::with_float(std::string_view name, ...)`) already knew the length from
+`std::string_view::size()`, and (b) the attribute name (`"price"`) is invariant across an entire
+batch. Pure, repeated, format-agnostic waste. **Fixed in `mrayva/a-tree`@`57650d0`**: every
+`atree_event_builder_with_*()` C function (`with_boolean`/`with_integer`/`with_string`/`with_float`/
+`with_string_list`/`with_integer_list`/`with_undefined`) now takes an explicit `name_len` (and
+`with_string` a `value_len`), reading via `slice::from_raw_parts` + `str::from_utf8` instead of
+`CStr::from_ptr` - no strlen scan, no null-terminator requirement. `atree.hpp`'s public C++
+`EventBuilder` API is completely unchanged (still `std::string_view` in, no call-site changes
+anywhere) - only its internals changed, from `std::string(name).c_str()` (an owned, materialized,
+null-terminated copy) to `name.data()`/`name.size()` passed straight through, which also drops a
+C++-side allocation that existed purely to satisfy the old C string convention. Verified: 14
+a-tree-ffi unit tests + the C smoke test (updated to pass explicit lengths) + the C++ smoke test
+(**unchanged** - proof the public API didn't move) all pass; core a-tree's 207 unit + 5 doc tests
+unaffected. `nats_sidecar` pin bump `64e70a5`, full 260-test suite (including the a-tree/be-tree
+differential-matrix correctness suite, which exercises every `with_*` variant, not just
+`with_float`) passes unchanged - no nats_sidecar code changes needed.
+
+**Re-profiled msgpack to confirm**: `__strlen_evex` is completely absent from the post-fix top 20
+(was 5.96%, rank 4). This run's absolute batches/s isn't directly comparable to the table above (the
+host was measurably busier during this capture - aggregate publish rate dropped from ~11M to ~4M
+rows/s between the two runs, a confound unrelated to this change) - the qualitative confirmation
+(the symbol vanishing entirely) is the reliable signal here, not this particular run's throughput
+number. A clean re-measurement of all 4 formats' absolute throughput is a natural follow-up, not
+done in this pass.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
