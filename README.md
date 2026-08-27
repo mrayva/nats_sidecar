@@ -681,6 +681,51 @@ in that category now is `columnar_rows::advance()`'s own single sequential `mp_s
 source payload, which is unavoidable (something has to read the bytes once), not a second write-then-
 reparse of them.
 
+**Applied the same principle to the write side, as asked ("build the row-view optimization for
+expand_columnar's msgpack write side too")**: `serialize_row()` (and `expand_columnar()`'s own column
+writes, for any other caller) go through `zerialize::write_value()`, which decodes a value
+(`isInt()`/`asInt64()`, `isString()`/`asStringView()`, ...) and re-encodes it through the destination
+Writer - wasted work whenever the source and destination are the *same* wire format, since the
+source's bytes are already a complete, valid encoding in the destination's own format. Added
+`write_value()`'s `raw_copy_compatible<V, W>` fast path (zerialize commit `9e64adc`, `raw_copy.hpp`) -
+an opt-in trait, false by default, that a protocol specializes true for its own
+(Deserializer, Serializer) pair; when true, `write_value()` copies the value's raw bytes straight
+through (`v.raw_view()` -> `w.raw(...)`) instead of decoding and re-encoding, at *any* recursion depth
+(a whole document, a nested map/array, or one scalar are all just "some bytes" to copy once this
+fires). Wired up for `MsgPack`<->`MsgPack` specifically (`MsgPackSerializer::raw()`, using the same
+`pk_.callback`/`pk_.data` primitive msgpack-c's own `pack_*` calls use internally). Verified with a
+dedicated zerialize test asserting a same-protocol `translate<MsgPack>()` comes back byte-identical to
+its source - true only if the fast path fires at every level, not just an equivalent decode - plus
+the full existing suite (which checks decoded values, not bytes) unaffected.
+
+This benefits every caller of `write_value()` generically, with **no call-site changes** in
+nats_sidecar: `serialize_row()`'s per-field writes (via `columnar_rows()`'s `mapEntries()`, each field
+already a real `MsgPackDeserializer`) now hit this path automatically. Measured with the same
+controlled two-binary methodology as above (one binary just before this change, one after, single
+instance, same saturated 115,020,848-row backlog, `perf` for a 10s window):
+
+| | batches/s | `serialize_row()`'s own share of CPU |
+|---|---:|---:|
+| before | ~6,056 | 1.78% |
+| after | ~6,006 | 0.60% |
+
+`serialize_row()`'s own cost dropped by roughly two thirds (1.78% -> 0.60%) - real, and confirmed by
+the byte-identity test to be the actual fast path firing, not noise - but aggregate single-instance
+throughput did **not** measurably improve (~6,056 vs ~6,006 batches/s is within normal run-to-run
+noise for a single 10-second sample, and if anything reads slightly lower). Consistent with the rest
+of that same profile: `msgpack_sbuffer_write`'s own share rose by close to the same amount
+serialize_row's fell (0.91% -> 1.48%) - `raw()` still has to hand the same bytes to the same
+underlying write primitive `msgpack_pack_double()`/`msgpack_pack_str()` etc. already called internally,
+it just skips the decode+re-encode logic *around* that call, so the win here is real but narrow: this
+schema has one attribute (`price`) and two fields per row total, so there's only ever one or two
+values per matched row for the fast path to save anything on. Unlike the read-side round trip (which
+was ~40%+ of the whole per-batch cost because it touched *every* column of *every* row in the batch,
+not just matched rows' own fields), the write side was already a small slice (~5% of the profile,
+matching-engine/allocator/read-side costs dominate at ~65%+ combined) - a wider schema (more
+attributes) or a higher match rate (more rows reaching `serialize_row()` per batch) would show a
+larger effect; at this schema's actual shape, the fix is real, zero-risk, and worth keeping, but not
+a lever that moves this benchmark's aggregate throughput.
+
 **This means the N=12 full-table "~265k rows/s sustained ceiling" measured above is now stale** -
 it was measured against the pre-fix binary. Re-ran the *exact same* N=12/`--workers 24` full-table
 benchmark (same 115,020,848-row NYSE table, same `--batch-size 500 --batch-encoding native`, same
