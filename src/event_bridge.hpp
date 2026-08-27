@@ -144,7 +144,14 @@ bool populate_event(
     return true;
 }
 
-// Match a deserialized message against all active subscriptions.
+// Match a deserialized message against all active subscriptions, using a
+// caller-supplied, already-`tree.make_event()`d event_sink. Exists
+// separately from the convenience overload below so a caller processing
+// many rows against the same tree (a columnar batch) can supply *one*
+// event_sink reused across all of them (when matching_engine::reuses_events()
+// says that's safe for this engine - see matching_engine.hpp) instead of a
+// fresh one per row.
+//
 // search_time_out, if non-null, is set to the wall-clock duration of the
 // matching_engine::search() call alone (not deserialize/populate) whenever
 // search actually runs - left untouched (still nullopt) if populate_event
@@ -155,18 +162,17 @@ std::optional<std::vector<uint64_t>> match_message(
     const matching_engine& tree,
     const attribute_schema& schema,
     Reader& reader,
+    event_sink& event,
     std::shared_ptr<spdlog::logger> log,
     std::optional<std::chrono::nanoseconds>* search_time_out = nullptr)
 {
-    auto event = tree.make_event();
-
-    if (!populate_event(*event, schema, reader, log)) {
+    if (!populate_event(event, schema, reader, log)) {
         return std::nullopt;
     }
 
     try {
         auto t0 = std::chrono::steady_clock::now();
-        auto result = tree.search(*event);
+        auto result = tree.search(event);
         auto t1 = std::chrono::steady_clock::now();
         if (search_time_out) {
             *search_time_out = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0);
@@ -176,6 +182,22 @@ std::optional<std::vector<uint64_t>> match_message(
         if (log) log->warn("event_bridge: matching engine search failed: {}", e.what());
         return std::nullopt;
     }
+}
+
+// Convenience overload: makes its own one-shot event_sink. Fine for a
+// caller that only matches a single message against `tree` (row-mode
+// deserialize_and_match() below, called once per input message) - no
+// reuse to benefit from there.
+template <typename Reader>
+std::optional<std::vector<uint64_t>> match_message(
+    const matching_engine& tree,
+    const attribute_schema& schema,
+    Reader& reader,
+    std::shared_ptr<spdlog::logger> log,
+    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr)
+{
+    auto event = tree.make_event();
+    return match_message(tree, schema, reader, *event, log, search_time_out);
 }
 
 // Top-level entry: deserialize raw bytes according to format, then match.

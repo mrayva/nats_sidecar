@@ -82,9 +82,38 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     std::chrono::nanoseconds total_search_time{0};
     bool any_search_time = false;
 
+    // Timing every row's tree.search() call (std::chrono::steady_clock::now(),
+    // twice per row) is itself real, measurable overhead on this workload -
+    // confirmed via perf, ~4% of total CPU - because individual searches run
+    // well under a microsecond here, so the act of timing competes with the
+    // thing being timed. Sample instead: only request timing for 1 in
+    // kSearchTimeSampleStride rows, then scale the summed sample up by that
+    // stride below to estimate the batch's total - worker_pool's avg_match_us
+    // (computed from this against the batch's *true*, un-sampled row count,
+    // via rows_searched_out) becomes a statistical estimate rather than an
+    // exact average, a standard and worthwhile trade here given how large a
+    // fraction of the measured quantity the measurement itself was.
+    constexpr std::size_t kSearchTimeSampleStride = 8;
+
+    // One event_sink for the whole batch, reused across every row instead
+    // of a fresh one per row, when the engine safely supports it
+    // (matching_engine::reuses_events() - true for a-tree, false for
+    // be-tree; see that method's own comment for why). search() recycles
+    // a reused event_sink in place rather than reallocating - a real,
+    // separately-measured per-row cost this batch's rows no longer each
+    // pay on their own. Engines that don't support reuse keep getting a
+    // fresh event_sink every row via match_message()'s own make_event()
+    // overload, exactly as before this change.
+    const bool reuse_event = tree.reuses_events();
+    std::unique_ptr<event_sink> reused_event = reuse_event ? tree.make_event() : nullptr;
+
     auto process_row = [&](std::size_t i, auto&& row) -> bool {
         std::optional<std::chrono::nanoseconds> row_search_time;
-        auto matches = match_message(tree, schema, row, log, &row_search_time);
+        const bool sample_timing = search_time_out && (i % kSearchTimeSampleStride == 0);
+        auto* timing_out = sample_timing ? &row_search_time : nullptr;
+        auto matches = reuse_event
+            ? match_message(tree, schema, row, *reused_event, log, timing_out)
+            : match_message(tree, schema, row, log, timing_out);
         if (row_search_time) {
             total_search_time += *row_search_time;
             any_search_time = true;
@@ -112,7 +141,9 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     }
     if (!ok) return std::nullopt;
 
-    if (search_time_out && any_search_time) *search_time_out = total_search_time;
+    if (search_time_out && any_search_time) {
+        *search_time_out = total_search_time * kSearchTimeSampleStride;
+    }
     return result;
 }
 

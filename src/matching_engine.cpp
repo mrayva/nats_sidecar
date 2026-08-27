@@ -85,11 +85,22 @@ public:
     std::vector<uint64_t> search(event_sink& event) const override {
         auto& sink = static_cast<atree_event_sink&>(event);
         try {
-            return m_tree.search(sink.native());
+            // search_reusing() (not search()) unconditionally: it never
+            // frees `sink`'s underlying builder itself - ownership stays
+            // with `sink` (an atree_event_sink, via its atree::EventBuilder
+            // member's own RAII destructor) either way, so this is exactly
+            // as correct for a one-shot event_sink (used for a single row,
+            // then destroyed - its destructor frees the builder once, same
+            // as before) as for one reused across many rows (see
+            // reuses_events() below) - and only the latter actually
+            // benefits from the recycling search_reusing() enables.
+            return m_tree.search_reusing(sink.native());
         } catch (const atree::Error& e) {
             throw matching_engine_error(e.what());
         }
     }
+
+    bool reuses_events() const override { return true; }
 
 private:
     atree::Tree m_tree;

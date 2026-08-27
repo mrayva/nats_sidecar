@@ -866,19 +866,59 @@ easy further headroom:
   more attributes would show more) - not a lever that moved this benchmark, the same honest
   pattern as the write-side raw-copy fix above.
 
-- **Allocator, beyond the fix above - identified further real cost, not yet acted on.**
-  `matching_engine::make_event()` returns `std::unique_ptr<event_sink>` - a heap allocation for the
-  sink object itself on *every* row, on top of whatever the concrete engine's own event builder
-  allocates internally (a-tree's `EventBuilder::new()`/`with_float()` show up as some of the
-  largest single symbols in the profile, ~4.3%+3.1%). A pooled/reusable event object (avoiding the
-  per-row `make_unique`, and ideally letting a-tree's own builder be reset and reused rather than
-  rebuilt) would plausibly cut into this further, but reusing a-tree's builder specifically would
-  need an upstream a-tree change - `atree.hpp`'s own docs already note it has "no reset/reuse API,
-  single-use by design" (see the `HashMap`->`Vec` fix earlier in this file for where that comment
-  came from). A local-only fix (object-pool the `unique_ptr<event_sink>` itself, still rebuilding
-  the a-tree builder fresh inside it each time) would only address part of the cost. Not
-  implemented this session - a genuine further lever, but one that needs either a cross-repo
-  change or a smaller one worth scoping and measuring on its own rather than folding in here.
+- **Allocator, beyond the fix above - built the identified lever, upstream in a-tree.**
+  `matching_engine::make_event()` returned `std::unique_ptr<event_sink>` - a heap allocation for the
+  sink object on *every* row, on top of what the concrete engine's own event builder allocates
+  internally (a-tree's `EventBuilder::new()` was one of the largest single symbols in the profile,
+  ~4.3%). Fixed at the source rather than worked around: **`mrayva/a-tree`@`61a85fe`** adds
+  `Event::into_builder()`/`ATree::recycle_event()`, reclaiming a previously-built `Event`'s
+  already-allocated buffer as a fresh `EventBuilder` (every attribute reset to `Undefined`) in
+  place, no allocation - the buffer is a fixed-size `Box<[AttributeValue]>` sized to the tree's
+  attribute count, so it never needs to grow or shrink and is safe to reuse indefinitely.
+  `atree_search()` (the FFI boundary) no longer frees its `builder` argument or consumes its values
+  by-value - it clears the FFI-side staging `Vec` in place (keeping its allocated capacity) and
+  recycles the core `Event` via the above instead of `make_event()` when one is available from a
+  prior call, stashing the new one back for next time. `atree.hpp`'s existing one-shot
+  `search()`/`try_search()` keep their exact documented "consumed by this call" contract (now via
+  an explicit free right after `atree_search()`, since Rust no longer does that automatically); a
+  new `search_reusing()` is the opt-in path that leaves the builder valid for another row.
+  Verified upstream with two new tests (core Rust and FFI/C++ level) specifically checking that a
+  value from a prior reuse cycle never leaks into one that doesn't set it again, across three
+  reuse cycles each - plus the full existing a-tree/a-tree-ffi suites (203+14 unit, 5+1 doc, 2
+  smoke tests) unchanged.
+  
+  Wired up here: `matching_engine::reuses_events()` (new, default `false`) - `true` for a-tree
+  (whose `search()` now routes through `search_reusing()` unconditionally, safe whether or not the
+  caller actually reuses the sink - its own destructor still frees exactly once either way), left
+  `false` for be-tree (its own `Event` allocates a fresh native variable object on every *individual*
+  attribute set via its underlying C library, not once per event like a-tree - this codebase
+  doesn't have enough visibility into whether replacing an already-set slot's variable is
+  memory-safe to risk it, so be-tree keeps a fresh event per row exactly as before). A new
+  `match_message()` overload takes a caller-supplied `event_sink&`; `match_columnar_batch()` makes
+  *one* per batch (not per row) when `tree.reuses_events()`, reused across every row in that batch.
+  Full 260-test nats_sidecar suite (including the a-tree/be-tree differential-agreement matrix and
+  the multi-row-per-batch columnar tests, which already exercised values changing row to row across
+  a reused sink) passes unchanged.
+
+  **Measured real**: single-instance steady-state throughput, saturated backlog, same methodology as
+  above: **~6,150 -> ~6,950 batches/s, a ~13% single-instance gain** - `EventBuilder::new` drops out
+  of the profile's top symbols entirely. Re-ran the N=12/`--workers` sweep: the zero-loss point moved
+  from `--workers 3` to **`--workers 4`**:
+
+  | `--workers` | batches processed | batches dropped |
+  |---:|---:|---:|
+  | 6 | 206,383 (89.7%) | 23,717 (10.3%) |
+  | 5 | 218,338 (94.9%) | 11,752 (5.1%) |
+  | 4 | 230,077 (**100.0%**) | **0** |
+
+  Real, measurable progress toward `--workers 6` (was 85.8%/14.2% before this fix, now 89.7%/10.3%)
+  but not there yet - `--workers 6` and `--workers 5` both still drop some. `ATree::search()` itself
+  (not just event construction) still allocates fresh scratch vectors on *every* call
+  (`matches: Vec::with_capacity(50)`, `queues: vec![Vec::with_capacity(50); max_level-1]` -
+  core a-tree's own `atree.rs`) - a further, separately-scoped lever in the same spirit as this one,
+  not pulled in here to keep this change reviewable and its correctness risk (a second buffer-reuse
+  change, this time to the search algorithm's own scratch state, not just event construction)
+  isolated and verifiable on its own.
 
 - **Read-side msgpack unpacking - little further low-risk headroom found.** `mp_skip` and
   `ColumnarRows::advance()`'s sequential walk are already the O(n) minimum for msgpack's

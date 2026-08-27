@@ -76,6 +76,22 @@ public:
     // Matches a populated event (must have come from this same engine's
     // make_event()) against every inserted expression.
     virtual std::vector<uint64_t> search(event_sink& event) const = 0;
+
+    // Whether an event_sink from make_event() may safely be reused for many
+    // populate+search() cycles in a row (repopulating and re-searching the
+    // *same* object) instead of needing a fresh one every time - true only
+    // for an engine whose own event representation supports that safely.
+    // a-tree does (see mrayva/a-tree's ATree::recycle_event(), which
+    // atree_matching_engine::search() routes through below): reusing one
+    // event_sink across a whole columnar batch instead of allocating a
+    // fresh one per row is a real, separately-measured cost eliminated for
+    // every row after the batch's first. be-tree's own Event allocates a
+    // fresh native variable object on every individual attribute set via
+    // its underlying C library, and this codebase doesn't have enough
+    // visibility into whether replacing an already-set slot's variable is
+    // memory-safe to risk it - stays at its original default (false),
+    // meaning callers must keep making a fresh event_sink per row for it.
+    virtual bool reuses_events() const { return false; }
 };
 
 // Builds a fresh matching_engine for the given engine type and attribute
