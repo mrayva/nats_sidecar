@@ -598,12 +598,28 @@ dominated by genuinely necessary work (`atree::Tree::search()`, a-tree's own per
 inefficiency in nats_sidecar's own code.
 
 **This means the N=12 full-table "~265k rows/s sustained ceiling" measured above is now stale** -
-it was measured against the pre-fix binary and should be substantially higher (naively ~7x, though
-contention effects across 12 concurrent instances on one 12-physical-core host make a clean
-linear extrapolation unreliable - worth a fresh N=12 run, not assumed). The two follow-up levers
-noted above (raising `input_queue_max_messages`, matching publish-side burst rate to the real
-ceiling) are still the right next moves, just against a materially higher real ceiling than first
-measured.
+it was measured against the pre-fix binary. Re-ran the *exact same* N=12/`--workers 24` full-table
+benchmark (same 115,020,848-row NYSE table, same `--batch-size 500 --batch-encoding native`, same
+`sidecar.yaml`) against the fixed binary to measure the real-world impact rather than extrapolate:
+
+| | before fix | after fix |
+|---|---:|---:|
+| batches received (=published by pgnats) | 230,264 | 230,261 |
+| batches processed | 124,157 (53.9%) | 139,881 (60.8%) |
+| batches dropped (local input queue full) | 106,107 (46.1%) | 90,380 (39.2%) |
+| publish-side aggregate rate | 9.13M rows/s | 10.28M rows/s |
+
+Loss dropped but did **not** go to zero, and that's expected rather than a sign the fix
+underperformed: `--workers 24` was deliberately chosen in the original test to *saturate* the old
+~265k rows/s ceiling by publishing far faster than N=12 single-threaded instances could ever drain
+- and it still publishes (here, 10.28M rows/s aggregate) well above the new, ~7.3x-higher
+per-instance ceiling once contention across 12 concurrent instances on one 12-physical-core host is
+accounted for. `slow_consumers=0` in `nats-server`'s varz confirms the loss mechanism is still
+exactly the same one as before (local per-instance input-queue overflow, not NATS transport) - just
+quantitatively smaller. The two follow-up levers noted above (raising `input_queue_max_messages`,
+matching publish-side burst rate/`--workers` to the real per-instance ceiling instead of the old
+one) remain the right next moves for actually eliminating loss at this ingest rate, and are still
+untested as of this writing.
 
 ## Schema Generation
 
