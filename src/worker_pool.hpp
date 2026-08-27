@@ -70,9 +70,12 @@ public:
 
     // Enqueue a payload for worker processing (move semantics). Plain
     // queue-group mode: no ack concept, matching today's at-most-once
-    // behavior exactly. Returns false when shutdown has begun or a queue
-    // limit is reached.
-    bool enqueue(std::vector<char> payload);
+    // behavior exactly. `columnar` marks this payload as a pg_zerialize-style
+    // columnar batch (see event_bridge.hpp's deserialize_and_match_columnar) -
+    // set per-message from the originating connection's own `columnar` flag,
+    // since one process can mix columnar and non-columnar connections.
+    // Returns false when shutdown has begun or a queue limit is reached.
+    bool enqueue(std::vector<char> payload, bool columnar = false);
 
     // JetStream-consumer-mode overload: the payload's originating js_message
     // and the specific connection's own js_sub travel with it so the worker
@@ -82,7 +85,7 @@ public:
     // of js-mode connections live at once, each with its own js_sub, so
     // this is per-message rather than a single pool-wide handle.
     bool enqueue(std::vector<char> payload, nats_asio::js_message js_msg,
-                 nats_asio::ijs_subscription_sptr js_sub);
+                 nats_asio::ijs_subscription_sptr js_sub, bool columnar = false);
 
     // Wait for every accepted publication coroutine to complete.
     asio::awaitable<bool> wait_for_publications(std::chrono::milliseconds timeout);
@@ -119,6 +122,7 @@ private:
         std::vector<char> payload;
         std::optional<nats_asio::js_message> js_msg;
         nats_asio::ijs_subscription_sptr js_sub;
+        bool columnar = false;
     };
     bool enqueue_impl(queued_message qm);
 

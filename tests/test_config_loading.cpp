@@ -251,6 +251,7 @@ TEST(config_loading, effective_connections_synthesizes_core_mode_from_legacy_fie
     sidecar::config cfg;
     cfg.input_subjects = {"sensor.data"};
     cfg.input_queue_group = "workers";
+    cfg.input_columnar = true;
 
     auto conns = cfg.effective_connections();
     ASSERT_EQ(conns.size(), 1u);
@@ -259,6 +260,7 @@ TEST(config_loading, effective_connections_synthesizes_core_mode_from_legacy_fie
     EXPECT_FALSE(conns[0].jetstream());
     EXPECT_EQ(conns[0].subjects, (std::vector<std::string>{"sensor.data"}));
     EXPECT_EQ(conns[0].queue_group, "workers");
+    EXPECT_TRUE(conns[0].columnar);
 }
 
 TEST(config_loading, effective_connections_synthesizes_js_mode_when_input_stream_set) {
@@ -309,6 +311,7 @@ connections:
     mode: core
     subjects: [telemetry.in]
     queue_group: telemetry-workers
+    columnar: true
 output_prefix: matched
 attributes:
   - name: temperature
@@ -330,6 +333,34 @@ attributes:
     EXPECT_FALSE(cfg.connections[1].jetstream());
     EXPECT_EQ(cfg.connections[1].subjects, (std::vector<std::string>{"telemetry.in"}));
     EXPECT_EQ(cfg.connections[1].queue_group, "telemetry-workers");
+    EXPECT_TRUE(cfg.connections[1].columnar);
+    EXPECT_FALSE(cfg.connections[0].columnar);  // defaults false when omitted
+}
+
+TEST(config_loading, legacy_input_columnar_yaml_key_sets_flat_field) {
+    temp_yaml_file file(R"(
+input_subjects: [sensor.data]
+input_columnar: true
+attributes:
+  - name: temperature
+    type: float
+)");
+    auto cfg = sidecar::load_config(file.path());
+    EXPECT_TRUE(cfg.input_columnar);
+    EXPECT_TRUE(cfg.effective_connections().front().columnar);
+}
+
+TEST(config_loading, connections_and_input_columnar_both_present_throws) {
+    temp_yaml_file file(R"(
+connections:
+  - name: a
+    subjects: [a.in]
+input_columnar: true
+attributes:
+  - name: temperature
+    type: float
+)");
+    EXPECT_THROW(sidecar::load_config(file.path()), std::runtime_error);
 }
 
 TEST(config_loading, connections_combined_with_legacy_input_subjects_throws) {

@@ -78,13 +78,14 @@ void worker_pool::stop() {
     m_log->info("Worker pool stopped");
 }
 
-bool worker_pool::enqueue(std::vector<char> payload) {
-    return enqueue_impl(queued_message{std::move(payload), std::nullopt, nullptr});
+bool worker_pool::enqueue(std::vector<char> payload, bool columnar) {
+    return enqueue_impl(queued_message{std::move(payload), std::nullopt, nullptr, columnar});
 }
 
 bool worker_pool::enqueue(std::vector<char> payload, nats_asio::js_message js_msg,
-                          nats_asio::ijs_subscription_sptr js_sub) {
-    return enqueue_impl(queued_message{std::move(payload), std::move(js_msg), std::move(js_sub)});
+                          nats_asio::ijs_subscription_sptr js_sub, bool columnar) {
+    return enqueue_impl(queued_message{
+        std::move(payload), std::move(js_msg), std::move(js_sub), columnar});
 }
 
 bool worker_pool::enqueue_impl(queued_message qm) {
@@ -206,20 +207,43 @@ void worker_pool::worker_loop(unsigned int worker_id) {
 
         std::span<const char> payload_span(qm.payload.data(), qm.payload.size());
 
+        // row_matches unifies both paths: a non-columnar message always
+        // yields 0 or 1 entries (its own payload, verbatim - the exact
+        // behavior this replaces); a columnar message yields 0..N entries,
+        // one per row that matched something. Everything from here on
+        // (stats, malformed/empty/matched branches, the publish coroutine)
+        // is one shared code path for both, differing only in how many
+        // entries row_matches holds.
         std::optional<std::chrono::nanoseconds> search_time;
-        auto matches = deserialize_and_match(
-            *snap->tree, m_schema, m_format, payload_span, m_log, &search_time);
+        std::size_t rows_searched = 1;
+        std::optional<std::vector<row_match>> row_matches;
+
+        if (qm.columnar) {
+            row_matches = deserialize_and_match_columnar(
+                *snap->tree, m_schema, m_format, payload_span, m_log,
+                &search_time, &rows_searched);
+        } else {
+            auto matches = deserialize_and_match(
+                *snap->tree, m_schema, m_format, payload_span, m_log, &search_time);
+            if (matches) {
+                row_matches.emplace();
+                if (!matches->empty()) {
+                    row_matches->push_back({std::move(*matches), std::move(qm.payload)});
+                }
+            }
+        }
 
         if (search_time) {
             m_match_time_ns_total.fetch_add(
                 static_cast<uint64_t>(search_time->count()), std::memory_order_relaxed);
-            m_match_time_count.fetch_add(1, std::memory_order_relaxed);
+            m_match_time_count.fetch_add(rows_searched, std::memory_order_relaxed);
         }
 
         m_processed.fetch_add(1, std::memory_order_relaxed);
 
-        if (!matches) {
-            // Malformed payload - a poison message that will never succeed
+        if (!row_matches) {
+            // Malformed payload (or, for a columnar batch, any row's match
+            // failing outright) - a poison message that will never succeed
             // no matter how many times it's redelivered. term(), not ack:
             // this is a real, visible "permanently gave up" signal (shows
             // up in js_get_consumer_info's stats) rather than a silent drop.
@@ -229,17 +253,17 @@ void worker_pool::worker_loop(unsigned int worker_id) {
             continue;
         }
 
-        if (matches->empty()) {
-            // Legitimately processed, nothing matched - ack now. Otherwise
-            // every non-matching message (most real traffic, for any given
-            // filter) would sit unacked until ack_wait and redeliver
-            // forever for no reason.
+        if (row_matches->empty()) {
+            // Legitimately processed, nothing matched (in any row) - ack
+            // now. Otherwise every non-matching message (most real traffic,
+            // for any given filter) would sit unacked until ack_wait and
+            // redeliver forever for no reason.
             if (qm.js_msg) spawn_ack(qm.js_sub, std::move(*qm.js_msg));
             qm.payload.clear();
             continue;
         }
 
-        m_matched.fetch_add(1, std::memory_order_relaxed);
+        m_matched.fetch_add(row_matches->size(), std::memory_order_relaxed);
 
         const auto previous_inflight = m_publish_counters->publish_inflight.fetch_add(
             1, std::memory_order_acq_rel);
@@ -265,8 +289,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         // I/O thread only after the write that made the message durable
         // downstream actually succeeded is what keeps ack ordered strictly
         // after publish, not a separate, potentially-racing step.
-        auto matched_ids = std::move(*matches);
-        auto payload_copy = std::move(qm.payload);
+        auto matches_to_publish = std::move(*row_matches);
         auto snap_copy = std::move(snap);
         auto conn = m_conn;
         auto log = m_log;
@@ -277,8 +300,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
 
         // Post publish work to the ASIO I/O thread
         asio::co_spawn(m_ioc,
-            [matched_ids = std::move(matched_ids),
-             payload_copy = std::move(payload_copy),
+            [matches_to_publish = std::move(matches_to_publish),
              snap_copy = std::move(snap_copy),
              conn = std::move(conn),
              log,
@@ -286,11 +308,22 @@ void worker_pool::worker_loop(unsigned int worker_id) {
              backpressure_timeout,
              js_sub = std::move(js_sub),
              js_msg = std::move(js_msg)]() mutable -> asio::awaitable<void> {
-                std::span<const char> pub_payload(payload_copy.data(), payload_copy.size());
                 bool publish_ok = false;
                 try {
-                    auto frames = build_pub_frames(
-                        matched_ids, snap_copy->output_subjects, pub_payload);
+                    // One combined wire buffer for every row's frames -
+                    // exactly one write_raw() below regardless of how many
+                    // rows matched, preserving the existing one-write/one-
+                    // backpressure-check/one-ack-or-term-per-input-message
+                    // invariant whether this message represented 1 row
+                    // (today) or N rows (columnar).
+                    pub_frames frames;
+                    for (const auto& rm : matches_to_publish) {
+                        auto row_frames = build_pub_frames(
+                            rm.matched_ids, snap_copy->output_subjects,
+                            std::span<const char>(rm.payload.data(), rm.payload.size()));
+                        frames.wire += row_frames.wire;
+                        frames.count += row_frames.count;
+                    }
                     if (!frames.wire.empty()) {
                         if (conn->is_backpressure_active()) {
                             auto drain_status = co_await conn->wait_for_drain(
@@ -315,11 +348,11 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                             publish_ok = true;
                         }
                     } else {
-                        // Every matched id was missing from output_subjects
-                        // (e.g. removed between search and publish) - no
-                        // frames were actually written, but nothing failed
-                        // either; the input message was still legitimately
-                        // handled.
+                        // Every matched id (across every row) was missing
+                        // from output_subjects (e.g. removed between search
+                        // and publish) - no frames were actually written,
+                        // but nothing failed either; the input message was
+                        // still legitimately handled.
                         publish_ok = true;
                     }
                 } catch (const std::exception& e) {

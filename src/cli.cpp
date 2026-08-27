@@ -21,6 +21,8 @@ cxxopts::Options build_cli_options() {
         ("engine", "Matching engine (atree|betree)", cxxopts::value<std::string>())
         ("output-prefix", "Output subject prefix", cxxopts::value<std::string>())
         ("queue-group", "Input queue group for load balancing", cxxopts::value<std::string>())
+        ("input-columnar", "Treat input as pg_zerialize-style columnar batches (see README) - "
+                            "not supported with format=bson")
         ("input-stream", "JetStream stream name for input; enables the durable-consumer "
                           "(loss-proof) input mode instead of plain queue-group subscribe",
                           cxxopts::value<std::string>())
@@ -71,7 +73,7 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     // already defines a 'connections' list, since there's no way to know
     // which named connection a bare flag like --input-stream should target.
     static constexpr const char* legacy_input_flags[] = {
-        "input-subject", "queue-group", "input-stream", "input-stream-storage",
+        "input-subject", "queue-group", "input-columnar", "input-stream", "input-stream-storage",
         "consumer-durable-name", "consumer-deliver-subject", "consumer-deliver-group",
         "consumer-max-ack-pending", "consumer-ack-wait"
     };
@@ -91,6 +93,7 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("input-subject"))        cfg.input_subjects = result["input-subject"].as<std::vector<std::string>>();
     if (result.count("output-prefix"))        cfg.output_prefix = result["output-prefix"].as<std::string>();
     if (result.count("queue-group"))          cfg.input_queue_group = result["queue-group"].as<std::string>();
+    if (result.count("input-columnar"))       cfg.input_columnar = true;
     if (result.count("input-stream"))              cfg.input_stream = result["input-stream"].as<std::string>();
     if (result.count("input-stream-storage"))      cfg.input_stream_storage = result["input-stream-storage"].as<std::string>();
     if (result.count("consumer-durable-name"))     cfg.consumer_durable_name = result["consumer-durable-name"].as<std::string>();
@@ -218,6 +221,19 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
         }
         if (c.stream_storage != "file" && c.stream_storage != "memory") {
             return fmt::format("connection '{}': stream_storage must be 'file' or 'memory'", c.name);
+        }
+    }
+
+    // Columnar batching materializes a root-level array internally
+    // (zerialize::expand_columnar) - BSON's wire format cannot round-trip a
+    // root-level array (a document and an array are byte-identical on the
+    // wire; only a *parent* element's header records which one a value is,
+    // and the root has no parent), so this combination is rejected outright
+    // rather than silently misinterpreting BSON columnar traffic.
+    for (const auto& c : conns) {
+        if (c.columnar && cfg.format == binary_format::bson) {
+            return fmt::format(
+                "connection '{}': columnar batching is not supported with format=bson", c.name);
         }
     }
 

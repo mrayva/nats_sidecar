@@ -48,11 +48,15 @@ private:
     // start()'s loop and the equivalent test-access shims.
     asio::awaitable<bool> subscribe_to_inputs(input_connection conn);
 
-    // Callback: incoming data message on the input subject
+    // Callback: incoming data message on the input subject. columnar mirrors
+    // the originating connection's own input_connection::columnar flag,
+    // captured per-connection at subscribe time (a process can mix columnar
+    // and non-columnar connections).
     asio::awaitable<void> on_data_message(
         std::string_view subject,
         std::optional<std::string_view> reply_to,
-        std::span<const char> payload);
+        std::span<const char> payload,
+        bool columnar);
 
     // Durable JetStream consumer input path (loss-proof alternative to
     // subscribe_to_inputs()'s plain queue-group subscribe - selected per
@@ -81,8 +85,9 @@ private:
     // that long. js_sub is this specific connection's own subscription
     // handle (captured per-connection at subscribe time), passed through to
     // worker_pool so ack/nak/term resolve against the right consumer.
+    // columnar mirrors this connection's own input_connection::columnar flag.
     asio::awaitable<void> on_js_data_message(
-        nats_asio::ijs_subscription_sptr js_sub, const nats_asio::js_message& msg);
+        nats_asio::ijs_subscription_sptr js_sub, const nats_asio::js_message& msg, bool columnar);
 
     // Callback: subscription request from a client (request/reply pattern)
     asio::awaitable<void> on_subscribe_request(

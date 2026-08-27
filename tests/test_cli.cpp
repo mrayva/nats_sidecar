@@ -22,6 +22,7 @@ TEST(cli, apply_cli_overrides_applies_all_flags) {
         "--input-subject", "sensor.data",
         "--output-prefix", "sensor.filtered",
         "--queue-group", "workers",
+        "--input-columnar",
         "--subscribe-subject", "custom.subscribe",
         "--unsubscribe-subject", "custom.unsubscribe",
         "--lease-bucket", "my-leases",
@@ -51,6 +52,7 @@ TEST(cli, apply_cli_overrides_applies_all_flags) {
     EXPECT_EQ(cfg.input_subjects[0], "sensor.data");
     EXPECT_EQ(cfg.output_prefix, "sensor.filtered");
     EXPECT_EQ(cfg.input_queue_group, "workers");
+    EXPECT_TRUE(cfg.input_columnar);
     EXPECT_EQ(cfg.subscribe_subject, "custom.subscribe");
     EXPECT_EQ(cfg.unsubscribe_subject, "custom.unsubscribe");
     EXPECT_EQ(cfg.lease_bucket, "my-leases");
@@ -97,6 +99,7 @@ TEST(cli, apply_cli_overrides_leaves_unset_fields_at_default) {
     EXPECT_EQ(cfg.nats_port, defaults.nats_port);
     EXPECT_EQ(cfg.lease_bucket, defaults.lease_bucket);
     EXPECT_EQ(cfg.registry_bucket, defaults.registry_bucket);
+    EXPECT_EQ(cfg.input_columnar, defaults.input_columnar);
     EXPECT_EQ(cfg.format, defaults.format);
 }
 
@@ -273,6 +276,37 @@ TEST(cli, finalize_and_validate_config_accepts_valid_config) {
     EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
 }
 
+TEST(cli, finalize_and_validate_config_rejects_columnar_with_bson_format) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"a.in"};
+    a.columnar = true;
+    cfg.connections = {a};
+    cfg.format = sidecar::binary_format::bson;
+    cfg.attributes = {{"value", sidecar::attribute_type::integer}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("columnar"), std::string::npos);
+    EXPECT_NE(err->find("bson"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_accepts_columnar_with_non_bson_format) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"a.in"};
+    a.columnar = true;
+    cfg.connections = {a};
+    cfg.format = sidecar::binary_format::msgpack;
+    cfg.attributes = {{"value", sidecar::attribute_type::integer}};
+
+    EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
+}
+
 TEST(cli, effective_worker_count_uses_configured_value_when_nonzero) {
     sidecar::config cfg;
     cfg.worker_threads = 7;
@@ -424,6 +458,22 @@ TEST(cli, apply_cli_overrides_rejects_input_subject_flag_when_connections_config
     auto err = sidecar::apply_cli_overrides(cfg, result);
     ASSERT_TRUE(err.has_value());
     EXPECT_NE(err->find("input-subject"), std::string::npos);
+    EXPECT_NE(err->find("connections"), std::string::npos);
+}
+
+TEST(cli, apply_cli_overrides_rejects_input_columnar_flag_when_connections_configured) {
+    auto options = sidecar::build_cli_options();
+    auto result = parse_args(options, {"--input-columnar"});
+
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.subjects = {"a.in"};
+    cfg.connections = {a};
+
+    auto err = sidecar::apply_cli_overrides(cfg, result);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("input-columnar"), std::string::npos);
     EXPECT_NE(err->find("connections"), std::string::npos);
 }
 

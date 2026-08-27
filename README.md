@@ -192,6 +192,7 @@ connections:
     mode: core
     subjects: ["telemetry.in"]
     queue_group: telemetry-workers          # optional
+    columnar: true                          # optional, default false - see "Columnar batch input"
 
 output_prefix: "matched"    # still one shared value - see below
 attributes:
@@ -219,6 +220,37 @@ apply to the legacy single-connection shape; they're rejected with an error if t
 file already defines `connections:`, since there's no way to know which named connection a bare
 flag should target. Every other flag (`--workers`, `--log-level`, `--lease-ttl`, ...) still works
 normally alongside `connections:`.
+
+### Columnar batch input
+
+Setting `columnar: true` on a connection (or the legacy flat `input_columnar: true` /
+`--input-columnar` for a single-connection config) tells that connection's messages are
+pg_zerialize-style columnar batches - `{"col1":[v,v,...],"col2":[v,v,...]}`, N rows collapsed into
+one message, exactly the shape `nats_publish_from_sql.py --batch-size N --batch-encoding native`
+produces - instead of one scalar-attribute row per message. The sidecar unpacks each batch into
+its N rows and matches every row independently: a matching row is published as its own standalone
+message (the same shape a non-batched connection would have sent), to whichever subscriptions that
+*specific row* matched - not the whole batch republished verbatim. Orthogonal to `mode` (js/core);
+a batch's JetStream message (if js-mode) is acked once, after every row's matches have been
+published, regardless of how many rows matched.
+
+Supported for 6 of the 7 `format` values: msgpack, cbor, flexbuffers, zera, ion, beve. **Not
+supported for `format: bson`** (rejected at startup with a clear error) - unpacking works by
+materializing a root-level array internally, and BSON's wire format cannot round-trip a root-level
+array (a document and an array are byte-identical on the wire; only a *parent* element's header
+records which one a value is, and the root has no parent).
+
+Two things worth knowing before enabling it:
+- A payload that doesn't actually match the columnar contract (every field an array, all the same
+  length) is rejected as malformed - same handling as any other unparseable message (`term()` in
+  js-mode, dropped in core-mode). One narrow case this can't distinguish: a normal, non-batched
+  message whose *entire* schema happens to be `string_list`/`integer_list`-typed (already
+  legitimately array-shaped) sent by mistake to a columnar connection would be silently
+  misinterpreted as a batch rather than rejected - a misconfiguration scenario, not a normal
+  operational path, and not specially guarded against.
+- `publish_max_inflight` now bounds one *batch* in flight, not one *message* - a single credit can
+  cover up to (rows matched) x (subscriptions per row) outbound frames instead of just
+  (subscriptions per row), so size it accordingly for a columnar connection carrying large batches.
 
 ### Attribute Types
 
@@ -463,9 +495,10 @@ mean real oversubscription, not just more config.
 **Practical, hardware-bounded conclusion for this box**: the highest *reliable* (not just fast)
 full-table-cycling throughput found is ~360k rows/s, using `--workers 8` paired with N=24
 core-mode sidecar instances (~0.2% residual loss). Going faster than that on this hardware would
-need either more CPU cores (to add consumer instances without oversubscribing) or `nats_sidecar`
-gaining columnar-batch matching support so `--batch-size` becomes usable - not more tuning of the
-current knobs.
+need either more CPU cores (to add consumer instances without oversubscribing), or using
+`--batch-size` now that `nats_sidecar` supports columnar-batch matching (see "Columnar batch
+input" below) to cut the per-row publish overhead this whole investigation was bottlenecked on -
+not more tuning of the current knobs.
 
 **Fixing the consumer count at N=12 (this host's physical core count) and sweeping `--workers`
 down instead pinpoints the boundary precisely**, rather than just bracketing it from above:
@@ -484,10 +517,8 @@ throughput, is what actually trips Slow Consumer.
 
 `nats_publish_from_sql.py --batch-size` (opt-in row batching, collapses N rows into one columnar
 message per subject: `{"col1":[v,v,...],"col2":[v,v,...]}` instead of one row-object message per
-row) was deliberately **not** tested against this sidecar setup - it changes the wire format in a
-way `nats_sidecar`'s current per-message scalar-attribute matching can't interpret as multiple
-candidate rows (it would need columnar-unbatching support added to `worker_pool`/the matching
-path first, not built as part of this investigation).
+row) was not tested against this sidecar setup as part of *this* investigation, but is now a
+supported input mode - see "Columnar batch input" below - not left as a follow-up.
 
 **Practical takeaway for a periodic full-table/snapshot flush**: N=12 core-mode instances sharing
 one `queue_group`, paired with `--workers` in the 4-6 range, is the cleanest reliable

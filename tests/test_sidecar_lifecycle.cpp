@@ -172,8 +172,9 @@ struct sidecar_engine_test_access {
 
     static asio::awaitable<void> on_js_data_message(sidecar::sidecar_engine& engine,
                                                       nats_asio::ijs_subscription_sptr js_sub,
-                                                      const nats_asio::js_message& msg) {
-        return engine.on_js_data_message(js_sub, msg);
+                                                      const nats_asio::js_message& msg,
+                                                      bool columnar = false) {
+        return engine.on_js_data_message(js_sub, msg, columnar);
     }
 
     static nats_asio::ijs_subscription_sptr input_js_sub(const sidecar::sidecar_engine& engine) {
@@ -189,8 +190,9 @@ struct sidecar_engine_test_access {
     }
 
     static asio::awaitable<void> on_data_message(sidecar::sidecar_engine& engine,
-                                                  std::span<const char> payload) {
-        return engine.on_data_message("sensor.data", std::nullopt, payload);
+                                                  std::span<const char> payload,
+                                                  bool columnar = false) {
+        return engine.on_data_message("sensor.data", std::nullopt, payload, columnar);
     }
 
     static asio::awaitable<void> on_subscribe_request(sidecar::sidecar_engine& engine,

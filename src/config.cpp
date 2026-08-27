@@ -39,6 +39,7 @@ std::vector<input_connection> config::effective_connections() const {
     c.mode = input_stream.empty() ? "core" : "js";
     c.subjects = input_subjects;
     c.queue_group = input_queue_group;
+    c.columnar = input_columnar;
     c.stream = input_stream;
     c.consumer_durable_name = consumer_durable_name;
     c.consumer_deliver_subject = consumer_deliver_subject;
@@ -56,7 +57,7 @@ namespace {
 // old flat shape, since merging the two would be ambiguous.
 bool has_legacy_input_fields(const YAML::Node& root) {
     static constexpr const char* legacy_keys[] = {
-        "input_subjects", "input_queue_group", "input_stream",
+        "input_subjects", "input_queue_group", "input_columnar", "input_stream",
         "consumer_durable_name", "consumer_deliver_subject",
         "consumer_deliver_group", "consumer_max_ack_pending",
         "consumer_ack_wait_seconds", "input_stream_storage"
@@ -99,6 +100,7 @@ input_connection parse_connection(const YAML::Node& node) {
     }
 
     if (auto n = node["queue_group"]) c.queue_group = n.as<std::string>();
+    if (auto n = node["columnar"])    c.columnar = n.as<bool>();
 
     if (auto n = node["stream"])                   c.stream = n.as<std::string>();
     if (auto n = node["consumer_durable_name"])    c.consumer_durable_name = n.as<std::string>();
@@ -165,6 +167,7 @@ config load_config(const std::string& path) {
     }
 
     if (auto n = root["input_queue_group"]) cfg.input_queue_group = n.as<std::string>();
+    if (auto n = root["input_columnar"])    cfg.input_columnar = n.as<bool>();
 
     if (auto n = root["input_stream"])             cfg.input_stream = n.as<std::string>();
     if (auto n = root["consumer_durable_name"])    cfg.consumer_durable_name = n.as<std::string>();

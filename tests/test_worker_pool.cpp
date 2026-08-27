@@ -37,6 +37,17 @@ std::vector<char> matching_payload(int value) {
                              reinterpret_cast<const char*>(buf.data()) + buf.size());
 }
 
+// A pg_zerialize-style columnar batch: {"value": [v, v, ...]}.
+std::vector<char> columnar_payload(std::vector<int> values) {
+    zerialize::dyn::Value::Array arr;
+    arr.reserve(values.size());
+    for (int v : values) arr.push_back(zerialize::dyn::Value(v));
+    auto buf = zerialize::serialize<zerialize::MsgPack>(
+        zerialize::dyn::Value::map({{"value", zerialize::dyn::Value::array(std::move(arr))}}));
+    return std::vector<char>(reinterpret_cast<const char*>(buf.data()),
+                             reinterpret_cast<const char*>(buf.data()) + buf.size());
+}
+
 nats_asio::js_message js_message_with(uint64_t stream_seq, std::vector<char> payload) {
     nats_asio::js_message msg;
     msg.msg.payload = std::move(payload);
@@ -241,6 +252,153 @@ TEST(worker_pool, publish_failure_is_counted_and_inflight_released) {
     EXPECT_EQ(stats.published, 0u);
     EXPECT_EQ(stats.publish_failures, 1u);
     EXPECT_EQ(stats.publish_inflight, 0u);
+}
+
+// --- Columnar batches (enqueue(..., columnar=true)) ---
+
+TEST(worker_pool, columnar_batch_matches_each_row_independently_and_writes_once) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::atomic<int> write_raw_calls{0};
+    std::string last_wire;
+    conn->on_write_raw = [&](std::span<const char> data) -> asio::awaitable<nats_asio::status> {
+        write_raw_calls.fetch_add(1);
+        last_wire.assign(data.data(), data.size());
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    // Row 0 (5) doesn't match; rows 1 and 2 (42, 100) do.
+    ASSERT_TRUE(pool.enqueue(columnar_payload({5, 42, 100}), /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published >= 2; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.processed, 1u) << "one input message, regardless of row count";
+    EXPECT_EQ(stats.matched, 2u) << "two rows matched something";
+    EXPECT_EQ(stats.published, 2u);
+    EXPECT_EQ(write_raw_calls.load(), 1)
+        << "every matching row's frames must land in one combined write_raw call";
+    EXPECT_NE(last_wire.find("PUB output.1 "), std::string::npos);
+    // Both rows matched the same subscription (id 1) but with different
+    // payload bytes - the combined wire must contain two distinct "PUB
+    // output.1 ..." frames, not one deduplicated/overwritten frame.
+    auto first = last_wire.find("PUB output.1 ");
+    auto second = last_wire.find("PUB output.1 ", first + 1);
+    EXPECT_NE(second, std::string::npos);
+}
+
+TEST(worker_pool, columnar_batch_with_no_matching_rows_publishes_nothing) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::atomic<int> write_raw_calls{0};
+    conn->on_write_raw = [&](std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        write_raw_calls.fetch_add(1);
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(columnar_payload({1, 2, 3}), /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().processed > 0; }, std::chrono::seconds(2)));
+    ioc.restart();
+    ioc.run_for(std::chrono::milliseconds(50));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.matched, 0u);
+    EXPECT_EQ(stats.published, 0u);
+    EXPECT_EQ(write_raw_calls.load(), 0);
+}
+
+TEST(worker_pool, columnar_batch_malformed_shape_is_termed_like_a_poison_message) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
+    pool.start();
+    // A normal (non-columnar) scalar payload sent to a columnar connection -
+    // "value" is a bare int, not an array, so expand_columnar rejects it.
+    auto bad_payload = matching_payload(42);
+    ASSERT_TRUE(pool.enqueue(bad_payload, js_message_with(21, bad_payload), js_sub, /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().match_failures > 0; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return !js_sub->termed_stream_seqs.empty(); }, std::chrono::seconds(2)));
+    pool.stop();
+
+    EXPECT_EQ(js_sub->termed_stream_seqs, (std::vector<uint64_t>{21}));
+    EXPECT_TRUE(js_sub->acked_stream_seqs.empty());
+}
+
+TEST(worker_pool, columnar_match_time_count_reflects_real_row_count_not_message_count) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
+
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(columnar_payload({1, 2, 3, 4, 5}), /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().processed > 0; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.processed, 1u);
+    EXPECT_EQ(stats.match_time_count, 5u)
+        << "avg_match_us must reflect the 5 real per-row searches, not the 1 input message";
+}
+
+TEST(worker_pool, js_mode_columnar_batch_acks_original_message_once_regardless_of_row_count) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->on_write_raw = [](std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    auto payload = columnar_payload({42, 100, 200});  // 3 rows, all matching
+    ASSERT_TRUE(pool.enqueue(payload, js_message_with(30, payload), js_sub, /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published >= 3; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return !js_sub->acked_stream_seqs.empty(); }, std::chrono::seconds(2)));
+    pool.stop();
+
+    // One JetStream message, one ack - never one per row.
+    EXPECT_EQ(js_sub->acked_stream_seqs, (std::vector<uint64_t>{30}));
+    EXPECT_TRUE(js_sub->nakked_stream_seqs.empty());
+    EXPECT_TRUE(js_sub->termed_stream_seqs.empty());
 }
 
 TEST(worker_pool, backpressure_timeout_fails_publish_without_writing) {

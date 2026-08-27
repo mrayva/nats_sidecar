@@ -180,4 +180,54 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
     std::shared_ptr<spdlog::logger> log,
     std::optional<std::chrono::nanoseconds>* search_time_out = nullptr);
 
+// One row of a columnar batch that matched at least one subscription.
+struct row_match {
+    std::vector<uint64_t> matched_ids;
+    std::vector<char> payload;   // this row's own standalone bytes, same format as the input batch
+};
+
+// Writes `row` (one element of a zerialize::expand_columnar() result - a
+// normal row-shaped map reader) into its own standalone document of the
+// same protocol. Mirrors zerialize::translate<DstP>()'s internal body
+// (RootSerializer + Writer + write_value + finish()) but returns raw bytes
+// instead of wrapping them in a Deserializer, since worker_pool publishes
+// raw spans, not Deserializer objects.
+template <typename Protocol, typename Reader>
+std::vector<char> serialize_row(const Reader& row) {
+    typename Protocol::RootSerializer rs{};
+    typename Protocol::Serializer w{rs};
+    zerialize::write_value(row, w);
+    zerialize::ZBuffer out = rs.finish();
+    const char* data = reinterpret_cast<const char*>(out.data());
+    return std::vector<char>(data, data + out.size());
+}
+
+// Top-level entry for a columnar-batched connection: unpacks `payload` (a
+// zerialize columnar record - see zerialize/columnar.hpp) into its N rows
+// and matches each row independently. nullopt means the whole batch is
+// malformed (poison, same contract as deserialize_and_match); an empty
+// vector means the batch was well-formed but no row matched anything.
+// rows_searched_out, if non-null, is set to the batch's row count (for
+// worker_pool's avg_match_us accounting - one message can now represent many
+// searches). search_time_out accumulates total nanoseconds across every
+// row's tree.search() call.
+//
+// BSON is not supported here (format == binary_format::bson is rejected at
+// config-validation time before this function is ever called): expand_columnar
+// materializes a root-level array, and BSON's wire format cannot round-trip
+// a root-level array (a document and an array are byte-identical on the
+// wire; only a *parent* element's header records which one a value is, and
+// the root has no parent - see zerialize/protocols/bson.hpp and
+// zerialize/test/test_zerialize.cpp's test_bson_specific() for why BSON is
+// excluded from zerialize's own generic protocol test harness for the same
+// reason).
+std::optional<std::vector<row_match>> deserialize_and_match_columnar(
+    const matching_engine& tree,
+    const attribute_schema& schema,
+    binary_format format,
+    std::span<const char> payload,
+    std::shared_ptr<spdlog::logger> log,
+    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr,
+    std::size_t* rows_searched_out = nullptr);
+
 } // namespace sidecar

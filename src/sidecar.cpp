@@ -173,8 +173,8 @@ asio::awaitable<bool> sidecar_engine::subscribe_to_inputs(input_connection conn)
     for (const auto& subject : conn.subjects) {
         auto [data_sub, data_status] = co_await m_conn->subscribe(
             subject,
-            [this](auto sub, auto reply_to, auto payload) {
-                return on_data_message(sub, reply_to, payload);
+            [this, columnar = conn.columnar](auto sub, auto reply_to, auto payload) {
+                return on_data_message(sub, reply_to, payload, columnar);
             },
             data_opts
         );
@@ -194,7 +194,8 @@ asio::awaitable<bool> sidecar_engine::subscribe_to_inputs(input_connection conn)
 asio::awaitable<void> sidecar_engine::on_data_message(
     std::string_view /*subject*/,
     std::optional<std::string_view> /*reply_to*/,
-    std::span<const char> payload)
+    std::span<const char> payload,
+    bool columnar)
 {
     m_messages_received++;
 
@@ -208,7 +209,7 @@ asio::awaitable<void> sidecar_engine::on_data_message(
 
     // Copy payload and enqueue for worker processing
     std::vector<char> payload_copy(payload.begin(), payload.end());
-    if (!m_worker_pool->enqueue(std::move(payload_copy))) {
+    if (!m_worker_pool->enqueue(std::move(payload_copy), columnar)) {
         m_log->debug("Input queue full or stopping; dropped payload");
     }
 }
@@ -354,8 +355,9 @@ asio::awaitable<nats_asio::ijs_subscription_sptr> sidecar_engine::subscribe_to_i
     auto self_sub = std::make_shared<nats_asio::ijs_subscription_sptr>();
     auto [js_sub, js_status] = co_await m_conn->js_subscribe(
         js_cfg,
-        [this, self_sub](nats_asio::ijs_subscription& /*sub*/, const nats_asio::js_message& msg) {
-            return on_js_data_message(*self_sub, msg);
+        [this, self_sub, columnar = conn.columnar](
+            nats_asio::ijs_subscription& /*sub*/, const nats_asio::js_message& msg) {
+            return on_js_data_message(*self_sub, msg, columnar);
         });
 
     if (js_status.failed()) {
@@ -378,7 +380,7 @@ asio::awaitable<nats_asio::ijs_subscription_sptr> sidecar_engine::subscribe_to_i
 }
 
 asio::awaitable<void> sidecar_engine::on_js_data_message(
-    nats_asio::ijs_subscription_sptr js_sub, const nats_asio::js_message& msg)
+    nats_asio::ijs_subscription_sptr js_sub, const nats_asio::js_message& msg, bool columnar)
 {
     m_messages_received++;
 
@@ -408,7 +410,7 @@ asio::awaitable<void> sidecar_engine::on_js_data_message(
     // js_sub) for worker processing. ack/nak/term happen later, from
     // worker_pool's own resolution logic, once match+publish has actually
     // completed - not here.
-    if (!m_worker_pool->enqueue(msg.msg.payload, msg, js_sub)) {
+    if (!m_worker_pool->enqueue(msg.msg.payload, msg, js_sub, columnar)) {
         // Backpressure at worker_pool's own queue limit - leave unacked,
         // same "let ack_wait redeliver" rule worker_loop's own
         // publish-inflight backpressure path follows.

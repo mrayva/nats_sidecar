@@ -296,6 +296,188 @@ TEST(event_bridge_matching, search_time_out_left_unset_when_search_never_runs) {
     EXPECT_FALSE(search_time.has_value());
 }
 
+// --- Columnar batch matching (deserialize_and_match_columnar) ---
+// BSON is intentionally not included here - columnar batching is rejected
+// for format=bson at config-validation time (see test_cli.cpp/
+// test_config_loading.cpp), not something deserialize_and_match_columnar
+// itself needs to handle.
+
+namespace {
+
+template <typename Protocol>
+std::optional<std::vector<sidecar::row_match>> match_columnar_with(
+    const sidecar::matching_engine& tree, const sidecar::attribute_schema& schema,
+    sidecar::binary_format format, const zerialize::dyn::Value& payload,
+    std::shared_ptr<spdlog::logger> log,
+    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr,
+    std::size_t* rows_searched_out = nullptr) {
+    auto buf = zerialize::serialize<Protocol>(payload);
+    return sidecar::deserialize_and_match_columnar(
+        tree, schema, format, as_char_span(buf), std::move(log),
+        search_time_out, rows_searched_out);
+}
+
+template <typename Protocol>
+void check_columnar_multi_row_match(
+    const sidecar::matching_engine& tree, const sidecar::attribute_schema& schema,
+    sidecar::binary_format format, uint64_t id) {
+    // Row 0 (value=5) doesn't match, rows 1 and 2 (42, 100) do.
+    auto payload = zerialize::dyn::map({
+        {"value", zerialize::dyn::array({5, 42, 100})},
+    });
+    auto result = match_columnar_with<Protocol>(tree, schema, format, payload, make_log());
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 2u);
+    EXPECT_TRUE(contains((*result)[0].matched_ids, id));
+    EXPECT_TRUE(contains((*result)[1].matched_ids, id));
+
+    typename Protocol::Deserializer row0(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>((*result)[0].payload.data()), (*result)[0].payload.size()));
+    typename Protocol::Deserializer row1(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>((*result)[1].payload.data()), (*result)[1].payload.size()));
+    EXPECT_EQ(row0["value"].asInt64(), 42);
+    EXPECT_EQ(row1["value"].asInt64(), 100);
+}
+
+} // namespace
+
+TEST(event_bridge_columnar, matches_multiple_rows_independently_across_all_supported_formats) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    uint64_t id = mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    check_columnar_multi_row_match<zerialize::MsgPack>(
+        *snap->tree, schema, sidecar::binary_format::msgpack, id);
+    check_columnar_multi_row_match<zerialize::CBOR>(
+        *snap->tree, schema, sidecar::binary_format::cbor, id);
+    check_columnar_multi_row_match<zerialize::Flex>(
+        *snap->tree, schema, sidecar::binary_format::flexbuffers, id);
+    check_columnar_multi_row_match<zerialize::Zera>(
+        *snap->tree, schema, sidecar::binary_format::zera, id);
+    check_columnar_multi_row_match<zerialize::Ion>(
+        *snap->tree, schema, sidecar::binary_format::ion, id);
+    check_columnar_multi_row_match<zerialize::Beve>(
+        *snap->tree, schema, sidecar::binary_format::beve, id);
+}
+
+TEST(event_bridge_columnar, empty_batch_returns_empty_result_not_malformed) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    auto result = match_columnar_with<zerialize::MsgPack>(
+        *snap->tree, schema, sidecar::binary_format::msgpack,
+        zerialize::dyn::map({}), make_log());
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->empty());
+}
+
+TEST(event_bridge_columnar, malformed_shape_returns_nullopt) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    // A normal (non-columnar) scalar row sent to the columnar path: "value"
+    // is a bare int, not an array - expand_columnar rejects this outright.
+    auto result = match_columnar_with<zerialize::MsgPack>(
+        *snap->tree, schema, sidecar::binary_format::msgpack,
+        zerialize::dyn::map({{"value", 42}}), make_log());
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST(event_bridge_columnar, mismatched_column_lengths_returns_nullopt) {
+    std::vector<sidecar::attribute_def> defs = {
+        {"value", sidecar::attribute_type::integer},
+        {"tag",   sidecar::attribute_type::string},
+    };
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    auto payload = zerialize::dyn::map({
+        {"value", zerialize::dyn::array({5, 42})},
+        {"tag", zerialize::dyn::array({std::string("a")})},   // one fewer than "value"
+    });
+    auto result = match_columnar_with<zerialize::MsgPack>(
+        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log());
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST(event_bridge_columnar, list_attribute_extracts_own_per_row_value) {
+    std::vector<sidecar::attribute_def> defs = {
+        {"tags", sidecar::attribute_type::string_list},
+    };
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    uint64_t id = mgr.subscribe("tags one of (\"a\")", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    // Each row's own "tags" value is itself an array (a list attribute) -
+    // the columnar batch shape wraps that in one more array level, one
+    // element per row.
+    auto payload = zerialize::dyn::map({
+        {"tags", zerialize::dyn::array({
+            zerialize::dyn::array({std::string("a")}),
+            zerialize::dyn::array({std::string("b")}),
+        })},
+    });
+    auto result = match_columnar_with<zerialize::MsgPack>(
+        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log());
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_TRUE(contains((*result)[0].matched_ids, id));
+}
+
+TEST(event_bridge_columnar, null_composite_row_produces_all_undefined_event) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    // "is null" is the only expression that can match a fully-undefined row.
+    uint64_t id = mgr.subscribe("value is null", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    // pg_zerialize represents a wholly-NULL composite row as null at that
+    // index in every column's array.
+    auto payload = zerialize::dyn::map({
+        {"value", zerialize::dyn::array({zerialize::dyn::Value(), 42})},
+    });
+    auto result = match_columnar_with<zerialize::MsgPack>(
+        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log());
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_TRUE(contains((*result)[0].matched_ids, id));
+}
+
+TEST(event_bridge_columnar, rows_searched_out_reflects_batch_row_count) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.snapshot();
+    ASSERT_TRUE(snap && snap->tree);
+
+    auto payload = zerialize::dyn::map({{"value", zerialize::dyn::array({1, 2, 3, 4, 5})}});
+    std::size_t rows_searched = 0;
+    auto result = match_columnar_with<zerialize::MsgPack>(
+        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log(),
+        nullptr, &rows_searched);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(rows_searched, 5u);
+}
+
 TEST(event_bridge_matching, unrecognized_binary_returns_nullopt) {
     std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
     sidecar::attribute_schema schema(defs);

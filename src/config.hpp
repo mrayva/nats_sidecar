@@ -59,6 +59,15 @@ struct input_connection {
     // core mode only: optional load-balancing group.
     std::string queue_group;
 
+    // Treat every message on this connection as a pg_zerialize-style
+    // columnar batch ({"col1":[v,v,...],"col2":[v,v,...]}, one message = N
+    // rows) instead of a single scalar-attribute row - see
+    // event_bridge.hpp's deserialize_and_match_columnar(). Orthogonal to
+    // mode (js/core). Not supported when config::format is
+    // binary_format::bson (rejected at startup - see
+    // finalize_and_validate_config()).
+    bool columnar = false;
+
     // js mode only - same semantics as the legacy flat fields below.
     // consumer_durable_name and consumer_deliver_subject are both required;
     // deliver_subject in particular must be an explicit, fixed value shared
@@ -99,6 +108,7 @@ struct config {
     // back-compat with the pre-multi-connection single-input-source shape.
     std::vector<std::string> input_subjects;
     std::string input_queue_group;  // optional load-balancing across sidecars
+    bool input_columnar = false;    // see input_connection::columnar
     std::string input_stream;
     std::string consumer_durable_name;
     std::string consumer_deliver_subject;
