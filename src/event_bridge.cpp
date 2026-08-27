@@ -71,8 +71,18 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     std::chrono::nanoseconds total_search_time{0};
     bool any_search_time = false;
 
-    for (std::size_t i = 0; i < n; ++i) {
-        auto row = rows[i];
+    // Walk rows sequentially via elements() when the format provides a
+    // single-pass forward iterator (msgpack/CBOR/Ion/BEVE) instead of
+    // indexing rows[i] - operator[](size_t) is an O(i) linear skip-from-
+    // start for those formats (confirmed directly via perf: this one line
+    // was 58% of all CPU time processing a real columnar batch, dwarfing
+    // both matching_engine::search() and populate_event() combined). Only
+    // Flex/Zera are genuinely O(1) per index, so the fallback below is
+    // never worse than before this fix. This is the exact same antipattern
+    // already fixed on the *producing* side in zerialize's
+    // write_expanded_columnar (columnar.hpp) - it just wasn't obvious that
+    // *consuming* an already-expanded row array by index is equally costly.
+    auto process_row = [&](std::size_t i, auto&& row) -> bool {
         std::optional<std::chrono::nanoseconds> row_search_time;
         auto matches = match_message(tree, schema, row, log, &row_search_time);
         if (row_search_time) {
@@ -87,12 +97,26 @@ std::optional<std::vector<row_match>> match_columnar_batch(
                 log->warn("event_bridge: row {} of columnar batch failed to match; "
                           "poisoning whole batch", i);
             }
-            return std::nullopt;
+            return false;
         }
         if (!matches->empty()) {
             result.push_back({std::move(*matches), serialize_row<Protocol>(row)});
         }
+        return true;
+    };
+
+    bool ok = true;
+    if constexpr (requires { rows.elements(); }) {
+        std::size_t i = 0;
+        for (auto&& row : rows.elements()) {
+            if (!process_row(i++, row)) { ok = false; break; }
+        }
+    } else {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!process_row(i, rows[i])) { ok = false; break; }
+        }
     }
+    if (!ok) return std::nullopt;
 
     if (search_time_out && any_search_time) *search_time_out = total_search_time;
     return result;

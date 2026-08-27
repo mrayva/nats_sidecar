@@ -529,6 +529,82 @@ throughput (~360k rows/s) at a small, real, non-zero loss cost. Either way, leav
 bigger buffers as a fix - they mask the real throughput mismatch and can turn a lossy-but-self-
 healing failure into a permanent one.
 
+**Follow-up with columnar batching: the bottleneck moves from NATS transport to per-instance
+processing capacity.** Same N=12 core-mode fleet (`worker_threads: 1` each, default `nats-server`
+limits), now with every connection's `columnar: true` and `pgnats` publishing via
+`--batch-size 500 --batch-encoding native` instead of one row per message. Deliberately pushed hard
+(`--workers 24`, aggressive by design - the point was to find the new ceiling, not confirm the old
+one) against the same real 115,020,848-row NYSE table, one full cycle:
+
+| metric | value |
+|---|---:|
+| rows published | 115,020,848 |
+| batches published (500 rows/batch) | 230,264 |
+| publish-side rate | 9.13M rows/s aggregate (24 workers, 12.6s) |
+| batches delivered by NATS to the fleet | 230,264 / 230,264 (100.00%) |
+| Slow Consumer events | 0 |
+| batches actually processed (unpacked + matched + published) | 124,157 (53.9%) |
+| batches dropped (local input queue full) | 106,107 (46.1%) |
+| rows matched (`price > 500.0`) and republished individually | 3,212,038 |
+
+**NATS transport handled the burst perfectly** - every single batch reached some instance's
+connection, zero Slow Consumer disconnects, at a publish rate (9.13M rows/s) that would have
+been wildly impossible in row-mode (the old ceiling was ~360k rows/s before Slow Consumer started
+triggering). Batching one NATS message per 500 rows really does eliminate the *old* bottleneck
+(per-message transport/protocol overhead) as completely as hoped.
+
+**But a new, different bottleneck appeared in its place: each instance's own bounded input queue
+(`input_queue_max_messages`, default 10000) filling up faster than its single worker thread could
+unpack-and-match batches.** Loss here happens at `worker_pool::enqueue_impl()`'s local queue-full
+check, not a NATS-level disconnect - `received` (what actually arrived) and `processed +
+input_dropped` (what happened to it) reconcile exactly (230,264 = 124,157 + 106,107), confirming
+the drop is a clean, well-understood local capacity limit, not a mystery loss. Measuring the
+drain-only phase (after publishing stopped, while the fleet worked through its backlog: 50,838
+queued batches processed in 96s) gives a real **sustained processing ceiling of ~265k rows/s
+aggregate for N=12 single-threaded instances** - each instance unpacking, matching, and
+re-publishing roughly one 500-row batch every ~23ms.
+
+**`perf`-profiled the single-threaded per-instance processing cost directly, rather than assume
+where it went** - and found the "~265k rows/s ceiling" above was itself measuring a real, fixable
+bug, not a fundamental cost:
+
+**Found: 58% of all sampled CPU time was going into `event_bridge.cpp`'s own row loop indexing
+`rows[i]` into the just-`expand_columnar`'d row array**, one row at a time
+(`zerialize::MsgPackDeserializer::operator[](size_t)` -> `zerialize::mp_skip`, recursively - a
+linear skip-from-the-start per call, confirmed directly in the call-graph). This is the exact same
+O(n^2) antipattern already fixed on the *producing* side inside zerialize's
+`write_expanded_columnar()` earlier in this session (see "Columnar batch input" above and
+zerialize commit `2417547`) - it simply wasn't obvious that *consuming* an already-expanded row
+array by index, in nats_sidecar's own new orchestration code, pays the identical cost. The real
+matching-engine work (`atree::Tree::search()`, ~20% of the *original* profile) and event
+construction (`populate_event()`, ~12%) were comparatively small next to this one indexing bug.
+
+**Fixed** by walking the expanded row array via its `.elements()` single-pass sequential iterator
+(the same primitive/fallback idiom used for the zerialize-side fix) instead of indexing `rows[i]`
+- a small, contained change to `event_bridge.cpp`'s `match_columnar_batch()`, no zerialize changes
+needed this time. Verified with a clean, controlled before/after measurement (single instance, a
+real ~34.5M-row backlog built up faster than one thread could drain it, steady-state batches/sec
+measured over multiple 10-second windows, immediately before vs. after rebuilding with the fix):
+
+| | batches/s (single instance) | rows/s equivalent |
+|---|---:|---:|
+| before fix | ~181 | ~90,500 |
+| after fix | ~1,330 | ~665,000 |
+
+**A real, measured 7.3x single-instance speedup** from one line. A follow-up `perf` capture after
+the fix confirms `mp_skip`/row-indexing is gone from the hot path entirely - the profile is now
+dominated by genuinely necessary work (`atree::Tree::search()`, a-tree's own per-row
+`EventBuilder`/HashMap construction, and serialization of matched output), not a fixable
+inefficiency in nats_sidecar's own code.
+
+**This means the N=12 full-table "~265k rows/s sustained ceiling" measured above is now stale** -
+it was measured against the pre-fix binary and should be substantially higher (naively ~7x, though
+contention effects across 12 concurrent instances on one 12-physical-core host make a clean
+linear extrapolation unreliable - worth a fresh N=12 run, not assumed). The two follow-up levers
+noted above (raising `input_queue_max_messages`, matching publish-side burst rate to the real
+ceiling) are still the right next moves, just against a materially higher real ceiling than first
+measured.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
