@@ -782,8 +782,10 @@ in place of the default `engine: atree`):**
 | rows matched (`price > 500.0`) | 3,733,599 | 3,286,903 |
 | publish-side aggregate rate | 10.28M rows/s | 9.46M rows/s |
 
-Processing capacity is statistically indistinguishable between engines at this workload (60.7% vs.
-60.6% of batches processed - within run-to-run noise). The two runs' `--workers 24` publish jobs
+**(Historical snapshot - see the "Every fix in this whole investigation was measured with
+`engine: atree`" note further down for why this no longer holds once the subsequent a-tree-specific
+fixes are accounted for.)** Processing capacity is statistically indistinguishable between engines
+at this workload (60.7% vs. 60.6% of batches processed - within run-to-run noise). The two runs' `--workers 24` publish jobs
 raced the fleet at slightly different real-world rates (10.28M vs. 9.46M rows/s, ordinary
 scheduling jitter between separate runs, not a deliberate variable), so the matched-row counts
 differ too - different runs drop different specific batches under this kind of queue-full race,
@@ -970,6 +972,36 @@ easy further headroom:
   redundant pass left to cut, short of a fundamentally different wire representation (e.g. a
   fixed-width columnar format) that's out of scope for "improve the existing msgpack path."
   Nothing changed here.
+
+**Every fix in this whole "improve sidecar performance" investigation was measured with
+`engine: atree` (the default) - be-tree only ever got continuous *correctness* coverage
+(`differential_matrix/matching_engine_differential`'s 46 a-tree-vs-be-tree agreement cases, run
+after every change in this file) via `matching_engine::search(event_sink&)`'s shared interface,
+never a performance re-check.** That matters because the "statistically indistinguishable" a-tree
+vs. be-tree finding above (60.7% vs. 60.6% processed) predates *every* fix below it in this file -
+the round-trip elimination and write-side raw-copy apply equally to both engines (they're in the
+msgpack/orchestration layer, not the matching engine), but event/search-state recycling is a-tree-
+specific by deliberate design (`matching_engine::reuses_events()` stays `false` for be-tree - its
+own `Event` allocates per individual attribute set via its underlying C library, not once per
+event, and this codebase doesn't have enough visibility into whether reusing an already-set slot
+there is memory-safe to risk it). Re-ran the single-instance profile with `engine: betree`,
+otherwise identical setup, to check whether that combination left the earlier "indistinguishable"
+finding stale:
+
+| | a-tree (all fixes) | be-tree |
+|---|---:|---:|
+| batches/s (single instance) | ~6,800-6,950 | ~5,900-5,970 |
+
+**No longer indistinguishable - a-tree is now measurably faster, roughly 15%, purely because it
+received three more rounds of engine-specific optimization be-tree structurally can't share.**
+be-tree's own profile confirms *why*, and it's a different bottleneck shape than a-tree's:
+`__strcmp_evex` (7.99%) and `betree_make_float_variable`/`cfree`/`_int_malloc`/`_int_free_chunk`/
+`free_event`/`free_value` (allocation/deallocation, ~18% combined) dominate - be-tree's underlying
+C library looks up variable names by string comparison and allocates a fresh native variable object
+on every single attribute set, for every row, exactly as it always has (this fix intentionally left
+that untouched - see above). This is the **current, accurate picture** - the "statistically
+indistinguishable" language earlier in this file describes a snapshot from *before* this
+investigation's a-tree-specific work and should be read as historical, not current.
 
 ## Schema Generation
 
