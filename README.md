@@ -592,10 +592,32 @@ measured over multiple 10-second windows, immediately before vs. after rebuildin
 | after fix | ~1,330 | ~665,000 |
 
 **A real, measured 7.3x single-instance speedup** from one line. A follow-up `perf` capture after
-the fix confirms `mp_skip`/row-indexing is gone from the hot path entirely - the profile is now
-dominated by genuinely necessary work (`atree::Tree::search()`, a-tree's own per-row
-`EventBuilder`/HashMap construction, and serialization of matched output), not a fixable
-inefficiency in nats_sidecar's own code.
+the fix confirms `mp_skip`/row-indexing from *this* bug is gone from the hot path. Re-examining
+that post-fix profile in full (categorized by subsystem, not just top-line symbols) - prompted by a
+direct challenge to justify "genuinely necessary work" rather than take it at face value - found the
+remaining cost is **not** dominated by msgpack row-unpacking at all:
+
+| category | share of CPU time |
+|---|---:|
+| a-tree's own per-row event construction (Rust `HashMap<String,...>` alloc+rehash, SipHash key hashing, `rust_decimal` compares, FFI panic-guard) | 53.7% |
+| msgpack row-unpacking (`mp_skip`, `memmove`, buffer writes) | 20.5% |
+| this codebase's own per-row stats timing (`clock_gettime`, called twice per row) | 2.5% |
+| this codebase's own orchestration (`populate_event`, `match_columnar_batch`, schema lookup) | 5.0% |
+| the actual matching algorithm (`ATree::search`, `process_predicates`) | ~2.4% |
+
+The single biggest cost is `atree::Tree::make_event()` allocating a fresh Rust
+`HashMap<String, EventAttributeValue>` on *every row*, even though the schema (which attributes
+exist) never changes between rows - `with_float("price", v)` inserts into it (hashing the string
+key, triggering a grow-from-empty rehash), and `search()` consumes and frees the whole thing.
+Checked a-tree's C++ wrapper (`atree.hpp`) directly: `EventBuilder` has no reset/reuse API, it's
+single-use by design - this is a real a-tree_ffi limitation, not something fixable inside
+nats_sidecar. This also surfaces an open question rather than a closed one: if a-tree's own
+overhead is the majority of a single instance's CPU time, the a-tree/be-tree N=12 comparison above
+(statistically identical throughput) is harder to explain than first framed - it hasn't been
+checked whether be-tree's own event construction carries a comparably large tax of its own, or
+whether something shared between both engines (the msgpack pipeline, `worker_pool`'s queueing) is
+the real fleet-level bottleneck instead of whatever a single isolated instance's `perf` profile
+shows. Not resolved - would need the same profiling pass run against be-tree specifically.
 
 **This means the N=12 full-table "~265k rows/s sustained ceiling" measured above is now stale** -
 it was measured against the pre-fix binary. Re-ran the *exact same* N=12/`--workers 24` full-table
@@ -616,10 +638,32 @@ underperformed: `--workers 24` was deliberately chosen in the original test to *
 per-instance ceiling once contention across 12 concurrent instances on one 12-physical-core host is
 accounted for. `slow_consumers=0` in `nats-server`'s varz confirms the loss mechanism is still
 exactly the same one as before (local per-instance input-queue overflow, not NATS transport) - just
-quantitatively smaller. The two follow-up levers noted above (raising `input_queue_max_messages`,
-matching publish-side burst rate/`--workers` to the real per-instance ceiling instead of the old
-one) remain the right next moves for actually eliminating loss at this ingest rate, and are still
-untested as of this writing.
+quantitatively smaller.
+
+**Found the actual zero-loss `--workers` setting for N=12 columnar, rather than leave it as an
+untested follow-up.** Same N=12 fleet, same full 115,020,848-row table, `--workers` swept down from
+24 (mirroring the row-mode N=12 sharpening methodology above, adapted since columnar's real ceiling
+turned out to be much lower than row-mode's):
+
+| `--workers` | publish rate | batches processed | batches dropped |
+|---:|---:|---:|---:|
+| 24 | 10.28M rows/s | 60.8% | 39.2% |
+| 6  | 5.59M rows/s  | 71.5% | 28.5% |
+| 4  | 4.14M rows/s  | 80.4% | 19.6% |
+| 2  | 2.27M rows/s  | **100.0%** | **0%** |
+
+**`--workers 2` is exactly loss-free** (0 batches dropped, `slow_consumers=0`) - unlike row-mode,
+where N=12 tolerated `--workers` up to 6 before tipping into loss, columnar's per-instance
+processing ceiling is low enough relative to how fast `--batch-size 500` batches arrive that only
+2 parallel publish connections are sustainable at N=12 without raising `input_queue_max_messages`.
+Matches the back-of-envelope expectation from the single-instance 7.3x speedup measurement (~1.93M
+rows/s naive extrapolation for N=12) reasonably closely - the real threshold (between 2.27M
+loss-free and 4.14M lossy) is a bit higher than that naive number, consistent with the isolated
+single-instance backlog-drain test not perfectly predicting real multi-instance-contention
+behavior. **Practical takeaway**: for a columnar connection at this N=12/single-worker-thread
+scale, keep `--batch-size 500` publish concurrency at 2 workers (or raise `input_queue_max_messages`
+substantially and/or `worker_threads` per instance if higher publish concurrency is required) - the
+`--workers 4-6` range that was loss-free for row-mode does **not** carry over to columnar mode.
 
 **be-tree comparison, same N=12/`--workers 24` benchmark, everything else identical (`engine: betree`
 in place of the default `engine: atree`):**
