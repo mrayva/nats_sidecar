@@ -8,7 +8,7 @@ include(FetchContent)
 FetchContent_Declare(
     atree
     GIT_REPOSITORY https://github.com/mrayva/a-tree.git
-    GIT_TAG        0f8da723a0b7275520f772658a41039bfe8802bb
+    GIT_TAG        b2bc18f70701f6dfbe76e6a584a4bbe80b16be22
     GIT_SHALLOW    TRUE
     SYSTEM
 )
@@ -17,13 +17,19 @@ FetchContent_MakeAvailable(atree)
 set(ATREE_SOURCE_DIR ${atree_SOURCE_DIR})
 set(ATREE_FFI_DIR    ${ATREE_SOURCE_DIR}/a-tree-ffi)
 
-# Determine cargo build output directory
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(ATREE_CARGO_PROFILE release)
-    set(ATREE_CARGO_FLAGS --release)
-else()
+# Determine cargo build output directory - only a plain "Debug" (or an
+# unspecified CMAKE_BUILD_TYPE) should leave a-tree's own Rust code
+# unoptimized. This used to check for the exact string "Release", which
+# silently left RelWithDebInfo (and MinSizeRel) builds - including every
+# `perf`-profiling build in this project - compiling a-tree via `cargo build`
+# with no optimizations at all, while the rest of the C++ was fully
+# optimized: a real confound when profiling where CPU time actually goes.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR NOT CMAKE_BUILD_TYPE)
     set(ATREE_CARGO_PROFILE debug)
     set(ATREE_CARGO_FLAGS "")
+else()
+    set(ATREE_CARGO_PROFILE release)
+    set(ATREE_CARGO_FLAGS --release)
 endif()
 
 set(ATREE_LIB_DIR ${ATREE_FFI_DIR}/target/${ATREE_CARGO_PROFILE})
