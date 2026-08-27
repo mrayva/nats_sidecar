@@ -920,6 +920,50 @@ easy further headroom:
   change, this time to the search algorithm's own scratch state, not just event construction)
   isolated and verifiable on its own.
 
+- **Followed up on that lever directly - traced it with `perf`'s call graph first, not just the flat
+  profile, before deciding how much of it to build.** `ATree::search()`'s three scratch allocations
+  turned out to have very different risk profiles once actually traced to their callers:
+  `EvaluationResult::new()`'s allocation (~1.85% of `_int_malloc`'s own self-time, confirmed via
+  `perf report -g`) is *not* lifetime-coupled to the tree at all - it just owns three fixed-size
+  `Box<[u64]>` bitmaps - while `matches`/`queues` hold `&Entry<T>` references borrowed from the
+  tree's own nodes, meaning reusing *their* allocations safely across FFI calls would need either
+  unsafe lifetime-erasure or dropping `Report`'s lifetime parameter entirely (cloning every match
+  instead of referencing it) - a real jump in engineering risk for what the same call-graph trace
+  showed as the smaller remaining piece (`_int_free_chunk`'s own cost, checked the same way, turned
+  out to be dominated by `row_match` destruction on the publish side, not search scratch at all).
+  Built only the safe part: **`mrayva/a-tree`@`95c99f9`** adds `EvaluationResult::reset()`/
+  `capacity()` and `ATree::search_with_results()`, reusing a caller-owned `EvaluationResult` (or
+  transparently reallocating if it's undersized) instead of `search()` allocating a fresh one every
+  call - `matches`/`queues` deliberately left exactly as they were, allocated fresh each time, not
+  bundled into this change. a-tree-ffi's `atree_search()` routes through it automatically, stashing
+  a reusable `EvaluationResult` in `FfiEventBuilder` the same way it already stashes a reusable
+  `Event` - **no nats_sidecar code changes needed at all**, only the pin bump. Verified: 4 new tests
+  (reset()/capacity() at the core level, `search_with_results()` reused across three distinct events
+  checked against fresh `search()` each time) plus the full existing a-tree/a-tree-ffi suites
+  unchanged.
+
+  **Measured honestly**: `EvaluationResult::new` drops out of the profile entirely (confirms the fix
+  works), but single-instance throughput came back statistically indistinguishable
+  (~6,950 -> ~6,800 batches/s, a *decrease* smaller than the run-to-run noise already seen elsewhere
+  in this investigation) - the same "real but too small to clear single-sample noise" pattern as the
+  write-side raw-copy and `string_view` fixes earlier in this file. The **fleet-level** N=12 re-sweep
+  told a clearer story, since it averages out single-capture noise:
+
+  | `--workers` | before this fix | after this fix |
+  |---:|---:|---:|
+  | 6 | 89.7% processed | 93.7% processed |
+  | 5 | 94.9% processed | 97.3% processed |
+  | 4 | 100.0% (zero-loss) | 100.0% (zero-loss) |
+
+  Real further progress at `--workers 5` and `--workers 6` (both got measurably closer to zero), but
+  the zero-loss threshold itself is unchanged at `--workers 4` - neither `--workers 5` nor
+  `--workers 6` crossed to 100%. **Stopping the "close the `--workers` 6 gap" thread here rather than
+  building the riskier `matches`/`queues` lever**: three fixes deep into this investigation (columnar
+  round trip, write-side raw-copy + `populate_event` allocation, now event/search-state recycling),
+  the remaining gap keeps costing more engineering risk for less measurable gain each time - the
+  clearest sign this is genuinely diminishing returns, not a lever away from `--workers 6` cleanly
+  closing.
+
 - **Read-side msgpack unpacking - little further low-risk headroom found.** `mp_skip` and
   `ColumnarRows::advance()`'s sequential walk are already the O(n) minimum for msgpack's
   variable-length encoding after this session's earlier round-trip fix - there's no second
