@@ -102,6 +102,51 @@ TEST_P(matching_engine_test, event_sink_reused_across_searches_has_no_stale_valu
     EXPECT_FALSE(contains(r3, 2));
 }
 
+// be-tree's own reuse of scalar (bool/int/float) event attributes across
+// searches ("Increment B" - see betree_event_sink's own doc comments in
+// matching_engine.cpp) keeps a per-slot pool of detached-but-not-freed
+// betree_variable objects, updated in place via betree_update_*_variable()
+// instead of reallocated, whenever a slot is touched again after being
+// left untouched. That pool logic - detach into the pool, pull back out,
+// update, reattach, or leave detached and eventually free at destruction -
+// is exactly the kind of manual C-level memory lifecycle code most likely
+// to hide a leak, double-free, or stale-read bug, so this specifically
+// hammers it: 12 searches on one reused sink, alternately touching and
+// NOT touching each of the three scalar attributes in a staggered pattern
+// (so every attribute cycles through touched->untouched->touched several
+// times, not just once), checked against expressions that would give a
+// different, easily-distinguishable answer if either a value leaked
+// through when it shouldn't have, or failed to actually update when it
+// should have. Run under ASan+UBSan (build-sanitizer/) as well as
+// normally - a functional pass here doesn't rule out a leak or a
+// use-after-free that just hasn't manifested as a wrong answer yet.
+TEST_P(matching_engine_test, event_sink_reused_across_many_cycles_with_staggered_attributes) {
+    auto engine = sidecar::build_matching_engine(GetParam(), trade_attributes());
+    engine->insert(1, "trade_price > 100.0");
+    engine->insert(2, "trade_volume > 1000");
+    engine->insert(3, "active");
+
+    auto sink = engine->make_event();
+
+    for (int cycle = 0; cycle < 12; ++cycle) {
+        const bool touch_price = (cycle % 2) == 0;
+        const bool touch_volume = (cycle % 3) == 0;
+        const bool touch_active = (cycle % 4) == 0;
+
+        if (touch_price) sink->with_float("trade_price", 200.0);
+        if (touch_volume) sink->with_integer("trade_volume", 2000);
+        if (touch_active) sink->with_boolean("active", true);
+
+        auto r = engine->search(*sink);
+        EXPECT_EQ(contains(r, 1), touch_price)
+            << "cycle " << cycle << ": trade_price stale-or-missing";
+        EXPECT_EQ(contains(r, 2), touch_volume)
+            << "cycle " << cycle << ": trade_volume stale-or-missing";
+        EXPECT_EQ(contains(r, 3), touch_active)
+            << "cycle " << cycle << ": active stale-or-missing";
+    }
+}
+
 TEST_P(matching_engine_test, and_or_combinators) {
     auto engine = sidecar::build_matching_engine(GetParam(), trade_attributes());
     engine->insert(1, "trade_price > 50.0 and trade_volume > 1000");

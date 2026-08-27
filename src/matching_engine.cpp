@@ -143,47 +143,129 @@ be::Tree build_betree(const std::vector<attribute_def>& attributes,
 class betree_event_sink : public event_sink {
 public:
     betree_event_sink(be::Event event, const string_view_lookup_map<std::size_t>& indices)
-        : m_event(std::move(event)), m_indices(indices) {}
+        : m_event(std::move(event)), m_indices(indices),
+          m_touched(m_indices.size(), false), m_spares(m_indices.size(), nullptr) {}
 
+    // m_spares may hold detached-but-not-freed betree_variable objects
+    // (see reset()'s own comment) that never made it back into m_event's
+    // own variables[] array by the time this sink is destroyed -
+    // betree_free_event() (invoked when m_event's destructor runs) only
+    // walks what's *currently attached*, so anything still sitting in the
+    // pool needs its own explicit free here, or it leaks.
+    ~betree_event_sink() override {
+        for (betree_variable* spare : m_spares) {
+            if (spare != nullptr) betree_free_variable(spare);
+        }
+    }
+    betree_event_sink(const betree_event_sink&) = delete;
+    betree_event_sink& operator=(const betree_event_sink&) = delete;
+
+    // "Increment B": bool/integer/float reuse an existing betree_variable
+    // from a prior row via betree_update_*_variable() (a plain field
+    // write - see that function's own doc comment in betree.h) instead of
+    // paying betree_make_*_variable()'s allocation on every single call,
+    // when reset() (below) left a spare for this exact slot from a
+    // previous row. First use of a slot (no spare yet) falls back to the
+    // existing, already-correct allocate-and-attach path unchanged.
+    // string/string_list/integer_list are NOT covered - those values hold
+    // their own nested heap allocations (a bstrdup'd string, a
+    // dynamically-sized array) where "update in place" would need real
+    // size-comparison/reallocation logic, a separate and harder problem,
+    // not attempted here.
     void with_boolean(std::string_view name, bool value) override {
-        m_event.set_boolean(index_for(name), value);
+        std::size_t idx = index_for(name);
+        if (betree_variable* spare = take_spare(idx)) {
+            betree_update_boolean_variable(spare, value);
+            reattach(idx, spare);
+        } else {
+            m_event.set_boolean(idx, value);
+        }
+        m_touched[idx] = true;
     }
     void with_integer(std::string_view name, int64_t value) override {
-        m_event.set_integer(index_for(name), value);
+        std::size_t idx = index_for(name);
+        if (betree_variable* spare = take_spare(idx)) {
+            betree_update_integer_variable(spare, value);
+            reattach(idx, spare);
+        } else {
+            m_event.set_integer(idx, value);
+        }
+        m_touched[idx] = true;
     }
     void with_float(std::string_view name, double value) override {
-        m_event.set_float(index_for(name), value);
+        std::size_t idx = index_for(name);
+        if (betree_variable* spare = take_spare(idx)) {
+            betree_update_float_variable(spare, value);
+            reattach(idx, spare);
+        } else {
+            m_event.set_float(idx, value);
+        }
+        m_touched[idx] = true;
     }
     void with_string(std::string_view name, std::string_view value) override {
-        m_event.set_string(index_for(name), value);
+        std::size_t idx = index_for(name);
+        m_event.set_string(idx, value);
+        m_touched[idx] = true;
     }
     void with_string_list(std::string_view name, const std::vector<std::string>& values) override {
+        std::size_t idx = index_for(name);
         std::vector<std::string_view> views(values.begin(), values.end());
-        m_event.set_string_list(index_for(name), views);
+        m_event.set_string_list(idx, views);
+        m_touched[idx] = true;
     }
     void with_integer_list(std::string_view name, const std::vector<int64_t>& values) override {
-        m_event.set_integer_list(index_for(name), values);
+        std::size_t idx = index_for(name);
+        m_event.set_integer_list(idx, values);
+        m_touched[idx] = true;
     }
     void with_undefined(std::string_view name) override {
+        // Deliberately NOT marked touched, and deliberately still goes
+        // through Event::clear() (free, not pool) rather than the spare
+        // path - this is the "explicitly told to be undefined" case
+        // (event_bridge.hpp's populate_event() only calls it when
+        // extracting a field's value threw), not the hot common-attribute
+        // path Increment B targets. reset() clearing an untouched slot
+        // gives the exact same end state anyway, so leaving this alone is
+        // correct, not just convenient.
         m_event.clear(index_for(name));
     }
 
     be::Event& native() { return m_event; }
 
-    // Clears every attribute slot back to unset, so this same event_sink
-    // can be safely reused for the next row's populate_event() calls
-    // instead of a fresh one being allocated - see reuses_events()'s own
-    // doc comment (matching_engine.hpp) for why this is safe: Event::clear()
-    // (betree_cpp.hpp) is just betree_set_variable(event, index, nullptr),
-    // an existing, already-exercised be-tree primitive (every with_undefined()
-    // call already goes through it) - not new, unverified C code. Called
-    // unconditionally after every search() (success or failure) rather than
-    // only for slots this row didn't set, so a row with fewer attributes
-    // than a previous one can never see that previous row's leftover value
-    // - the same blanket-reset principle a-tree's own event recycling uses.
+    // Clears every attribute slot this row didn't touch back to unset (so
+    // a row with fewer attributes than a previous one can never see that
+    // previous row's leftover value - see reuses_events()'s own doc
+    // comment, matching_engine.hpp), while DETACHING (not freeing) the
+    // ones it did touch into m_spares for with_boolean/with_integer/
+    // with_float to reuse next row via betree_update_*_variable() instead
+    // of reallocating. Detaching means writing event->variables[i]
+    // directly instead of calling betree_set_variable(event, i, nullptr)
+    // (which is what Event::clear() does, and which would free the
+    // variable, defeating the whole point) - safe because betree_event's
+    // fields are a plain public struct, and because after this write the
+    // slot is genuinely undefined for search purposes (be-tree's regular
+    // search path treats a null variables[i] as unknown/undefined, exactly
+    // the state we want), it's just that this codebase, not be-tree's own
+    // free_event(), is now responsible for eventually freeing that
+    // detached pointer - which the destructor above does for anything
+    // still in m_spares when this sink goes away.
     void reset() {
+        betree_event* raw = m_event.get();
         for (std::size_t i = 0; i < m_indices.size(); ++i) {
-            m_event.clear(i);
+            if (m_touched[i]) {
+                betree_variable* v = raw->variables[i];
+                raw->variables[i] = nullptr;
+                if (m_spares[i] != nullptr) {
+                    // Should never happen (take_spare() always empties a
+                    // slot before it's used again) - free defensively
+                    // rather than leak if this invariant is ever violated.
+                    betree_free_variable(m_spares[i]);
+                }
+                m_spares[i] = v;
+            } else {
+                m_event.clear(i);
+            }
+            m_touched[i] = false;
         }
     }
 
@@ -196,8 +278,32 @@ private:
         return it->second;
     }
 
+    betree_variable* take_spare(std::size_t idx) {
+        betree_variable* v = m_spares[idx];
+        m_spares[idx] = nullptr;
+        return v;
+    }
+
+    // Reattaches a variable pulled from m_spares[idx] back into the event
+    // at the SAME index it was detached from, without going through
+    // betree_set_variable() - that function would also re-derive and
+    // bstrdup() the attribute name/id into the variable on every call
+    // (see its own comment in betree.cpp), which is redundant work here:
+    // this variable's attr_var was already resolved correctly for this
+    // exact index when it was first created, and never needs to change
+    // since a spare is only ever reattached to the slot it came from. Safe
+    // for the same reason reset()'s detach is: betree_event's fields are a
+    // plain public struct, and the slot is guaranteed null right now (this
+    // is only called immediately after take_spare(), never otherwise), so
+    // there is nothing to free on the way in either.
+    void reattach(std::size_t idx, betree_variable* variable) {
+        m_event.get()->variables[idx] = variable;
+    }
+
     be::Event m_event;
     const string_view_lookup_map<std::size_t>& m_indices;
+    std::vector<bool> m_touched;
+    std::vector<betree_variable*> m_spares;
 };
 
 class betree_matching_engine : public matching_engine {

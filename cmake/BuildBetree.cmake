@@ -15,7 +15,7 @@ include(FetchContent)
 FetchContent_Declare(
     betree
     GIT_REPOSITORY https://github.com/mrayva/be-tree.git
-    GIT_TAG        3d13dd3a009e08db4934ef7f1dc4f00a2f0bfb5c
+    GIT_TAG        bebd8b62245cef4d2d06309eff54758350a8b2c1
     GIT_SHALLOW    TRUE
     SYSTEM
 )
