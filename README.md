@@ -1329,6 +1329,65 @@ itself costs only 0.23% (matching the "single field write" design). Steady-state
 ~10,770 -> ~11,000+ batches/s - **the a-tree/be-tree gap, which had widened to ~25%, is now down to
 roughly 5-8%**, close to fully closed.
 
+## be-tree: attribute-name lookup via linear scan, not a hashmap
+
+Re-profiling after Increment B surfaced `betree_event_sink::index_for()`'s attribute-name-to-index
+lookup - a `std::unordered_map<std::string_view, std::size_t>` with transparent hashing
+(`string_view_lookup_map`) - as a small but real cost on the hot per-attribute path, once per
+`with_*()` call. be-tree schemas are small (real ones seen so far: single digits to low tens of
+attributes), the same "hash overhead exceeds linear-scan cost at this size" reasoning a-tree-ffi's
+own event-builder already relies on (a `Vec`, not a `HashMap`, for the identical name-to-id
+problem).
+
+**Fixed** (`nats_sidecar`@`b532097`): added `small_attr_map<V>`, a linear-scan
+`std::vector<std::pair<std::string, V>>`, replacing `string_view_lookup_map<std::size_t>`
+everywhere be-tree's own attribute-index map is built and read (`build_betree()`,
+`betree_event_sink`, `betree_matching_engine`). No behavior change - `find()`/`set()` have the same
+semantics as the map they replace - so this needed no new test coverage beyond the existing suite
+passing unchanged.
+
+## be-tree: reuse the report and undefined-bitmap buffers ("Increment C")
+
+Re-profiling again after Increment B (with the columnar-batch feature - see "Columnar batch input"
+below - now in the picture, moving the workload from one search per NATS message to one search per
+*row* of a batch) surfaced two more distinct `__libc_calloc` callers, unrelated to per-row event
+setup: `make_undefined()` (5.27%) - be-tree's undefined-variable bitmap, one fresh
+`(attr_domain_count+63)/64`-`uint64_t` allocation per search - and `make_report()` (1.27%) - the
+`struct report` returned by every search, freed and reallocated fresh every single time even though
+its shape never changes between searches against the same tree.
+
+**Fixed** (`mrayva/be-tree`@`80048d3`, `nats_sidecar`@`02e4768`): added
+`betree_refresh_undefined()` (recomputes `make_undefined()`'s bitmap into an existing, caller-owned
+buffer instead of allocating a new one), `betree_search_with_event_reusing()` (like
+`betree_search_with_event()`, but takes that buffer as a required parameter), and
+`betree_reset_report()` (resets an existing report's counters/subs/state for another search instead
+of `free_report()`+`make_report()`), plus a `Tree::search_reusing()` C++ wrapper mirroring a-tree's
+own `search_reusing()` convention (returns matched ids directly). `betree_event_sink` now owns a
+persistent `report*` (`make_report()` in its constructor, `free_report()` in its destructor) and a
+`std::vector<uint64_t>` undefined-bitmap scratch buffer, both sized once per sink instead of
+allocated fresh per row; `reset()` (already called unconditionally after every search to prepare the
+sink for its next row, from Increment A) now also calls `betree_reset_report()` on the report,
+keeping the same "always call reset() after search, sink is ready to reuse again" invariant for the
+report as it already had for the event. `betree_search_with_preds()`'s signature changed to take
+`undefined` as a required caller-owned parameter instead of allocating/freeing it internally - its
+sole existing caller (`betree_search_with_event_filled()`, be-tree's own non-reusing path) preserves
+the old allocate-and-free-every-time behavior, so no other call site's behavior changes.
+
+New be-tree-level test `test_search_with_event_reusing` (C, `tree.cpp`'s level) and
+`verify_search_reusing()` (C++, `betree_cpp.hpp`'s level) both exercise several searches in a row
+against the same reused report/undefined buffers, including a variable flipping to/from undefined
+between searches, proving both buffers are correctly recomputed each time rather than going stale.
+Verified the same way as Increments A and B: be-tree's own 24-target suite (normal build and
+`build-asan/`, `ASAN_OPTIONS=detect_leaks=1`), and nats_sidecar's full 264-test suite (normal
+`build/` and `build-sanitizer/`, same leak-detection flag) - all clean.
+
+**Measured real**: re-profiled a fourth time. `make_undefined` and `make_report` are both gone
+entirely from the profile's `__libc_calloc` call graph - the only remaining `__libc_calloc` caller on
+the be-tree engine path is now `make_environment()` (0.84%, its own array allocation, deliberately
+out of scope for this increment - not confirmed as individually significant the way
+`make_undefined`/`make_report` were). Total `__libc_calloc` self-time across the whole profile:
+0.86%, down from a combined ~6.5% for `make_undefined`+`make_report` alone before this fix.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
