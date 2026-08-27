@@ -144,7 +144,8 @@ class betree_event_sink : public event_sink {
 public:
     betree_event_sink(be::Event event, const small_attr_map<std::size_t>& indices)
         : m_event(std::move(event)), m_indices(indices),
-          m_touched(m_indices.size(), false), m_spares(m_indices.size(), nullptr) {}
+          m_touched(m_indices.size(), false), m_spares(m_indices.size(), nullptr),
+          m_report(make_report()), m_undefined((m_indices.size() + 63) / 64, 0) {}
 
     // m_spares may hold detached-but-not-freed betree_variable objects
     // (see reset()'s own comment) that never made it back into m_event's
@@ -156,6 +157,7 @@ public:
         for (betree_variable* spare : m_spares) {
             if (spare != nullptr) betree_free_variable(spare);
         }
+        free_report(m_report);
     }
     betree_event_sink(const betree_event_sink&) = delete;
     betree_event_sink& operator=(const betree_event_sink&) = delete;
@@ -232,6 +234,16 @@ public:
 
     be::Event& native() { return m_event; }
 
+    // Persistent report/undefined-bitmap buffers for
+    // betree_matching_engine::search() to pass into Tree::search_reusing(),
+    // avoiding a fresh make_report()/make_undefined() allocation on every
+    // single row - see search_reusing()'s own doc comment (betree_cpp.hpp).
+    // `m_report` must be reset (see reset() below) before each reuse;
+    // `m_undefined` needs no such reset, search_reusing() recomputes it in
+    // place every call.
+    struct report* report() { return m_report; }
+    std::uint64_t* undefined_scratch() { return m_undefined.data(); }
+
     // Clears every attribute slot this row didn't touch back to unset (so
     // a row with fewer attributes than a previous one can never see that
     // previous row's leftover value - see reuses_events()'s own doc
@@ -267,6 +279,14 @@ public:
             }
             m_touched[i] = false;
         }
+        // Leaves m_report ready for the next search_reusing() call - see
+        // report()'s own doc comment above for why this belongs here
+        // (right after a search, not before the next one): reset() already
+        // runs unconditionally after every search (see
+        // betree_matching_engine::search() below), so this keeps that same
+        // "always call reset() after search, sink is ready to reuse again"
+        // invariant covering the report too, not just the event.
+        betree_reset_report(m_report);
     }
 
 private:
@@ -304,6 +324,8 @@ private:
     const small_attr_map<std::size_t>& m_indices;
     std::vector<bool> m_touched;
     std::vector<betree_variable*> m_spares;
+    struct report* m_report;
+    std::vector<std::uint64_t> m_undefined;
 };
 
 class betree_matching_engine : public matching_engine {
@@ -340,10 +362,18 @@ public:
     // with_float, see their doc comments) separately covers the
     // per-attribute betree_make_*_variable() cost this method's own reset
     // doesn't touch.
+    // search_reusing() (not search()): sink already owns a persistent
+    // report/undefined-scratch pair (see betree_event_sink::report()/
+    // undefined_scratch()'s own doc comments) sized once for this tree's
+    // attribute count instead of allocated fresh on every row - "Increment
+    // C" of the be-tree reuse work, covering the __libc_calloc costs
+    // make_undefined()/make_report() showed up as in profiling, on top of
+    // Increments A (event-container reuse) and B (per-variable reuse)
+    // above.
     std::vector<uint64_t> search(event_sink& event) const override {
         auto& sink = static_cast<betree_event_sink&>(event);
         try {
-            auto matched = m_tree.search(sink.native()).matched_subs;
+            auto matched = m_tree.search_reusing(sink.native(), sink.report(), sink.undefined_scratch());
             sink.reset();
             return matched;
         } catch (const std::exception& e) {
