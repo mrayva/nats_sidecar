@@ -1220,6 +1220,60 @@ completely gone from the top 20 (were ~1.27% each, ~2.5% combined, in the previo
 `populate_event`'s own profile symbol now shows `std::shared_ptr<spdlog::logger> const&` in its
 demangled signature, directly confirming the fix is the one actually running.
 
+## be-tree: event-container reuse ("Increment A")
+
+**Re-ran the a-tree/be-tree head-to-head** (single instance, msgpack, same real 115,020,848-row NYSE
+backlog, current binary) to check whether the gap - last measured at ~8% - had moved, since a-tree
+had since picked up three more engine-specific fixes (strlen, String-buffer reuse, name-to-id
+caching) be-tree structurally doesn't share:
+
+| | a-tree | be-tree |
+|---|---:|---:|
+| steady-state throughput | ~11,700 batches/s | ~9,380 batches/s |
+
+**The gap had widened to ~25%.** be-tree's own profile pointed at one clear, dominant cause:
+`betree_make_float_variable` (9.64%), `betree_matching_engine::make_event()` (4.43%),
+`__libc_calloc` (5.88%), and `cfree` (3.41%) - ~23% of the whole profile - all traced to the same
+root: `matching_engine::reuses_events()` was `false` for be-tree, so every row got a brand new
+`betree_event` (a fresh `bmalloc()` for the struct plus a fresh `bcalloc()` for its
+variable-pointer array via `betree_make_event()`) instead of reusing one across the batch the way
+a-tree's `EventBuilder::recycle_event()` already does.
+
+**Traced into be-tree's own C source before touching anything, to scope the risk properly.**
+`Event::clear(index)` (`betree_cpp.hpp`) turned out to already be exactly the primitive needed:
+just `betree_set_variable(event, index, nullptr)`, which safely frees whatever was in that slot and
+clears it - an existing, already-exercised be-tree call (every `with_undefined()` already goes
+through it), not new or unverified C code. That meant reusing the event *container* was
+substantially lower-risk than reusing individual *variables* (which would need genuinely new
+be-tree C API to update a value in place, and remains a separate, deliberately-deferred "Increment
+B" - see below).
+
+**Fixed** (`nats_sidecar`@`d94730a`): `betree_matching_engine::reuses_events()` now returns `true`.
+`betree_event_sink::reset()` loops `Event::clear()` over every attribute index;
+`betree_matching_engine::search()` calls it unconditionally after every search (success or
+failure), so a reused sink is always "blank" for the next row - the same blanket-reset principle
+a-tree's own recycling uses, rather than tracking which specific slots need clearing. New test
+`event_sink_reused_across_searches_has_no_stale_values` (parameterized over both engines) reuses one
+sink across three searches, the second deliberately setting *fewer* attributes than the first, and
+checks against expressions chosen so a leaked stale value would flip the answer. Verified two ways:
+the normal 262-test suite, and the same suite again under nats_sidecar's existing ASan+UBSan
+sanitizer build (`build-sanitizer/`) - both clean, no leaks, no sanitizer errors.
+
+**Measured real**: re-profiled be-tree again. `betree_matching_engine::make_event()` dropped from
+4.43% to 0.02%, and `betree_make_event` itself (the be-tree C function) to 0.00% - both now called
+once per *batch* instead of once per *row*, exactly as designed; `match_columnar_batch`'s own
+self-time dropped from 8.44% to 1.98% alongside it. Steady-state throughput: ~9,380 -> ~10,770
+batches/s (~15% gain) - the a-tree/be-tree gap is back down to roughly ~9%, close to where it stood
+before this session's a-tree-only fixes widened it to ~25%.
+
+**What's still not covered ("Increment B", not attempted)**: `betree_make_float_variable` itself
+(11.63% post-fix, now the single largest be-tree-specific symbol) - be-tree allocates a fresh native
+variable object on every individual attribute *set* regardless of whether the event container is
+fresh or reused, and there's no existing be-tree API to update an already-set slot's value in place.
+Building one would be real surgery on be-tree's memory-managed C code (the class of change where a
+mistake means use-after-free, not a compile error) - a separate, deliberately bigger and riskier
+piece of work, not started here.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
