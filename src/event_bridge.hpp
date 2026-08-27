@@ -17,14 +17,17 @@
 #include <string>
 #include <vector>
 #include <optional>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace sidecar {
 
-// Precomputed lookup: attribute name -> schema definition
+// Precomputed lookup: attribute name -> schema definition. Looked up by
+// string_view_lookup_map<> (matching_engine.hpp) - heterogeneous find() by
+// std::string_view, not requiring a caller to already have an owned
+// std::string just to look a name up (see populate_event() below, which
+// looks this up once per (row, attribute) pair).
 struct attribute_schema {
-    std::unordered_map<std::string, attribute_type> types;
+    string_view_lookup_map<attribute_type> types;
 
     explicit attribute_schema(const std::vector<attribute_def>& defs) {
         for (const auto& d : defs) {
@@ -32,7 +35,7 @@ struct attribute_schema {
         }
     }
 
-    std::optional<attribute_type> lookup(const std::string& name) const {
+    std::optional<attribute_type> lookup(std::string_view name) const {
         auto it = types.find(name);
         if (it != types.end()) return it->second;
         return std::nullopt;
@@ -54,9 +57,14 @@ bool populate_event(
 
     auto keys = reader.mapKeys();
     for (auto key_sv : keys) {
-        std::string key(key_sv);
-
-        auto type_opt = schema.lookup(key);
+        // key_sv is used directly as the lookup key and the event_sink name
+        // argument below - no owned std::string needed for either: schema
+        // lookup() takes string_view via string_view_lookup_map<>'s
+        // heterogeneous find(), and event_sink's with_*() methods all take
+        // string_view too (see matching_engine.hpp) - constructing a
+        // std::string here would just be an allocation neither consumer
+        // needs.
+        auto type_opt = schema.lookup(key_sv);
         if (!type_opt) continue;
 
         auto value = reader[key_sv];
@@ -65,35 +73,35 @@ bool populate_event(
             switch (*type_opt) {
                 case attribute_type::boolean:
                     if (value.isBool()) {
-                        builder.with_boolean(key, value.asBool());
+                        builder.with_boolean(key_sv, value.asBool());
                     } else {
-                        builder.with_undefined(key);
+                        builder.with_undefined(key_sv);
                     }
                     break;
 
                 case attribute_type::integer:
                     if (value.isInt() || value.isUInt()) {
-                        builder.with_integer(key, value.asInt64());
+                        builder.with_integer(key_sv, value.asInt64());
                     } else {
-                        builder.with_undefined(key);
+                        builder.with_undefined(key_sv);
                     }
                     break;
 
                 case attribute_type::float_val:
                     if (value.isFloat()) {
-                        builder.with_float(key, value.asDouble());
+                        builder.with_float(key_sv, value.asDouble());
                     } else if (value.isInt() || value.isUInt()) {
-                        builder.with_float(key, static_cast<double>(value.asInt64()));
+                        builder.with_float(key_sv, static_cast<double>(value.asInt64()));
                     } else {
-                        builder.with_undefined(key);
+                        builder.with_undefined(key_sv);
                     }
                     break;
 
                 case attribute_type::string:
                     if (value.isString()) {
-                        builder.with_string(key, std::string(value.asStringView()));
+                        builder.with_string(key_sv, value.asStringView());
                     } else {
-                        builder.with_undefined(key);
+                        builder.with_undefined(key_sv);
                     }
                     break;
 
@@ -106,9 +114,9 @@ bool populate_event(
                             auto elem = value[i];
                             if (elem.isString()) list.emplace_back(elem.asString());
                         }
-                        builder.with_string_list(key, list);
+                        builder.with_string_list(key_sv, list);
                     } else {
-                        builder.with_undefined(key);
+                        builder.with_undefined(key_sv);
                     }
                     break;
 
@@ -121,15 +129,15 @@ bool populate_event(
                             auto elem = value[i];
                             if (elem.isInt() || elem.isUInt()) list.push_back(elem.asInt64());
                         }
-                        builder.with_integer_list(key, list);
+                        builder.with_integer_list(key_sv, list);
                     } else {
-                        builder.with_undefined(key);
+                        builder.with_undefined(key_sv);
                     }
                     break;
             }
         } catch (const std::exception& e) {
-            if (log) log->debug("event_bridge: failed to extract field '{}': {}", key, e.what());
-            try { builder.with_undefined(key); } catch (...) {}
+            if (log) log->debug("event_bridge: failed to extract field '{}': {}", key_sv, e.what());
+            try { builder.with_undefined(key_sv); } catch (...) {}
         }
     }
 

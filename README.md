@@ -821,6 +821,72 @@ but modest further gain (60.8% -> 63.2%) on top of `columnar_rows()`'s much larg
 (53.9% -> 60.8%), not a second dramatic step change. Both fixes are additive, not redundant, and
 neither regresses the other.
 
+**Swept `--workers` down at N=12 with both fixes to find the new zero-loss point**, same
+methodology as the earlier row-mode and columnar sweeps above:
+
+| `--workers` | batches processed | batches dropped |
+|---:|---:|---:|
+| 24 | 144,330 (62.7%) | 85,937 (37.3%) |
+| 6  | 197,446 (85.8%) | 32,654 (14.2%) |
+| 4  | 213,398 (92.8%) | 16,679 (7.2%)  |
+| 3  | 230,070 (**100.0%**) | **0** |
+
+`--workers 3` is the new exactly-loss-free point (up from `--workers 2` with `columnar_rows()`
+alone) - a sharp threshold again, not gradual (7.2% loss at 4, 0% at 3), consistent with every
+other threshold found in this investigation. Both perf fixes together bought this fleet roughly
+one more `--workers` step of headroom at N=12.
+
+**Investigated the three next-largest profile categories on request** (allocator, read-side
+msgpack unpacking, this codebase's own orchestration/glue) rather than assume any of them had
+easy further headroom:
+
+- **Orchestration/glue - found and fixed a real, avoidable double allocation.**
+  `populate_event()` did `std::string key(key_sv)` - allocating a new string every (row, attribute)
+  pair - purely to satisfy `attribute_schema::lookup()` and `event_sink`'s `with_*()` methods,
+  both of which were typed `const std::string&`. Neither actually needed an owned string:
+  `atree::EventBuilder`'s own methods (`atree.hpp`) already take `std::string_view` throughout,
+  converting to an owned string only once, at the point they need a null-terminated C string for
+  the Rust FFI boundary - `populate_event()`'s own `std::string key` was a second, wholly redundant
+  allocation on top of that unavoidable one. Fixed: `event_sink`'s virtual interface and both
+  concrete implementations (`atree_event_sink`, `betree_event_sink`) now take `std::string_view`
+  directly; `attribute_schema::types` and `betree_event_sink`'s index map both switched to a
+  transparent-hash `unordered_map` (new `string_view_lookup_map<V>` in `matching_engine.hpp`) so
+  `.find()` accepts a `string_view` without constructing a `std::string` first;
+  `populate_event()` now passes `key_sv` straight through everywhere, allocation-free. Also caught
+  and fixed a second, smaller redundant copy in the same function: the `string` case wrapped
+  `value.asStringView()` in `std::string(...)` before calling `with_string()`, even though that
+  method's value parameter was already `std::string_view` - pure wasted copy-then-discard.
+  Verified: full 260-test suite passes unchanged (behavior, not implementation, is what's tested).
+  **Measured honestly**: single-instance steady-state throughput came back statistically
+  indistinguishable before/after (~6,158 batches/s both times, in windows chosen to be equally
+  deep in a saturated backlog) - matching-engine and allocator categories both did shrink a little
+  in the profile (25.7%->22.6% and 22.9%->21.8% respectively, consistent with a real eliminated
+  allocation), but at this one-attribute schema the absolute effect is too small to clear
+  measurement noise in a single-instance benchmark. Real, zero-risk, worth keeping (a schema with
+  more attributes would show more) - not a lever that moved this benchmark, the same honest
+  pattern as the write-side raw-copy fix above.
+
+- **Allocator, beyond the fix above - identified further real cost, not yet acted on.**
+  `matching_engine::make_event()` returns `std::unique_ptr<event_sink>` - a heap allocation for the
+  sink object itself on *every* row, on top of whatever the concrete engine's own event builder
+  allocates internally (a-tree's `EventBuilder::new()`/`with_float()` show up as some of the
+  largest single symbols in the profile, ~4.3%+3.1%). A pooled/reusable event object (avoiding the
+  per-row `make_unique`, and ideally letting a-tree's own builder be reset and reused rather than
+  rebuilt) would plausibly cut into this further, but reusing a-tree's builder specifically would
+  need an upstream a-tree change - `atree.hpp`'s own docs already note it has "no reset/reuse API,
+  single-use by design" (see the `HashMap`->`Vec` fix earlier in this file for where that comment
+  came from). A local-only fix (object-pool the `unique_ptr<event_sink>` itself, still rebuilding
+  the a-tree builder fresh inside it each time) would only address part of the cost. Not
+  implemented this session - a genuine further lever, but one that needs either a cross-repo
+  change or a smaller one worth scoping and measuring on its own rather than folding in here.
+
+- **Read-side msgpack unpacking - little further low-risk headroom found.** `mp_skip` and
+  `ColumnarRows::advance()`'s sequential walk are already the O(n) minimum for msgpack's
+  variable-length encoding after this session's earlier round-trip fix - there's no second
+  redundant pass left to cut, short of a fundamentally different wire representation (e.g. a
+  fixed-width columnar format) that's out of scope for "improve the existing msgpack path."
+  Nothing changed here.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.

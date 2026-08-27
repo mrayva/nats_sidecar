@@ -2,7 +2,6 @@
 #include "dialect.hpp"
 #include <atree.hpp>
 #include <betree_cpp.hpp>
-#include <unordered_map>
 
 namespace sidecar {
 
@@ -39,25 +38,25 @@ class atree_event_sink : public event_sink {
 public:
     explicit atree_event_sink(atree::EventBuilder builder) : m_builder(std::move(builder)) {}
 
-    void with_boolean(const std::string& name, bool value) override {
+    void with_boolean(std::string_view name, bool value) override {
         m_builder.with_boolean(name, value);
     }
-    void with_integer(const std::string& name, int64_t value) override {
+    void with_integer(std::string_view name, int64_t value) override {
         m_builder.with_integer(name, value);
     }
-    void with_float(const std::string& name, double value) override {
+    void with_float(std::string_view name, double value) override {
         m_builder.with_float(name, value);
     }
-    void with_string(const std::string& name, std::string_view value) override {
+    void with_string(std::string_view name, std::string_view value) override {
         m_builder.with_string(name, value);
     }
-    void with_string_list(const std::string& name, const std::vector<std::string>& values) override {
+    void with_string_list(std::string_view name, const std::vector<std::string>& values) override {
         m_builder.with_string_list(name, values);
     }
-    void with_integer_list(const std::string& name, const std::vector<int64_t>& values) override {
+    void with_integer_list(std::string_view name, const std::vector<int64_t>& values) override {
         m_builder.with_integer_list(name, values);
     }
-    void with_undefined(const std::string& name) override {
+    void with_undefined(std::string_view name) override {
         m_builder.with_undefined(name);
     }
 
@@ -100,7 +99,7 @@ private:
 // atree::EventBuilder) - indices are assigned in schema-declaration order
 // and looked up by name here to keep event_sink's interface uniform.
 be::Tree build_betree(const std::vector<attribute_def>& attributes,
-                       std::unordered_map<std::string, std::size_t>& indices_out)
+                       string_view_lookup_map<std::size_t>& indices_out)
 {
     be::Tree tree;
     std::size_t idx = 0;
@@ -132,50 +131,50 @@ be::Tree build_betree(const std::vector<attribute_def>& attributes,
 
 class betree_event_sink : public event_sink {
 public:
-    betree_event_sink(be::Event event, const std::unordered_map<std::string, std::size_t>& indices)
+    betree_event_sink(be::Event event, const string_view_lookup_map<std::size_t>& indices)
         : m_event(std::move(event)), m_indices(indices) {}
 
-    void with_boolean(const std::string& name, bool value) override {
+    void with_boolean(std::string_view name, bool value) override {
         m_event.set_boolean(index_for(name), value);
     }
-    void with_integer(const std::string& name, int64_t value) override {
+    void with_integer(std::string_view name, int64_t value) override {
         m_event.set_integer(index_for(name), value);
     }
-    void with_float(const std::string& name, double value) override {
+    void with_float(std::string_view name, double value) override {
         m_event.set_float(index_for(name), value);
     }
-    void with_string(const std::string& name, std::string_view value) override {
+    void with_string(std::string_view name, std::string_view value) override {
         m_event.set_string(index_for(name), value);
     }
-    void with_string_list(const std::string& name, const std::vector<std::string>& values) override {
+    void with_string_list(std::string_view name, const std::vector<std::string>& values) override {
         std::vector<std::string_view> views(values.begin(), values.end());
         m_event.set_string_list(index_for(name), views);
     }
-    void with_integer_list(const std::string& name, const std::vector<int64_t>& values) override {
+    void with_integer_list(std::string_view name, const std::vector<int64_t>& values) override {
         m_event.set_integer_list(index_for(name), values);
     }
-    void with_undefined(const std::string& name) override {
+    void with_undefined(std::string_view name) override {
         m_event.clear(index_for(name));
     }
 
     be::Event& native() { return m_event; }
 
 private:
-    std::size_t index_for(const std::string& name) const {
+    std::size_t index_for(std::string_view name) const {
         auto it = m_indices.find(name);
         if (it == m_indices.end()) {
-            throw matching_engine_error("unknown attribute: " + name);
+            throw matching_engine_error("unknown attribute: " + std::string(name));
         }
         return it->second;
     }
 
     be::Event m_event;
-    const std::unordered_map<std::string, std::size_t>& m_indices;
+    const string_view_lookup_map<std::size_t>& m_indices;
 };
 
 class betree_matching_engine : public matching_engine {
 public:
-    betree_matching_engine(be::Tree tree, std::unordered_map<std::string, std::size_t> indices)
+    betree_matching_engine(be::Tree tree, string_view_lookup_map<std::size_t> indices)
         : m_tree(std::move(tree)), m_indices(std::move(indices)) {}
 
     void insert(uint64_t id, const std::string& expression) override {
@@ -205,7 +204,7 @@ public:
 
 private:
     be::Tree m_tree;
-    std::unordered_map<std::string, std::size_t> m_indices;
+    string_view_lookup_map<std::size_t> m_indices;
 };
 
 } // namespace
@@ -217,7 +216,7 @@ std::unique_ptr<matching_engine> build_matching_engine(
         case engine_type::atree:
             return std::make_unique<atree_matching_engine>(build_atree(attributes));
         case engine_type::betree: {
-            std::unordered_map<std::string, std::size_t> indices;
+            string_view_lookup_map<std::size_t> indices;
             auto tree = build_betree(attributes, indices);
             return std::make_unique<betree_matching_engine>(std::move(tree), std::move(indices));
         }
