@@ -1198,6 +1198,28 @@ exact call path (strlen -> String-buffer reuse -> name-to-id resolution) - each 
 verified by re-profiling rather than assumed from the code change alone, which is exactly what
 caught this one's first attempt not actually working.
 
+**Next target: `shared_ptr<spdlog::logger>` passed by value through the per-row match path.**
+`populate_event()`/`match_message()`/`match_columnar_batch()`/`deserialize_and_match()`/
+`deserialize_and_match_columnar()` (`event_bridge.hpp`/`.cpp`) all took
+`std::shared_ptr<spdlog::logger> log` by value, even though every one of them only ever reads
+through it synchronously (`log->debug/warn(...)`) - never stores it or extends its lifetime.
+`match_columnar_batch()`'s per-row `process_row()` lambda calls `match_message()`, which calls
+`populate_event()` - two nested by-value copies per row, four atomic refcount operations, purely to
+satisfy parameters that never needed ownership in the first place. Showed up in every format's
+profile (not just one) as `shared_ptr::_M_add_ref_copy`/`_M_release`, since the logger is threaded
+through on every row regardless of which wire format is in use.
+
+**Fixed** (`nats_sidecar`@`9f1a049`): changed all 8 signatures (5 in `event_bridge.hpp`, 3 in
+`event_bridge.cpp`) to take `const std::shared_ptr<spdlog::logger>&` instead. Every call site
+already passes an lvalue (a parameter, a member like `worker_pool::m_log`, or a reference captured
+by `process_row`'s lambda), so nothing else needed to change - a pure signature fix. Full 260-test
+suite passes unchanged.
+
+**Measured real**: re-profiled msgpack again. `shared_ptr::_M_add_ref_copy`/`_M_release` are
+completely gone from the top 20 (were ~1.27% each, ~2.5% combined, in the previous capture) -
+`populate_event`'s own profile symbol now shows `std::shared_ptr<spdlog::logger> const&` in its
+demangled signature, directly confirming the fix is the one actually running.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
