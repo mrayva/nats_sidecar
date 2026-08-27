@@ -186,7 +186,7 @@ struct row_match {
     std::vector<char> payload;   // this row's own standalone bytes, same format as the input batch
 };
 
-// Writes `row` (one element of a zerialize::expand_columnar() result - a
+// Writes `row` (one row of a zerialize::columnar_rows() view - a
 // normal row-shaped map reader) into its own standalone document of the
 // same protocol. Mirrors zerialize::translate<DstP>()'s internal body
 // (RootSerializer + Writer + write_value + finish()) but returns raw bytes
@@ -213,14 +213,19 @@ std::vector<char> serialize_row(const Reader& row) {
 // row's tree.search() call.
 //
 // BSON is not supported here (format == binary_format::bson is rejected at
-// config-validation time before this function is ever called): expand_columnar
-// materializes a root-level array, and BSON's wire format cannot round-trip
-// a root-level array (a document and an array are byte-identical on the
-// wire; only a *parent* element's header records which one a value is, and
-// the root has no parent - see zerialize/protocols/bson.hpp and
-// zerialize/test/test_zerialize.cpp's test_bson_specific() for why BSON is
-// excluded from zerialize's own generic protocol test harness for the same
-// reason).
+// config-validation time before this function is ever called, and has no
+// case below). Historically this was because expand_columnar() materialized
+// a root-level array, which BSON's wire format can't round-trip (a document
+// and an array are byte-identical on the wire; only a *parent* element's
+// header records which one a value is, and the root has no parent - see
+// zerialize/protocols/bson.hpp). match_columnar_batch() no longer calls
+// expand_columnar() (see its own comment), so that specific blocker no
+// longer applies - every root value this path produces is a document (the
+// source columnar record, and each matched row's own standalone payload),
+// never an array. BSON support could plausibly be added now, but that's a
+// deliberate scope decision someone still needs to make (new test coverage,
+// a config-validation change, a README update) - not a side effect of this
+// perf change, so the exclusion stays as-is for now.
 std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     const matching_engine& tree,
     const attribute_schema& schema,

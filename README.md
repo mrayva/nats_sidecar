@@ -645,6 +645,42 @@ the unoptimized profile first suggested. The bigger remaining lever is still the
 reading directly off the original column arrays, skipping that intermediate buffer entirely, would
 cut into roughly half of the ~37-44% msgpack share - not yet built.
 
+**Built and measured.** Added `zerialize::columnar_rows()` (zerialize commit `9878b79`) - a
+forward-only cursor that walks a columnar-shaped `Reader` directly, one row at a time, giving the
+same per-row field values `expand_columnar()` does with no `Writer` pass and no second
+`Deserializer` parsing the result back in. Same validation, same O(n*m) column/row access pattern
+(each column resolved once, walked sequentially via `.elements()` when the protocol provides it -
+same idiom as `write_expanded_columnar()`), just never materializing the expanded document.
+Cross-checked row-for-row against `expand_columnar()`'s own output across all 7 non-BSON protocols
+in zerialize's test suite before this project ever depended on it. `match_columnar_batch()` in
+`event_bridge.cpp` was rewritten to use it in place of `expand_columnar<Protocol>()` - `populate_event`/
+`match_message` needed **zero changes** (a `ColumnarRows` row is just another `Reader`).
+
+Verified with the same controlled methodology as the a-tree/be-tree comparison above: two binaries
+built from the same properly-optimized `RelWithDebInfo` config, one at the commit just before this
+change (still calling `expand_columnar()`), one after, single instance, same full 115,020,848-row
+NYSE table published as a `--batch-size 500 --batch-encoding native` backlog, `perf record` for a
+10-second window while each drained it, steady-state batches/s measured from the stats log across
+that same window:
+
+| | batches/s (single instance) | msgpack/round-trip share of CPU | msgpack/round-trip cost per batch |
+|---|---:|---:|---:|
+| before (`expand_columnar`) | ~4,575 | 44.5% | ~97.3µs |
+| after (`columnar_rows`) | ~6,105 | 27.6% | ~45.2µs |
+
+**A real ~33% single-instance batch-throughput gain, and it's cleanly attributable to the round trip
+specifically, not a general speedup that happens to correlate.** Converting both profiles' relative
+percentages to absolute per-batch CPU cost (each profile's total CPU-time-per-batch is just
+`1/throughput`) makes this precise: total cost dropped from ~218.6µs/batch to ~163.8µs/batch (a
+54.8µs drop), and the msgpack/round-trip category alone accounts for 52.1µs of that (~95% of the
+total reduction) - every other category (matching engine, allocator, this codebase's own
+orchestration, stats timing) stayed flat or improved slightly in absolute terms, none of them
+regressed to offset the gain. The round-trip's own cost roughly halved (97.3µs -> 45.2µs, a 53.5%
+cut), matching the "roughly half of the ~37-44% share" estimate above almost exactly - what's left
+in that category now is `columnar_rows::advance()`'s own single sequential `mp_skip` walk over the
+source payload, which is unavoidable (something has to read the bytes once), not a second write-then-
+reparse of them.
+
 **This means the N=12 full-table "~265k rows/s sustained ceiling" measured above is now stale** -
 it was measured against the pre-fix binary. Re-ran the *exact same* N=12/`--workers 24` full-table
 benchmark (same 115,020,848-row NYSE table, same `--batch-size 500 --batch-encoding native`, same

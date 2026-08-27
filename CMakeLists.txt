@@ -116,7 +116,7 @@ set(ZERIALIZE_ENABLE_BEVE ON CACHE BOOL "Enable BEVE (via glaze) for the sidecar
 FetchContent_Declare(
     zerialize
     GIT_REPOSITORY https://github.com/mrayva/zerialize.git
-    GIT_TAG        241754796b73d8fa551662ea163a761a7329545e
+    GIT_TAG        9878b79f9af60283ff21ae171012965dc9c80dcb
     SYSTEM
 )
 FetchContent_MakeAvailable(zerialize)

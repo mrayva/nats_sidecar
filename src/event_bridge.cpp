@@ -63,25 +63,25 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     std::size_t* rows_searched_out)
 {
     typename Protocol::Deserializer reader(bytes);
-    auto rows = zerialize::expand_columnar<Protocol>(reader);
-    const std::size_t n = rows.arraySize();
+
+    // columnar_rows() walks `reader` (the columnar-shaped payload) directly,
+    // one row at a time - it does not build the row-major document
+    // expand_columnar() used to (a Writer pass, then a fresh Deserializer
+    // parsing exactly what was just written straight back in). That
+    // write-then-read round trip was itself the single largest CPU cost in
+    // this whole request path once the O(n^2) row/column-indexing bugs on
+    // both sides of it were fixed (confirmed via perf) - bigger than
+    // matching_engine::search(), populate_event(), and everything else in
+    // this function combined. See zerialize/columnar.hpp's columnar_rows()
+    // doc comment for how it gets the same values without materializing.
+    auto rows = zerialize::columnar_rows(reader);
+    const std::size_t n = rows.size();
     if (rows_searched_out) *rows_searched_out = n;
 
     std::vector<row_match> result;
     std::chrono::nanoseconds total_search_time{0};
     bool any_search_time = false;
 
-    // Walk rows sequentially via elements() when the format provides a
-    // single-pass forward iterator (msgpack/CBOR/Ion/BEVE) instead of
-    // indexing rows[i] - operator[](size_t) is an O(i) linear skip-from-
-    // start for those formats (confirmed directly via perf: this one line
-    // was 58% of all CPU time processing a real columnar batch, dwarfing
-    // both matching_engine::search() and populate_event() combined). Only
-    // Flex/Zera are genuinely O(1) per index, so the fallback below is
-    // never worse than before this fix. This is the exact same antipattern
-    // already fixed on the *producing* side in zerialize's
-    // write_expanded_columnar (columnar.hpp) - it just wasn't obvious that
-    // *consuming* an already-expanded row array by index is equally costly.
     auto process_row = [&](std::size_t i, auto&& row) -> bool {
         std::optional<std::chrono::nanoseconds> row_search_time;
         auto matches = match_message(tree, schema, row, log, &row_search_time);
@@ -106,15 +106,9 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     };
 
     bool ok = true;
-    if constexpr (requires { rows.elements(); }) {
-        std::size_t i = 0;
-        for (auto&& row : rows.elements()) {
-            if (!process_row(i++, row)) { ok = false; break; }
-        }
-    } else {
-        for (std::size_t i = 0; i < n; ++i) {
-            if (!process_row(i, rows[i])) { ok = false; break; }
-        }
+    std::size_t i = 0;
+    for (auto&& row : rows) {
+        if (!process_row(i++, row)) { ok = false; break; }
     }
     if (!ok) return std::nullopt;
 
