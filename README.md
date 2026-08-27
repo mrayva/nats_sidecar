@@ -1160,6 +1160,44 @@ as the test case: reconfigured, ran `make` alone (no manual workaround) in both 
 `build-perf/` - both correctly showed `Compiling a-tree-ffi` and relinked. A following no-op
 `make` completes in ~0.2s, confirming negligible steady-state cost.
 
+**Went one level deeper on the same call path again: resolving an attribute *name* to its internal
+id, not just reading or copying it.** `EventBuilder::with_float()` (core `a-tree`) resolves `name`
+via `AttributeTable::by_name()` - a hash-and-probe lookup - on every single call, even though a
+caller building many events against the same tree (e.g. one per row of a batch) very often sets the
+exact same, invariant attribute names every time. Showed up in the post-fix profile as
+`core::hash::sip::Hasher::write` plus part of `EventBuilder::with_float`'s own share.
+
+**First attempt didn't actually work, caught by re-profiling rather than assumed.**
+`mrayva/a-tree`@`9caa557` added `ATree::attribute_id()` + index-based `EventBuilder::with_*_by_id()`
+methods (skip the hash lookup given an already-resolved id) and cached every attribute's id in
+`a-tree-ffi`'s `ATreeHandle` at `atree_new()` time - but `atree_search()`'s replay loop still called
+`handle.attribute_ids.get(name)` on **every row**, which is itself a hash lookup by name. The fix
+relocated the cost from core a-tree's internal hashmap to a-tree-ffi's own one, without eliminating
+it from the per-row path at all. Caught immediately by re-profiling instead of assuming success:
+`hash_one::<&String>` was still sitting in the top 20, at roughly the same share the original
+lookup had.
+
+**Real fix, `mrayva/a-tree`@`bc434fb`**: `push_attr()` (see the buffer-reuse fix above) now also
+caches the resolved `AttributeId` *in the slot itself*, invalidating it back to `None` only when
+the incoming name genuinely differs from what that slot held last time - in the steady-state case
+(the same schema attribute set on every row), a slot's id is resolved exactly **once**, on its
+first use, and never looked up again. `atree_search()`'s replay loop only touches
+`attribute_ids` when a slot's cached id is `None`, writing the result back into the slot for every
+subsequent row to reuse. The existing `reused_slot_correctly_overwrites_a_shorter_or_longer_attribute_name`
+test (alternates two different names in the same slot across three searches) already exercised the
+invalidation path and still passes - proof the cache genuinely tracks per-slot identity correctly,
+not just "does it happen to work for the common case." `nats_sidecar` pin bump `38710b5`, full
+260-test suite passes.
+
+**Measured real**: re-profiled msgpack a third time. `core::hash::sip`/`hash_one::<&String>` are
+completely gone from the top 20 this time (the only remaining `_Hash_bytes` symbol, ~0.95%, is
+unrelated - libstdc++'s own, not core a-tree's `AttributeTable`). `with_float_by_id` (8.19%) and
+`push_attr` (5.18%) are now genuinely just the value-write/`Decimal::new()` cost and the name
+comparison/slot write respectively, not hashing hiding inside either. This is the third fix on this
+exact call path (strlen -> String-buffer reuse -> name-to-id resolution) - each one real, each one
+verified by re-profiling rather than assumed from the code change alone, which is exactly what
+caught this one's first attempt not actually working.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
