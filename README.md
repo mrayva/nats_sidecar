@@ -605,19 +605,45 @@ remaining cost is **not** dominated by msgpack row-unpacking at all:
 | this codebase's own orchestration (`populate_event`, `match_columnar_batch`, schema lookup) | 5.0% |
 | the actual matching algorithm (`ATree::search`, `process_predicates`) | ~2.4% |
 
-The single biggest cost is `atree::Tree::make_event()` allocating a fresh Rust
-`HashMap<String, EventAttributeValue>` on *every row*, even though the schema (which attributes
-exist) never changes between rows - `with_float("price", v)` inserts into it (hashing the string
-key, triggering a grow-from-empty rehash), and `search()` consumes and frees the whole thing.
-Checked a-tree's C++ wrapper (`atree.hpp`) directly: `EventBuilder` has no reset/reuse API, it's
-single-use by design - this is a real a-tree_ffi limitation, not something fixable inside
-nats_sidecar. This also surfaces an open question rather than a closed one: if a-tree's own
-overhead is the majority of a single instance's CPU time, the a-tree/be-tree N=12 comparison above
-(statistically identical throughput) is harder to explain than first framed - it hasn't been
-checked whether be-tree's own event construction carries a comparably large tax of its own, or
-whether something shared between both engines (the msgpack pipeline, `worker_pool`'s queueing) is
-the real fleet-level bottleneck instead of whatever a single isolated instance's `perf` profile
-shows. Not resolved - would need the same profiling pass run against be-tree specifically.
+**That 53.7% figure turned out to itself be an artifact, caught by trying to act on it.** Attempting
+to actually fix it (see below) required checking how `nats_sidecar`'s `build-perf/` (RelWithDebInfo)
+profiling build compiled a-tree's Rust code - and found `cmake/BuildAtree.cmake` selected the
+optimized `cargo build --release` profile only for the exact string `"Release"`, silently leaving
+`RelWithDebInfo` (every profiling build in this project) compiling a-tree with **zero Rust
+optimizations** while the surrounding C++ was fully optimized. That asymmetry inflated a-tree's
+apparent share of CPU time in every profile captured up to this point - the 53.7%/20.5% split above
+does not hold once compilation is made fair. Fixed the build-type check (only `Debug`/unset now
+stays unoptimized, matching how CMake treats build types everywhere else), then re-profiled all
+three configurations - old a-tree (`HashMap`), fixed a-tree (`Vec`, see below), and be-tree - as
+properly-optimized `--release` builds, single instance, same continuous-backlog methodology:
+
+| category | old a-tree (HashMap) | fixed a-tree (Vec) | be-tree |
+|---|---:|---:|---:|
+| matching-engine event construction (Rust FFI / be-tree equivalent) | 16.6% | 15.5% | 12.1% |
+| msgpack row-unpacking (`mp_skip`, `memmove`, buffer writes) | 42.7% | 43.5% | 37.1% |
+| stats timing (`clock_gettime`) | 3.4% | 3.2% | 8.5% |
+| this codebase's own orchestration | 12.8% | 12.7% | 15.1% |
+
+Corrected picture: msgpack row-unpacking is the real dominant cost (~37-44%) at roughly 2.5-3x the
+matching engine's own share (~12-17%), the exact opposite emphasis from the flawed unoptimized
+profile. This also resolves the open question from the a-tree/be-tree N=12 comparison above -
+their near-identical fleet throughput was never surprising: engine choice was never going to move
+the needle much when the shared msgpack pipeline costs 2.5-3x more than either engine's own
+overhead. **Separately, found `atree::Tree::make_event()` allocates a fresh Rust
+`HashMap<String, EventAttributeValue>` on every row for `FfiEventBuilder`'s own staging (checked
+`atree.hpp`: no reset/reuse API, single-use by design) even though the core a-tree crate's own
+`EventBuilder` is already index-based and allocation-light** - fixed upstream in
+`mrayva/a-tree`@`b2bc18f` by replacing that staging `HashMap` with a `Vec<(String, ...)>` (insertion
+order preserved, so replaying it into the core builder gives identical last-write-wins semantics;
+all 15 existing a-tree-ffi tests pass unchanged). Real, but modest once fairly measured: ~1
+percentage point of total CPU (16.6%->15.5%), consistent with a same-order single-instance
+steady-state throughput check (~6,350 vs ~6,270 batches/s, within normal run-to-run noise for a
+single 10-second sample) - a legitimate, zero-risk upstream fix worth keeping, not the large win
+the unoptimized profile first suggested. The bigger remaining lever is still the msgpack side:
+`expand_columnar()` does a full write pass (columns -> a new row-major buffer) that
+`match_columnar_batch` then reads back row-by-row - a real write-then-read round trip. A row view
+reading directly off the original column arrays, skipping that intermediate buffer entirely, would
+cut into roughly half of the ~37-44% msgpack share - not yet built.
 
 **This means the N=12 full-table "~265k rows/s sustained ceiling" measured above is now stale** -
 it was measured against the pre-fix binary. Re-ran the *exact same* N=12/`--workers 24` full-table
