@@ -1030,6 +1030,47 @@ place instead of allocating a fresh one, or reusing variable objects across sear
 a-tree's `EventBuilder` now does - not attempted here, offered as a next step rather than pulled in
 unprompted).
 
+**Extended the write-side raw-copy fast path to BEVE, ruled CBOR out architecturally.** Asked to do
+the same `raw_copy_compatible<V, W>` treatment for CBOR and BEVE that MsgPack already got above.
+CBOR was tried and reverted: jsoncons' CBOR encoder (`basic_cbor_encoder`) tracks a private
+per-container item count, set by `begin_array(n)`/`begin_object(n)` and validated against what
+actually got written at `end_array()`/`end_object()` - it throws
+(`"Too few items were added to a CBOR map or array of known length"`) if a raw value is spliced in
+without going through its own counted write calls, and there's no public API to inject pre-encoded
+bytes while keeping that counter in sync. Confirmed by an actual crash, then fully reverted
+(`cbor.hpp` back to its original state, full zerialize suite re-verified clean) - this is a settled
+architectural conclusion for jsoncons as it stands today, not a "needs more effort" item.
+
+BEVE's own hand-rolled writer has no such bookkeeping (`begin_array(n)`/`begin_map(n)` write the
+count up front, `end_array()`/`end_map()` are literal no-ops), so it was safe. One extra wrinkle
+BEVE has that MsgPack doesn't: its lazy reader can *synthesize* a value with no real backing byte
+range at all (e.g. one element pulled out of a typed array, built on the fly from the array's flat
+packed storage). zerialize's `write_value()` gained a new, general, optional per-*value* escape
+hatch for this (`raw_copy_safe()`, `raw_copy.hpp`) alongside the existing per-*type*
+`raw_copy_compatible` trait - `BeveDeserializer::raw_copy_safe()` returns false for these
+synthesized elements, falling back to the normal decode/re-encode path. Verified with a test that
+hand-crafts a raw BEVE document containing a numeric typed array at the byte level specifically to
+exercise this guard (not just decoded-value equality, which wouldn't have caught the CBOR-style
+failure mode), plus the standard byte-identity test mirroring MsgPack's. Zerialize commit `6e9d417`,
+nats_sidecar pin bump `4d01fd5` - no nats_sidecar code changes needed.
+
+**Measured single-instance** (`format: beve`, `columnar: true`, same real 115,020,848-row NYSE
+backlog and two-binary methodology as the MsgPack write-side measurement above):
+
+| | `serialize_row`+`write_value`+`build_pub_frames` combined self-time |
+|---|---:|
+| before | ~0.81% |
+| after | ~0.67% |
+
+A real but modest reduction - smaller than MsgPack's own write-side win, plausibly because BEVE's
+scalar encoding (fixed-width header + memcpy) was already cheaper than MsgPack's variable-length
+encoding, so there's less to save per value. Aggregate single-instance throughput was statistically
+unchanged (~9,350-9,520 batches/s both ways, within normal run-to-run noise) - same "real, narrow,
+schema-shape-limited" pattern as MsgPack's write-side fix: this schema has one attribute and two
+fields per row, and the read-side columnar/matching-engine work still dominates the profile (the
+top 15 symbols are the same functions in nearly the same proportions before and after). A wider
+schema or higher match rate would show a larger effect.
+
 ## Schema Generation
 
 Writing the `attributes:` section by hand can be tedious and error-prone, especially for wide tables. Two helpers generate it automatically by inspecting actual data.
