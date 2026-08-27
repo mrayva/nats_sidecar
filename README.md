@@ -1266,13 +1266,68 @@ self-time dropped from 8.44% to 1.98% alongside it. Steady-state throughput: ~9,
 batches/s (~15% gain) - the a-tree/be-tree gap is back down to roughly ~9%, close to where it stood
 before this session's a-tree-only fixes widened it to ~25%.
 
-**What's still not covered ("Increment B", not attempted)**: `betree_make_float_variable` itself
-(11.63% post-fix, now the single largest be-tree-specific symbol) - be-tree allocates a fresh native
-variable object on every individual attribute *set* regardless of whether the event container is
-fresh or reused, and there's no existing be-tree API to update an already-set slot's value in place.
-Building one would be real surgery on be-tree's memory-managed C code (the class of change where a
-mistake means use-after-free, not a compile error) - a separate, deliberately bigger and riskier
-piece of work, not started here.
+**What's still not covered ("Increment B" at that point, not yet attempted)**:
+`betree_make_float_variable` itself (11.63%, then the single largest be-tree-specific symbol) -
+be-tree allocates a fresh native variable object on every individual attribute *set* regardless of
+whether the event container is fresh or reused, and there was no existing be-tree API to update an
+already-set slot's value in place.
+
+## be-tree: update scalar variables in place ("Increment B")
+
+**Traced the actual allocation before writing anything, to scope the risk properly** (per the
+user's "how to approach Increment B" ask): `struct value` (be-tree's internal tagged-union-shaped
+struct for a variable's payload) stores `float_value`/`integer_value`/`boolean_value` as *inline
+fields*, not behind a pointer - `betree_make_float_variable()`'s only allocations are the outer
+`betree_variable` struct itself and a `bstrdup()` of the attribute name. That means updating an
+*existing* float/int/bool variable's value is a single field write, with no allocation at all -
+`attr_var` (name + resolved id) and `value_type` never need to change once a variable exists for a
+given slot, since a slot's attribute (and therefore its type) is fixed for the tree's whole
+lifetime.
+
+**The naive design has a real correctness trap, found before writing code.** The first sketch -
+"keep a touched slot's variable alive across rows for reuse, clear only untouched ones" - silently
+reintroduces the exact stale-value bug Increment A exists to prevent: the decision to keep a slot
+alive is made at the end of row N based on row N's own touched-set, before anyone knows whether row
+N+1 will touch it too. be-tree's regular search path has exactly one way to represent "undefined" -
+a null pointer in the slot - so an allocated-but-not-yet-cleared variable sitting there is
+indistinguishable from a genuinely current one. The actual fix needed a small object pool, kept
+deliberately separate from the event's own `variables[]` array.
+
+**Fixed** (`mrayva/be-tree`@`bebd8b6`, `nats_sidecar`@`0fb611f`): added
+`betree_update_{boolean,integer,float}_variable()` to be-tree (a plain field overwrite, additive
+API, scoped to these three scalar types only - string/list values hold their own nested
+allocations, where "update in place" would need real size-comparison/reallocation logic, a separate
+and harder problem not attempted). `betree_event_sink` now keeps a per-slot pool
+(`m_spares`) of detached-but-not-freed variables: `reset()` (Increment A) detaches a touched
+slot's variable directly (`event->variables[i] = nullptr`, bypassing `Event::clear()`'s free) into
+the pool instead of freeing it; `with_boolean`/`with_integer`/`with_float` check the pool first -
+a hit calls the new update function and reattaches the same pointer directly (also bypassing
+`betree_set_variable()`, which would otherwise redundantly re-derive and `bstrdup()` the attribute
+name on every single call even though it's already correct); a miss falls back to the existing
+allocate-and-attach path. The sink's destructor frees anything still sitting in the pool, since
+`betree_free_event()` only walks what's *currently attached*.
+
+New test `event_sink_reused_across_many_cycles_with_staggered_attributes`: 12 searches on one
+reused sink, staggering which of three scalar attributes get touched each cycle on different
+periods, so every attribute cycles through touched->untouched->touched several times - checked
+against expressions that would give a different answer if a value leaked through or failed to
+update. Verified the same way as Increment A: the normal suite (264 tests, up from 262) and the
+full suite again under the ASan+UBSan sanitizer build, this time with `detect_leaks=1` explicitly
+enabled given this is exactly the kind of manual C-level memory lifecycle code most likely to leak
+- both clean, zero leaks, zero sanitizer errors.
+
+**A real build-system gap found along the way**: be-tree's `betree.h` only exposes its C
+declarations when compiling as *C* - under C++ (`__cplusplus` defined, true for every real
+consumer including nats_sidecar), it `#include`s a separate `betree.hpp` instead. The first attempt
+added the new functions only to `betree.h`'s C branch, which compiled and passed be-tree's own
+*C-only* `betree_tests.c` suite fine, and only failed once nats_sidecar's own (C++) build tried to
+call them - `betree.hpp` needed the exact same declarations added separately.
+
+**Measured real**: re-profiled be-tree a third time. `betree_make_float_variable` collapsed from
+11.63% to 0.04%, `betree_set_variable` from ~1.56% to 0.00%; the new `betree_update_float_variable`
+itself costs only 0.23% (matching the "single field write" design). Steady-state throughput:
+~10,770 -> ~11,000+ batches/s - **the a-tree/be-tree gap, which had widened to ~25%, is now down to
+roughly 5-8%**, close to fully closed.
 
 ## Schema Generation
 
