@@ -1848,6 +1848,61 @@ workloads. The remaining a-tree gap at K=50,000 is a well-characterized, much sm
 where this investigation started - a-tree's own evaluator remains more mature, and closing the rest
 would mean chasing progressively smaller, progressively more specific costs for a shrinking return.
 
+## The real-world check: a K=1 fleet test tells the opposite story, and why
+
+Everything above is a synthetic, in-process benchmark with K=1,000-50,000 *subscriptions*. The actual
+motivating real-world use case for this project (see "Operational note: cycling a whole table through
+core-mode connections" above) is different: N=12 `nats_sidecar` instances, a real 115,020,848-row NYSE
+trade table published through them, and typically **one or a few** live content filters, not thousands.
+That's K=1, not K=50,000 - worth checking directly rather than assuming the synthetic benchmark's
+result generalizes.
+
+**It doesn't.** Running the exact N=12 fleet methodology from the "Operational note" section above
+(one `price > 500.0` subscription, `pgnats`'s `--batch-size 500 --batch-encoding native --workers`
+4/5/6, randomized cell order to avoid the run-order confound already documented in this file) found
+be-tree zero-loss at every level, a-tree zero-loss except a small real loss at workers=6, and **pstree
+losing real throughput at every level, worse than either competitor, and worse as load increased** -
+reproduced across two independent randomized trials (average loss 2.78% / 6.08% / 13.93% at
+pub-workers 4/5/6). The opposite ranking from the synthetic benchmark above.
+
+**Root cause, found via `perf record --call-graph dwarf` on one fleet instance under real load**
+(frame-pointer-based `-g` unwinding gave garbled, misattributed samples on this asio/coroutine-heavy
+binary - `--call-graph dwarf` is required here, matching this project's own earlier profiling
+lesson): pstree pays real, consistent per-row costs a-tree/be-tree structurally never pay -
+`pstree::detail::encodeValue`/`DoubleCodec::encode` (~8-12% of CPU, encoding every event's value into
+a 16-element `ElementKey` before any matching can happen at all - PS-Tree's whole indexing design
+requires this on every single event, unlike a-tree/be-tree's direct native-value comparison),
+`pstree_event_sink::with_float()` (~9-11%), and `PSTDynamic::matchEvent`'s own tree-walk/group-lookup
+(~5-8%). This is the flip side of the synthetic benchmark's own story: the indexing machinery that
+makes PS-Tree fast at high K is pure, unamortized overhead at K=1, where a-tree/be-tree's "just
+compare the value" simplicity wins outright - same architecture, opposite verdict, depending entirely
+on subscription count.
+
+**Fixed the independently-actionable part** (`pstree@eaa0f19`): `ElementKey` was a plain
+`std::vector<uint16_t>` - a genuine per-row heap allocation. Replaced with a small-vector-optimized
+type (inline storage for up to 16 elements, covering int64/double/bool with zero heap allocation;
+only `StringCodec`'s longer keys still spill to the heap, unchanged). This doesn't change the
+fundamental architectural tradeoff (encoding itself still costs more than no encoding at all), but it
+removes one concrete, measured, unforced cost on top of it.
+
+**Re-verified with a third randomized N=12 trial using the fixed binary**: all three pstree cells
+(pub-workers 4/5/6) showed **0% loss** - a complete elimination, not a partial improvement, versus the
+2.78%/6.08%/13.93% average across the two prior unfixed trials. One trial, not yet independently
+reconfirmed the way the "before" numbers were (two trials) - given the established run-to-run noise in
+this exact test, a single result should be treated as a strong, mechanistically-explained signal, not
+final proof. Match counts and publish rates in this trial were consistent with the prior two (not an
+easier run), and the elimination was unanimous across all three tested load levels rather than a
+partial win at just one - both make "this was just noise" a less likely explanation than "the fix
+worked," but a fourth confirming trial would close the gap between "very likely" and "certain."
+
+**Practical upshot**: the synthetic high-K benchmark and this real low-K fleet test are not in tension
+- they're measuring genuinely different regimes of the same architecture, and both are real. For a
+deployment with many independent subscriptions, pstree is now the strongest engine of the three (see
+above). For a deployment with few subscriptions and high per-row throughput requirements - the shape
+this project's own NYSE full-table-cycling use case actually has - pstree's real-world standing is
+still being established; this fix closed the one clearly avoidable gap found so far, and a-tree/be-tree
+were already profiled here too (see below) without turning up comparably clear-cut opportunities.
+
 ## License
 
 See LICENSE file.
