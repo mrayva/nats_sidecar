@@ -490,15 +490,36 @@ public:
         : m_parsing_tree(build_betree(attributes, m_unused_indices)),
           m_pstd(build_pstree_schema(attributes)) {}
 
+    // Reserved top bit of the PSTDynamic-subscription-id space: SET means "this is a
+    // synthetic clause id, look it up in m_clause_to_sub"; CLEAR means "this literal value
+    // IS the caller's own subscription id" (see insert()'s own comment for when each path is
+    // used, and search()'s for why the clear-bit path can skip translation AND dedup
+    // entirely, not just translation).
+    static constexpr uint64_t kSyntheticIdBit = uint64_t{1} << 63;
+
     // Each inserted expression becomes one or more PSTDynamic subscriptions - one per DNF
     // clause (see ast_to_pstree_dnf()'s own doc comment for why OR/NOT need this at all,
-    // PSTDynamic's own model being pure-conjunction) - sharing a fresh "clause id" mapped back
-    // to the caller's own `id` in m_clause_to_sub, so search() can deduplicate a subscription
-    // matched via more than one of its own OR'd clauses back down to a single result. Parsing
-    // reuses be-tree's own already-linked, already-tested parser (betree_make_sub(), against
-    // m_parsing_tree - a throwaway instance built purely to parse/type-check, never searched)
-    // rather than writing a second parser for the same grammar - see pstree_dialect.hpp's own
-    // doc comment for the full reasoning.
+    // PSTDynamic's own model being pure-conjunction). A subscription with exactly ONE clause
+    // (no OR in the expression - the common case; this project's own benchmark generates it
+    // ~90% of the time) uses the caller's own `id` directly as the PSTDynamic subscription id,
+    // skipping m_clause_to_sub entirely - safe because a single-clause subscription's own
+    // bucket is visited AT MOST ONCE per event by construction (the canonical-decomposition
+    // disjointness property PSTree's own tests already verify: a single predicate can never be
+    // double-counted for one query point), so there is nothing to deduplicate either. Multi-
+    // clause (OR'd) subscriptions, and any subscription whose caller-supplied `id` happens to
+    // already have `kSyntheticIdBit` set (astronomically unlikely for a real registry, but
+    // handled rather than assumed away), fall back to a fresh synthetic clause id mapped back
+    // to `id` in m_clause_to_sub, exactly as before - search() still needs both translation and
+    // dedup for these, since more than one of a subscription's own OR'd clauses can genuinely
+    // match the same event. Found via `perf annotate` on matching_engine_bench: after the O(n^2)
+    // dedup fix and PSTDynamic's own per-match unordered_map::at() fix (see both repos' READMEs),
+    // these two remaining per-match hashmap operations were ~71% of search()'s own self-time at
+    // scale - this removes both for the dominant case rather than just one.
+    //
+    // Parsing reuses be-tree's own already-linked, already-tested parser (betree_make_sub(),
+    // against m_parsing_tree - a throwaway instance built purely to parse/type-check, never
+    // searched) rather than writing a second parser for the same grammar - see
+    // pstree_dialect.hpp's own doc comment for the full reasoning.
     void insert(uint64_t id, const std::string& expression) override {
         std::string translated;
         try {
@@ -521,6 +542,8 @@ public:
         }
         free_sub(sub);
 
+        bool useDirectId = (dnf.size() == 1) && ((id & kSyntheticIdBit) == 0);
+
         std::vector<uint64_t> insertedClauseIds;
         try {
             for (auto& clause : dnf) {
@@ -536,10 +559,10 @@ public:
                         "which pstree cannot index - every clause needs at least one "
                         "real predicate");
                 }
-                uint64_t clauseId = m_next_clause_id++;
+                uint64_t clauseId = useDirectId ? id : (kSyntheticIdBit | m_next_clause_id++);
                 m_pstd.insertSubscription(pstree::Subscription{clauseId, clause});
                 insertedClauseIds.push_back(clauseId);
-                m_clause_to_sub[clauseId] = id;
+                if (!useDirectId) m_clause_to_sub[clauseId] = id;
             }
         } catch (const matching_engine_error&) {
             for (auto clauseId : insertedClauseIds) {
@@ -579,6 +602,15 @@ public:
             m_seen_scratch.clear();
             result.reserve(clauseMatches.size());
             for (auto clauseId : clauseMatches) {
+                if ((clauseId & kSyntheticIdBit) == 0) {
+                    // Direct-id path (see insert()'s own comment): this literal value already
+                    // IS the caller's subscription id, and by construction (single-clause,
+                    // canonical-decomposition disjointness) can appear at most once in
+                    // clauseMatches for this event - skip both the translation lookup and the
+                    // dedup check, not just one of them.
+                    result.push_back(clauseId);
+                    continue;
+                }
                 auto it = m_clause_to_sub.find(clauseId);
                 uint64_t subId = (it != m_clause_to_sub.end()) ? it->second : clauseId;
                 if (m_seen_scratch.insert(subId).second) {
