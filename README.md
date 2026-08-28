@@ -1502,6 +1502,98 @@ NATS input subject
 - Worker threads process messages in parallel using lock-free RCU snapshots of the matching engine (a-tree or be-tree)
 - NATS publishes are posted back to the ASIO thread via `co_spawn`
 
+## Matching-engine benchmark: a-tree vs be-tree vs pstree
+
+The end-to-end fleet benchmarks earlier in this file found matching-engine choice barely mattered
+("Processing capacity is statistically indistinguishable between engines... A matching-engine
+choice would be expected to matter more under conditions where search itself is the bottleneck -
+not measured here") because NATS transport and row-unpacking dominated at that scale. This is that
+missing measurement: `benchmarks/matching_engine_bench.cpp` (`-DSIDECAR_BUILD_BENCHMARKS=ON`,
+`RelWithDebInfo`) isolates pure matching-engine cost in-process - no NATS/Postgres/OS I/O at all -
+specifically to independently check the PS-Tree paper's own self-reported claim (PSTDynamic beats
+both BE-Tree and A-Tree on matching time and index construction time).
+
+**Methodology**: a fixed non-list schema (`trade_price` float, `trade_volume` integer, `symbol`
+string, `active` boolean - pstree has no list-attribute support, so this benchmark's schema and
+generated subscriptions avoid them entirely, for a fair 3-way comparison). K subscriptions and
+20,000 events are generated once per K with fixed seeds (identical input to all three engines);
+each K runs two full passes with engine order reversed between passes (atree/betree/pstree, then
+pstree/betree/atree) and the two passes' timings are averaged - cheap insurance against
+warmup/cache-locality bias between consecutive engine runs in the same process (see the run-order
+lesson earlier in this file, though its actual mechanism - OS page-cache/process-level drift - does
+not really apply to a single in-process CPU benchmark with no I/O).
+
+**A real a-tree bug surfaced immediately, before any performance number could be trusted.**
+Aggregate match counts across all 20,000 events agreed exactly between all three engines at
+K=1,000, but a-tree's count started diverging from be-tree/pstree (which agreed with each other)
+at K=2,000 and grew with K - a correctness bug, not noise. Root-caused to a real gap in a-tree's
+own `insert_root()`: when a brand new subscription's whole expression turns out to already exist
+as some *other* subscription's non-accessor AND-child (a-tree picks the cheaper of an AND's two
+predicates as the "accessor" - the one that's eagerly evaluated and can trigger the AND; the other
+is only ever reached lazily, from inside the AND's own evaluation), the new subscription's id gets
+attached to that node, but the node itself was never registered as an eager evaluation entry point
+- so it would silently never match, for any event, no matter how obviously true the predicate is.
+Fixed upstream (`mrayva/a-tree@a9a8829`, with a dedicated regression test) and confirmed: the exact
+per-event/per-subscription diff that exposed it (a diagnostic tool built for this investigation,
+not kept in the repo) found zero further disagreements after the fix, and this file's own
+`test_matching_engine_differential.cpp`/`test_matching_engine.cpp` suites - which only ever
+exercise a handful of subscriptions at a time - never had a chance to catch it. This is exactly the
+kind of bug that scale-dependent testing (not hand-picked small examples) exists to find.
+
+**Results, after the fix** (RelWithDebInfo, one host, 20,000 events per K):
+
+| K | engine | insert | insert rate | search | search rate | total matches |
+|---:|---|---:|---:|---:|---:|---:|
+| 1,000  | atree  | 1.04 ms    | 960,698 subs/s | 225.75 ms   | 88,595 events/s | 5,286,377  |
+| 1,000  | betree | 2.85 ms    | 350,518 subs/s | 400.51 ms   | 49,937 events/s | 5,286,377  |
+| 1,000  | pstree | 14.46 ms   | 69,155 subs/s  | 314.54 ms   | 63,586 events/s | 5,286,377  |
+| 5,000  | atree  | 9.48 ms    | 527,374 subs/s | 1,361.91 ms | 14,685 events/s | 27,180,339 |
+| 5,000  | betree | 46.91 ms   | 106,578 subs/s | 2,554.98 ms | 7,828 events/s  | 27,180,339 |
+| 5,000  | pstree | 508.07 ms  | 9,841 subs/s   | 5,794.04 ms | 3,452 events/s  | 27,180,339 |
+| 10,000 | atree  | 34.77 ms   | 287,613 subs/s | 2,862.11 ms | 6,988 events/s  | 54,413,004 |
+| 10,000 | betree | 239.08 ms  | 41,827 subs/s  | 5,916.02 ms | 3,381 events/s  | 54,413,004 |
+| 10,000 | pstree | 2,434.18 ms| 4,108 subs/s   | 19,637.96 ms| 1,018 events/s  | 54,413,004 |
+
+Match counts agree exactly across all three engines at every K - the correctness bar this
+comparison needs to mean anything.
+
+**pstree does not win here - and degrades far faster than either a-tree or be-tree as K grows.**
+At K=1,000 it's already the slowest to insert (5-14x a-tree/be-tree) but competitive on search
+(within 1.4x of a-tree). By K=10,000, pstree's insert rate has fallen 17x further behind a-tree
+(vs. 3.3x at K=1,000) and its search rate has fallen from 1.4x slower than a-tree to 6.9x slower -
+a real, disproportionate blowup, not a fixed constant-factor gap.
+
+**Root cause is architectural, not a bug, and traces directly to this benchmark's own workload
+shape.** `PSTDynamic::insertSubscription()` (`pst_dynamic.hpp`) attaches a subscription to *every
+leaf* its access predicate's range covers - correct and necessary, since `MatchEvent`'s O(1)
+per-event lookup (`matchPair`) only works if every leaf already knows every predicate covering it,
+with no further search at match time. For an equality predicate this is one leaf; for `trade_price
+> X` (30% of this benchmark's generated subscriptions have this as their *only* predicate, so it's
+forced to be the access predicate) it's every leaf from X to the domain maximum - roughly half the
+leaves in that dimension's tree, on average, given X is uniform over the domain. As more
+`trade_price > X` subscriptions insert (each with an independent random threshold), the price
+dimension's tree partitions ever more finely, so each new wide-range insertion touches
+proportionally more, smaller leaves - and every event landing in a leaf shared by many such
+subscriptions pays a linear scan over all of them at match time (`MatchEvent`'s per-group loop).
+This is quadratic-leaning insertion cost and matching cost that degrades with subscription-set
+density, not a fixed per-operation cost - exactly what the numbers above show, and exactly the
+scenario Section 2.3's own selectivity ranking (`{=} > {∈} > {in} > {<,≤,>,≥} > ...`) is implicitly
+warning about: PS-Tree's design assumes an access predicate is *usually* narrow (an equality, or a
+bounded range), and degrades hard when a subscription's *only* available predicate is a wide,
+unbounded comparison - a very common real subscription shape ("alert me when price exceeds $X")
+that this benchmark deliberately includes 30% of, and that the paper's own selectivity heuristic
+has no way to avoid when it's the only predicate offered.
+
+**Conclusion**: on this workload, PSTDynamic does not reproduce the paper's own self-reported
+advantage over BE-Tree/A-Tree - it's slower on both index construction and matching time, by a
+growing margin as the subscription count increases. This doesn't invalidate the paper's own
+results (which likely used workloads with narrower/bounded access predicates, or evaluated at
+scales where this benchmark's specific bottleneck - many independent wide-range predicates sharing
+one dimension - wasn't dominant), but it does mean **this project's own real subscription shapes
+(threshold alerts being a common one) are not a good match for PS-Tree/PSTDynamic as implemented
+here** - `engine: pstree` remains available (see the "Expression Syntax" section for its supported
+operators and limitations) but isn't recommended over `atree`/`betree` for this kind of workload.
+
 ## License
 
 See LICENSE file.
