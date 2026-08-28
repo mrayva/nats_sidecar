@@ -1711,30 +1711,87 @@ super-linearity also improved: 140x time growth for the same 51x match-volume in
 down from 260x, and now genuinely *better* than be-tree's own super-linearity (156x) at the same
 comparison - no longer the worst-scaling of the three on this metric.
 
-**A third, deeper cost was identified via the same profiling pass but NOT fixed here - a real
-architectural question, not a quick patch.** With both bugs above fixed, `matchEvent`'s own remaining
-self-time is now dominated (~86%, per `perf annotate`) by a chain of pointer dereferences needed just
-to start iterating one candidate's predicates: `subPtr -> Subscription::predicates.data() ->
-predicates[0].attr`. Each of these is a load from a genuinely different, independently-heap-allocated
-location (the `Subscription` sits in `subscriptions_`'s hashmap node storage; its `predicates` vector
-is a separate allocation) with no relationship to iteration order across different candidates - a
-textbook cache-miss-dominated pointer chase, not an algorithmic complexity problem. Separately,
-`pstree_matching_engine::search()`'s own remaining self-time is still dominated (~71%) by two
-per-match `unordered_map` operations (`m_clause_to_sub.find()` translating a DNF clause id back to
-the caller's subscription id, plus `m_seen_scratch.insert()` for dedup) - both real hashmap costs,
-just no longer *quadratic* ones. Closing either of these further would mean a genuine data-layout
-redesign (e.g. a more cache-friendly Subscription/predicate storage, or restructuring how DNF clause
-ids map back to subscription ids to avoid one of the two hashmap lookups) rather than a bug fix -
-tracked as identified, characterized, real follow-up debt, not chased further in this pass.
+A third cost was identified via the same profiling pass: `pstree_matching_engine::search()`'s own
+remaining self-time was still dominated (~71%) by two per-match `unordered_map` operations -
+`m_clause_to_sub.find()` (translating a DNF clause id back to the caller's subscription id) and
+`m_seen_scratch.insert()` (dedup) - both real hashmap costs, no longer *quadratic* ones, but still
+paid on every one of thousands of matches per event.
 
-**Conclusion**: the insert-side scaling issue and two independent real search-side bottlenecks (the
-O(n^2) dedup bug and the per-match hashmap lookup) are now fixed and verified across a 50x range of
-K. pstree's insert is unambiguously the fastest of the three engines at large K; its search now beats
-be-tree outright at every tested K and trails a-tree by a real but substantially narrowed margin
-(1.1x-2.4x, down from 1.3x-5.0x). `engine: pstree` is a strong all-around choice, not one narrowly
-justified only by churn-heavy workloads; `atree` remains the fastest choice when search throughput at
-very large K is the primary concern, though the remaining gap is now a data-layout question with a
-known shape, not an open mystery.
+**User pushed back that "competitive with be-tree, behind a-tree" wasn't good enough for a redesign
+meant to demonstrate a modern technique - explicit ask to keep improving. Both operations above turn
+out to be provably unnecessary for the common case, not just expensive.** A subscription with no `OR`
+in its expression (a single DNF clause - ~90% of this benchmark's generated subscriptions) can, by
+construction, appear **at most once** in `matchEvent`'s raw results for any one event: PS-Tree's
+canonical-decomposition disjointness (the same property `test_between_exhaustive_small_domain` and
+the complexity regression test already verify) guarantees a single predicate's own bucket is visited
+at most once per query point. If it can never repeat, it needs no dedup; if there's only ever one
+clause, there's nothing to translate.
+
+**Fixed** (`nats_sidecar@5f7b911`): reserved the top bit of the `uint64_t` id space
+(`kSyntheticIdBit`). A single-clause subscription whose caller-supplied id doesn't already use that
+bit is inserted into `PSTDynamic` under its own real id directly, skipping `m_clause_to_sub`
+entirely; `search()` recognizes the clear bit on a returned match and skips both the translation
+lookup and the dedup check. Multi-clause (`OR`) subscriptions, and the vanishingly unlikely case of a
+caller id that already has the reserved bit set, fall back to the original synthetic-id +
+`m_clause_to_sub` path unchanged - full correctness preserved for every case, the fast path only
+*adds* a shortcut for the common one. `sidecar_test` passes under both normal and ASan+UBSan builds.
+
+**Results, after all three fixes (dedup, `unordered_map::at()` elimination, and the direct-id
+shortcut):**
+
+| K | engine | insert | insert rate | search | search rate | total matches |
+|---:|---|---:|---:|---:|---:|---:|
+| 1,000  | atree  | 0.93 ms     | 1,079,697 subs/s | 222.65 ms    | 89,828 events/s  | 5,286,377   |
+| 1,000  | betree | 3.13 ms     | 319,005 subs/s   | 398.42 ms    | 50,198 events/s  | 5,286,377   |
+| 1,000  | pstree | 3.85 ms     | 259,773 subs/s   | 146.82 ms    | 136,222 events/s | 5,286,377   |
+| 5,000  | atree  | 9.14 ms     | 547,023 subs/s   | 1,331.62 ms  | 15,019 events/s  | 27,180,339  |
+| 5,000  | betree | 49.70 ms    | 100,602 subs/s   | 2,515.25 ms  | 7,951 events/s   | 27,180,339  |
+| 5,000  | pstree | 21.44 ms    | 233,186 subs/s   | 1,264.03 ms  | 15,822 events/s  | 27,180,339  |
+| 10,000 | atree  | 31.52 ms    | 317,261 subs/s   | 2,816.87 ms  | 7,100 events/s   | 54,413,004  |
+| 10,000 | betree | 209.24 ms   | 47,791 subs/s    | 5,509.93 ms  | 3,630 events/s   | 54,413,004  |
+| 10,000 | pstree | 35.88 ms    | 278,712 subs/s   | 2,947.15 ms  | 6,786 events/s   | 54,413,004  |
+| 50,000 | atree  | 759.91 ms   | 65,797 subs/s    | 14,765.47 ms | 1,355 events/s   | 271,572,457 |
+| 50,000 | betree | 8,415.70 ms | 5,941 subs/s     | 65,414.31 ms | 306 events/s     | 271,572,457 |
+| 50,000 | pstree | 245.00 ms   | 204,081 subs/s   | 18,992.54 ms | 1,053 events/s   | 271,572,457 |
+
+Match counts still agree exactly across all three engines at every K.
+
+**pstree now beats a-tree outright at K=1,000 and K=5,000, and closes to within 1.05x-1.29x at
+K=10,000/50,000** (down from 1.1x-2.4x after the previous fix, and 1.3x-5.0x before any of the three).
+At K=1,000: 136,222 vs. a-tree's 89,828 events/s - pstree is **1.5x faster than a-tree**. At K=5,000:
+15,822 vs. 15,019 - still ahead. Only at K=10,000 (6,786 vs. 7,100, 1.05x behind) and K=50,000 (1,053
+vs. 1,355, 1.29x behind) does a-tree retake the lead, by a real but now-modest margin. pstree remains
+comfortably ahead of be-tree throughout (2.7x at K=1,000, narrowing to 3.4x - *widening* - at
+K=50,000, since be-tree's own search cost keeps degrading faster than either competitor's). Search
+improved a further 1.6x-1.8x on top of the previous two fixes (largest relative gain at K=1,000:
+248.62ms -> 146.82ms).
+
+**Total improvement across all three fixes, from the original (unfixed) search regression**: at
+K=10,000, search went from 19,637.96 ms to 2,947.15 ms - a **6.7x** improvement. At K=50,000, from
+371,186.76 ms to 18,992.54 ms - a **19.5x** improvement.
+
+**What's left, characterized but not fixed here - a real architectural question, not a quick patch.**
+`matchEvent`'s own remaining self-time is now dominated (~86%, per `perf annotate`) by a chain of
+pointer dereferences needed just to start iterating one candidate's predicates: `subPtr ->
+Subscription::predicates.data() -> predicates[0].attr`. Each is a load from a genuinely different,
+independently-heap-allocated location (the `Subscription` sits in `subscriptions_`'s hashmap node
+storage; its `predicates` vector is a separate allocation) with no relationship to iteration order
+across different candidates - a textbook cache-miss-dominated pointer chase, not an algorithmic
+complexity problem this session's three fixes could reach. Closing it would mean a genuine
+data-layout redesign (e.g. small-vector-inlining `Subscription::predicates` so the common 1-2
+predicate case needs no second allocation at all, or a more cache-friendly arena for `Subscription`
+storage itself) touching a type used across both `pstree` and `nats_sidecar` - real correctness
+surface, not a local patch - tracked as identified, characterized, real follow-up debt.
+
+**Conclusion**: the insert-side scaling issue and three independent, real search-side bottlenecks
+(the O(n^2) dedup bug, the per-match hashmap lookup inside `matchEvent`, and the wrapper's own
+translation+dedup overhead) are now fixed and verified across a 50x range of K. pstree's insert is
+unambiguously the fastest of the three engines at large K; its search now beats be-tree outright at
+every tested K and beats or nearly matches a-tree too (ahead at K=1,000-5,000, within 1.05x-1.29x at
+K=10,000-50,000) - a genuine turnaround from "uniformly worse than both" at the start of this
+investigation. `engine: pstree` is now a strong default choice, not one narrowly justified only by
+churn-heavy workloads; the remaining a-tree gap at large K is a well-characterized cache-locality
+question with a known shape and a known (bigger, riskier) fix, not an open mystery.
 
 ## License
 
