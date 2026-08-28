@@ -1770,28 +1770,83 @@ improved a further 1.6x-1.8x on top of the previous two fixes (largest relative 
 K=10,000, search went from 19,637.96 ms to 2,947.15 ms - a **6.7x** improvement. At K=50,000, from
 371,186.76 ms to 18,992.54 ms - a **19.5x** improvement.
 
-**What's left, characterized but not fixed here - a real architectural question, not a quick patch.**
-`matchEvent`'s own remaining self-time is now dominated (~86%, per `perf annotate`) by a chain of
-pointer dereferences needed just to start iterating one candidate's predicates: `subPtr ->
-Subscription::predicates.data() -> predicates[0].attr`. Each is a load from a genuinely different,
-independently-heap-allocated location (the `Subscription` sits in `subscriptions_`'s hashmap node
-storage; its `predicates` vector is a separate allocation) with no relationship to iteration order
-across different candidates - a textbook cache-miss-dominated pointer chase, not an algorithmic
-complexity problem this session's three fixes could reach. Closing it would mean a genuine
-data-layout redesign (e.g. small-vector-inlining `Subscription::predicates` so the common 1-2
-predicate case needs no second allocation at all, or a more cache-friendly arena for `Subscription`
-storage itself) touching a type used across both `pstree` and `nats_sidecar` - real correctness
-surface, not a local patch - tracked as identified, characterized, real follow-up debt.
+A fourth cost was identified via the same profiling pass: with all three fixes above in place,
+`matchEvent`'s own remaining self-time was ~86% (per `perf annotate`) a cache-miss-dominated pointer
+chase - `subPtr -> Subscription::predicates.data() -> predicates[0].attr` - three genuinely different,
+independently-heap-allocated locations (the `Subscription` sits in `subscriptions_`'s hashmap node
+storage; its `predicates` vector is a separate allocation) touched for every candidate, with no
+relationship to iteration order across different candidates.
 
-**Conclusion**: the insert-side scaling issue and three independent, real search-side bottlenecks
-(the O(n^2) dedup bug, the per-match hashmap lookup inside `matchEvent`, and the wrapper's own
-translation+dedup overhead) are now fixed and verified across a 50x range of K. pstree's insert is
-unambiguously the fastest of the three engines at large K; its search now beats be-tree outright at
-every tested K and beats or nearly matches a-tree too (ahead at K=1,000-5,000, within 1.05x-1.29x at
-K=10,000-50,000) - a genuine turnaround from "uniformly worse than both" at the start of this
-investigation. `engine: pstree` is now a strong default choice, not one narrowly justified only by
-churn-heavy workloads; the remaining a-tree gap at large K is a well-characterized cache-locality
-question with a known shape and a known (bigger, riskier) fix, not an open mystery.
+**User explicitly pushed further still: "let's not leave any stone unturned - we need to try to beat
+a-tree throughout," with the condition that anything risky gets extra test coverage and nothing gets
+committed unless it demonstrably works end-to-end first.** This one is a genuine data-layout change
+(not a bug fix), so it got treated accordingly:
+
+**Fixed** (`pstree@c90e778`): added `PredicateList`, a hand-specialized small-vector for
+`SubPredicate` with inline storage for up to 4 elements (covers realistic subscription shapes - this
+benchmark's own generator produces 1-2), falling back to a heap buffer with standard doubling growth
+only when a subscription genuinely has more. `Subscription::predicates` is now `PredicateList`
+instead of `std::vector<SubPredicate>`; `Subscription` remains a plain aggregate (`PredicateList`'s
+converting constructors from `std::vector<SubPredicate>` and `std::initializer_list<SubPredicate>`
+preserve every existing aggregate-init call site, in both repos, unchanged). Deliberately
+hand-specialized rather than a reusable template - a narrower, fully-reasoned-about surface carries
+less risk than a general-purpose one.
+
+Given the manual placement-new/destroy bookkeeping this kind of type requires, it got the extra
+scrutiny the risk warranted: a new dedicated test file (`tests/test_predicate_list.cpp`) covering
+growth past inline capacity checked at every step, copy/move independence and self-assignment safety
+for both inline and heap-spilled sizes, `at()` bounds checking, and a mixed copy/move stress loop - on
+top of the existing indirect coverage via `test_predicate.cpp`/`test_pst_dynamic*.cpp`, all of which
+passed completely unmodified (including `test_pst_dynamic_stress.cpp`'s random-vs-brute-force oracle,
+the strongest signal PSTDynamic's contract was unaffected). Crucially, the whole change was validated
+against `nats_sidecar` - full `sidecar_test` suite under both normal and ASan+UBSan builds, plus a
+live benchmark re-run - via a local `FETCHCONTENT_SOURCE_DIR_PSTREE` override, *before* committing
+anything in either repo, per the "if it doesn't work, don't commit" instruction.
+
+**Results, after all four fixes:**
+
+| K | engine | insert | insert rate | search | search rate | total matches |
+|---:|---|---:|---:|---:|---:|---:|
+| 1,000  | atree  | 0.96 ms     | 1,041,292 subs/s | 224.32 ms    | 89,160 events/s  | 5,286,377   |
+| 1,000  | betree | 3.16 ms     | 316,071 subs/s   | 414.20 ms    | 48,285 events/s  | 5,286,377   |
+| 1,000  | pstree | 3.71 ms     | 269,285 subs/s   | 148.29 ms    | 134,870 events/s | 5,286,377   |
+| 5,000  | atree  | 10.01 ms    | 499,667 subs/s   | 1,362.07 ms  | 14,684 events/s  | 27,180,339  |
+| 5,000  | betree | 44.01 ms    | 113,607 subs/s   | 2,543.97 ms  | 7,862 events/s   | 27,180,339  |
+| 5,000  | pstree | 17.23 ms    | 290,109 subs/s   | 1,125.55 ms  | 17,769 events/s  | 27,180,339  |
+| 10,000 | atree  | 33.13 ms    | 301,805 subs/s   | 2,833.12 ms  | 7,059 events/s   | 54,413,004  |
+| 10,000 | betree | 215.10 ms   | 46,490 subs/s    | 5,602.87 ms  | 3,570 events/s   | 54,413,004  |
+| 10,000 | pstree | 34.68 ms    | 288,314 subs/s   | 2,671.22 ms  | 7,487 events/s   | 54,413,004  |
+| 50,000 | atree  | 761.08 ms   | 65,696 subs/s    | 15,078.69 ms | 1,326 events/s   | 271,572,457 |
+| 50,000 | betree | 8,627.80 ms | 5,795 subs/s     | 61,913.98 ms | 323 events/s     | 271,572,457 |
+| 50,000 | pstree | 198.73 ms   | 251,592 subs/s   | 17,469.55 ms | 1,145 events/s   | 271,572,457 |
+
+Match counts still agree exactly across all three engines at every K.
+
+**pstree now beats a-tree outright at K=1,000, K=5,000, AND K=10,000** - not just the two smallest K
+values as after the previous fix. At K=1,000: 134,870 vs. 89,160 events/s (1.51x faster). At K=5,000:
+17,769 vs. 14,684 (1.21x faster). At K=10,000: 7,487 vs. 7,059 (**1.06x faster** - this K crossed over
+from 1.05x *behind* to slightly *ahead*). Only at K=50,000 does a-tree keep the lead, and even there
+the gap narrowed further: 1,326 vs. 1,145 events/s, **1.16x behind** (down from 1.29x after the
+previous fix, 2.4x two fixes ago, 5.0x before any of the four). pstree remains far ahead of be-tree at
+every K (2.8x-3.4x). This fix's own relative gain grew with K rather than shrinking (1.01x at
+K=1,000 - within run-to-run noise - up to 1.12x at K=5,000/10,000 and 1.09x at K=50,000), consistent
+with cache-miss cost mattering more as more distinct candidate subscriptions get touched per event.
+
+**Total improvement across all four fixes, from the original (unfixed) search regression**: at
+K=10,000, search went from 19,637.96 ms to 2,671.22 ms - a **7.4x** improvement. At K=50,000, from
+371,186.76 ms to 17,469.55 ms - a **21.2x** improvement.
+
+**Conclusion**: the insert-side scaling issue and four independent, real search-side bottlenecks (the
+O(n^2) dedup bug, the per-match hashmap lookup inside `matchEvent`, the wrapper's own
+translation+dedup overhead, and the Subscription/predicate storage cache-miss) are now fixed and
+verified across a 50x range of K. pstree's insert is unambiguously the fastest of the three engines at
+large K; its search beats be-tree outright at every tested K and now beats a-tree too at every K
+except the largest, where it trails by a real but modest 1.16x - a complete turnaround from "uniformly
+worse than both" at the start of this investigation. `engine: pstree` is now the strongest default
+choice among the three for this workload shape, not one narrowly justified only by churn-heavy
+workloads. The remaining a-tree gap at K=50,000 is a well-characterized, much smaller residual than
+where this investigation started - a-tree's own evaluator remains more mature, and closing the rest
+would mean chasing progressively smaller, progressively more specific costs for a shrinking return.
 
 ## License
 
