@@ -219,6 +219,94 @@ TEST(matching_engine, betree_rejects_is_not_empty) {
     EXPECT_THROW(engine->insert(1, "tags is not empty"), sidecar::matching_engine_error);
 }
 
+// pstree isn't included in the atree_and_betree parameterized suite above: every one of that
+// suite's fixtures unconditionally populates the "tags" (string_list) attribute via match()'s
+// shared with_string_list() call, even for expressions that never reference it - and
+// pstree_event_sink::with_string_list() throws unconditionally (pstree has no representation
+// for list-valued attributes at all, see matching_engine.cpp/pstree_dialect.hpp). Rather than
+// restructure that shared fixture around a limitation specific to one engine, pstree gets its
+// own narrower, targeted checks here instead - the systematic operator/type coverage it does
+// share with a-tree/be-tree already lives in test_matching_engine_differential.cpp, whose
+// per-field-optional event fixture doesn't have this problem.
+TEST(matching_engine, pstree_invalid_expression_throws_matching_engine_error) {
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, trade_attributes());
+    EXPECT_THROW(engine->insert(1, "this is not valid !!!"), sidecar::matching_engine_error);
+}
+
+TEST(matching_engine, pstree_rejects_list_valued_attribute_reference) {
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, trade_attributes());
+    EXPECT_THROW(engine->insert(1, "tags one of (\"urgent\")"), sidecar::matching_engine_error);
+}
+
+// Exercises pstree_matching_engine::insert()'s rollback path: "trade_price > 10.0 or true"
+// expands (ast_to_pstree_dnf) to two DNF clauses - a real, indexable one and a second,
+// unconditionally-true EMPTY clause pstree can't represent at all (see
+// pstree_dialect.cpp/pst_dynamic.hpp's own comments on this). The first clause is inserted
+// into PSTDynamic successfully before the second is found to be un-insertable and the whole
+// insert() call throws - the already-inserted first clause must be rolled back
+// (PSTDynamic::deleteSubscription()), or a later, unrelated event could spuriously match a
+// subscription that was supposed to have been entirely rejected.
+TEST(matching_engine, pstree_partial_dnf_insert_failure_rolls_back_cleanly) {
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, trade_attributes());
+    EXPECT_THROW(engine->insert(1, "trade_price > 10.0 or true"), sidecar::matching_engine_error);
+
+    // The rejected subscription must leave no trace: an event that would satisfy the
+    // real half of the rejected expression (trade_price > 10.0) must not match id 1.
+    auto sink = engine->make_event();
+    sink->with_float("trade_price", 100.0);
+    sink->with_integer("trade_volume", 1);
+    sink->with_string("symbol", "AAPL");
+    sink->with_boolean("active", true);
+    auto r = engine->search(*sink);
+    EXPECT_FALSE(contains(r, 1));
+
+    // The engine must still be usable afterward - a later, unrelated insert should succeed
+    // and match normally, confirming the rollback didn't leave PSTDynamic's own internal
+    // state (dimension trees, leaf groups, clause-id bookkeeping) corrupted. Re-populate
+    // `sink` first: search() already reset it (pstree_event_sink::reset() clears the event
+    // vector outright, unlike a-tree/be-tree's "ready to reuse" semantics).
+    engine->insert(2, "trade_price > 10.0");
+    sink->with_float("trade_price", 100.0);
+    sink->with_integer("trade_volume", 1);
+    sink->with_string("symbol", "AAPL");
+    sink->with_boolean("active", true);
+    auto r2 = engine->search(*sink);
+    EXPECT_TRUE(contains(r2, 2));
+    EXPECT_FALSE(contains(r2, 1));
+}
+
+TEST(matching_engine, pstree_and_or_not_combinators_and_reuse) {
+    // Exercises the OR-into-DNF-clauses path (ast_to_pstree_dnf) end to end, including a
+    // negated AND (De Morgan pushdown) and a reused event_sink across two searches - the same
+    // shape as matching_engine_test's own and_or_combinators/not_and_boolean_truthiness/
+    // event_sink_reused_across_searches cases above, just without touching "tags".
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, trade_attributes());
+    engine->insert(1, "trade_price > 50.0 and trade_volume > 1000");
+    engine->insert(2, "trade_price > 10000.0 or symbol = \"COIN\"");
+    engine->insert(3, "not (trade_price > 100.0 and active)");
+
+    auto sink = engine->make_event();
+    sink->with_float("trade_price", 150.0);
+    sink->with_integer("trade_volume", 2000);
+    sink->with_string("symbol", "AAPL");
+    sink->with_boolean("active", true);
+    auto r1 = engine->search(*sink);
+    EXPECT_TRUE(contains(r1, 1));
+    EXPECT_FALSE(contains(r1, 2));
+    EXPECT_FALSE(contains(r1, 3)) // not(150.0 > 100.0 and active=true) = not(true) = false
+        << "sub 3 (\"not (trade_price > 100.0 and active)\") should not match: "
+           "both inner conjuncts are true, so the negation is false";
+
+    sink->with_float("trade_price", 1.0);
+    sink->with_integer("trade_volume", 1);
+    sink->with_string("symbol", "COIN");
+    sink->with_boolean("active", false);
+    auto r2 = engine->search(*sink);
+    EXPECT_FALSE(contains(r2, 1));
+    EXPECT_TRUE(contains(r2, 2));
+    EXPECT_TRUE(contains(r2, 3));
+}
+
 TEST(matching_engine, atree_accepts_is_not_empty) {
     // a-tree has a real IsNotEmpty token; only be-tree lacks the rule.
     auto engine = sidecar::build_matching_engine(sidecar::engine_type::atree, trade_attributes());

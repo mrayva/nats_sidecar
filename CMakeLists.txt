@@ -127,6 +127,9 @@ include(cmake/BuildAtree.cmake)
 # --- be-tree (C++20 core, native CMake) ---
 include(cmake/BuildBetree.cmake)
 
+# --- pstree (header-only C++20, PS-Tree/PSTDynamic) ---
+include(cmake/BuildPSTree.cmake)
+
 # --- sidecar library (shared between executable and tests) ---
 add_library(sidecar_lib STATIC
     src/cli.cpp
@@ -134,6 +137,7 @@ add_library(sidecar_lib STATIC
     src/dialect.cpp
     src/event_bridge.cpp
     src/matching_engine.cpp
+    src/pstree_dialect.cpp
     src/schema_generator.cpp
     src/subscription_manager.cpp
     src/subscription_registry.cpp
@@ -152,6 +156,7 @@ target_link_libraries(sidecar_lib
         zerialize
         atree_ffi
         betree
+        pstree
         yaml-cpp::yaml-cpp
         spdlog::spdlog
         fmt::fmt

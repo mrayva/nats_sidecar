@@ -76,7 +76,7 @@ the legacy single-connection config shape - they're rejected if the config file 
 | `-p, --port PORT` | NATS server port |
 | `-i, --input-subject SUBJ` | Input NATS subject (repeatable: `-i a -i b` for multiple inputs) |
 | `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`) |
-| `--engine ENGINE` | Matching engine (`atree`, `betree`); defaults to `atree` |
+| `--engine ENGINE` | Matching engine (`atree`, `betree`, `pstree`); defaults to `atree` |
 | `--output-prefix PREFIX` | Output subject prefix (defaults to input subject) |
 | `--queue-group GROUP` | Input queue group for load balancing (plain, non-durable mode) |
 | `--input-stream NAME` | JetStream stream name for the durable-consumer input mode (see below); enables it when set, alongside the four flags below |
@@ -129,7 +129,7 @@ nats_port: 4222
 # (mixing durable and best-effort mode) in one process.
 input_subjects: ["sensor.data"]
 format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
-engine: atree             # atree | betree
+engine: atree             # atree | betree | pstree
 
 # Output: matched messages published to <output_prefix>.<subscription_id>,
 # shared by every input connection - a client's subscribed expression
@@ -265,13 +265,52 @@ Two things worth knowing before enabling it:
 
 ### Expression Syntax
 
-Both engines accept the same expression syntax verbatim: `=`, `<>`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, `in`, `not in`, `one of`, `none of`, `all of`, `is null`, `is not null`, `is empty`. Multi-word operators are space-separated (`not in`, not `not_in`) - this matches both engines' actual grammars, confirmed against their lexers directly.
+All three engines accept the same expression syntax verbatim: `=`, `<>`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`, `in`, `not in`, `one of`, `none of`, `all of`, `is null`, `is not null`, `is empty`. Multi-word operators are space-separated (`not in`, not `not_in`) - this matches every engine's actual grammar (`pstree`'s own expressions are parsed by be-tree's own parser - see below - so it inherits be-tree's grammar exactly), confirmed against their lexers directly.
 
-One operator is engine-specific: **`is not empty` is only available under `engine: atree`**. be-tree's grammar has no rule for it at all; subscribing with it under `engine: betree` is rejected at subscribe time with a clear error rather than silently misbehaving. There's no substitute expression to fall back to if you need this on be-tree.
+One operator is engine-specific: **`is not empty` is only available under `engine: atree`**. be-tree's grammar has no rule for it at all; subscribing with it under `engine: betree` (or `engine: pstree`, which parses via be-tree's own parser) is rejected at subscribe time with a clear error rather than silently misbehaving. There's no substitute expression to fall back to if you need this on be-tree/pstree.
 
 `in` / `not in` list literals accept integer or string values only, not floats. `one of` / `none of` / `all of` apply to list-typed attributes (`string_list` / `integer_list`); `is empty` / `is not empty` likewise.
 
-`all of` means "the attribute contains every listed value" on both engines - but only because it's made to: a-tree's own native `all of` actually checks the opposite (the attribute is a subset of the literal list), so `matching_engine` transparently rewrites `X all of (v1, ..., vn)` into `X one of (v1) and ... and X one of (vn)` before handing it to a-tree, which evaluates to the same (be-tree-matching) result. This is invisible in normal use - the rewrite happens automatically inside `insert()` - but worth knowing if you're reading a-tree's own docs/tests, which describe `all of` differently.
+`all of` means "the attribute contains every listed value" on both a-tree and be-tree - but only because it's made to: a-tree's own native `all of` actually checks the opposite (the attribute is a subset of the literal list), so `matching_engine` transparently rewrites `X all of (v1, ..., vn)` into `X one of (v1) and ... and X one of (vn)` before handing it to a-tree, which evaluates to the same (be-tree-matching) result. This is invisible in normal use - the rewrite happens automatically inside `insert()` - but worth knowing if you're reading a-tree's own docs/tests, which describe `all of` differently.
+
+### `engine: pstree`
+
+A third matching engine (`src/matching_engine.cpp`'s `pstree_matching_engine`), built on
+[mrayva/pstree](https://github.com/mrayva/pstree) - a from-scratch implementation of PS-Tree/PSTDynamic,
+the boolean-expression matching design from ["Efficient Parallel Boolean Expression Matching"](https://doi.org/10.1145/3736756)
+(Ji, Yao, Wang, Wei, Jacobsen — ACM TODS 2025). Expressions are parsed by reusing be-tree's own
+parser (`betree_make_sub()`, against a throwaway, never-searched be-tree instance built purely to
+parse and type-check) rather than a second hand-written parser - see `src/pstree_dialect.hpp`'s own
+doc comment for the full reasoning. The resulting AST is converted to Disjunctive Normal Form
+(De Morgan negation-pushdown for `not`, clause expansion for `or`) since PSTDynamic's own model is a
+pure conjunction of predicates with no AND/OR/NOT combinators at all; each DNF clause becomes its
+own PSTDynamic subscription, and `pstree_matching_engine::search()` deduplicates a subscription
+matched via more than one of its own OR'd clauses back down to a single result.
+
+Two real, structural limitations (not omissions - PSTDynamic's own predicate-space-index design has
+no way to represent either):
+
+- **No list-valued attributes** (`string_list` / `integer_list`) - an event attribute in
+  PSTDynamic's model is always a single value, never a list. Referencing one (`one of`/`none of`/
+  `all of`/`is empty`/`is not empty`, or any comparison against a list-typed attribute) is rejected
+  at subscribe time with a clear error.
+- **`X is null` can't be indexed if it's the subscription's only usable predicate.** PSTDynamic
+  picks one predicate per subscription (the "access predicate") to index into a per-dimension tree;
+  `is null` can never be chosen for that role, since "this attribute was absent" has no
+  representable position in a value-ordered index (`MatchEvent` only ever consults a dimension's
+  tree for events that *do* have that attribute). A subscription with at least one other,
+  indexable predicate alongside `is null` works fine; `"X is null"` alone (or every branch of an
+  `or` reducing to bare `is null` checks) is rejected at subscribe time. `is not null` has no such
+  problem - it's always indexable (as an unselective "matches every leaf" fallback).
+- String attributes are compared only up to a fixed prefix length (`kPstreeStringMaxLen`, 128 bytes,
+  in `matching_engine.cpp`) - PS-Tree's string encoding is a fixed-depth tree, one level per byte
+  position, not a variable-length comparison. Two distinct strings sharing a 128-byte prefix are
+  indistinguishable to `pstree`; unlikely to matter for realistic attribute values (names, symbols,
+  categories, ids) but worth knowing if an attribute can hold long strings.
+
+Independent throughput comparison against a-tree/be-tree (the paper's own self-reported benchmarks
+are not otherwise verified here) is future work - see the project status notes for the current
+state of that investigation.
 
 ## Client Protocol
 

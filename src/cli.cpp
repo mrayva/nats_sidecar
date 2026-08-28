@@ -18,7 +18,7 @@ cxxopts::Options build_cli_options() {
                              "replaces any config-file input_subjects entirely if given)",
                              cxxopts::value<std::vector<std::string>>())
         ("f,format", "Binary format (msgpack|cbor|flexbuffers|zera|ion|bson|beve)", cxxopts::value<std::string>())
-        ("engine", "Matching engine (atree|betree)", cxxopts::value<std::string>())
+        ("engine", "Matching engine (atree|betree|pstree)", cxxopts::value<std::string>())
         ("output-prefix", "Output subject prefix", cxxopts::value<std::string>())
         ("queue-group", "Input queue group for load balancing", cxxopts::value<std::string>())
         ("input-columnar", "Treat input as pg_zerialize-style columnar batches (see README) - "

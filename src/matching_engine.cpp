@@ -1,7 +1,16 @@
 #include "matching_engine.hpp"
 #include "dialect.hpp"
+#include "pstree_dialect.hpp"
 #include <atree.hpp>
 #include <betree_cpp.hpp>
+// tree.h redirects to tree.hpp under __cplusplus (its own dispatch, see the file itself) -
+// plain C++ declarations, not a C ABI, so no extern "C" wrapper here: free_sub() (used below,
+// not exposed via betree_cpp.hpp/betree.h) is a normal C++-linkage global function.
+#include <tree.h>
+#include <pstree/pst_dynamic.hpp>
+
+#include <algorithm>
+#include <unordered_map>
 
 namespace sidecar {
 
@@ -15,6 +24,15 @@ constexpr int64_t kBetreeIntMax = 1'000'000'000LL;
 constexpr double kBetreeFloatMin = -1e9;
 constexpr double kBetreeFloatMax = 1e9;
 constexpr std::size_t kBetreeStringCount = 1024;
+
+// PS-Tree's own string encoding (order_key.hpp's StringCodec) is a FIXED-depth tree - one
+// inner-node level per character position, sized by this constant - not a variable-length
+// comparison like a-tree/be-tree's own string handling. A string longer than this is silently
+// TRUNCATED at encode time (bytes past this length never affect which predicate space it
+// falls into), so two distinct strings sharing this-many-byte prefix are indistinguishable to
+// pstree. Chosen generously for typical attribute values (names, symbols, categories, ids);
+// documented as a real, structural limitation in README.md, not a bug.
+constexpr std::size_t kPstreeStringMaxLen = 128;
 }
 
 namespace {
@@ -398,6 +416,187 @@ private:
     small_attr_map<std::size_t> m_indices;
 };
 
+// list_valued attributes have no analog in PSTDynamic's model (an event attribute is always a
+// single value there, never a list - see mrayva/pstree's README) - excluded from the schema
+// entirely, not just from indexing: any expression that actually references one is rejected at
+// translation time by ast_to_pstree_dnf() (pstree_dialect.cpp), which is the only place that
+// needs to know they exist.
+std::vector<pstree::AttrSchema> build_pstree_schema(const std::vector<attribute_def>& attributes) {
+    std::vector<pstree::AttrSchema> schema;
+    for (const auto& attr : attributes) {
+        switch (attr.type) {
+            case attribute_type::boolean:
+                schema.push_back({attr.name, pstree::ValueType::kBoolean});
+                break;
+            case attribute_type::integer:
+                schema.push_back({attr.name, pstree::ValueType::kInteger});
+                break;
+            case attribute_type::float_val:
+                schema.push_back({attr.name, pstree::ValueType::kFloat});
+                break;
+            case attribute_type::string:
+                schema.push_back({attr.name, pstree::ValueType::kString, kPstreeStringMaxLen});
+                break;
+            case attribute_type::string_list:
+            case attribute_type::integer_list:
+                break;
+        }
+    }
+    return schema;
+}
+
+// No incremental population API to speak of: PSTDynamic::Event is just a
+// std::vector<EventPair> built fresh from each with_*() call, so unlike
+// atree/betree there's no native builder object to wrap - this class
+// itself IS the builder.
+class pstree_event_sink : public event_sink {
+public:
+    void with_boolean(std::string_view name, bool value) override {
+        m_event.push_back({std::string(name), pstree::Value(value)});
+    }
+    void with_integer(std::string_view name, int64_t value) override {
+        m_event.push_back({std::string(name), pstree::Value(static_cast<std::int64_t>(value))});
+    }
+    void with_float(std::string_view name, double value) override {
+        m_event.push_back({std::string(name), pstree::Value(value)});
+    }
+    void with_string(std::string_view name, std::string_view value) override {
+        m_event.push_back({std::string(name), pstree::Value(std::string(value))});
+    }
+    void with_string_list(std::string_view name, const std::vector<std::string>&) override {
+        throw matching_engine_error(
+            "pstree does not support list-valued attributes: '" + std::string(name) + "'");
+    }
+    void with_integer_list(std::string_view name, const std::vector<int64_t>&) override {
+        throw matching_engine_error(
+            "pstree does not support list-valued attributes: '" + std::string(name) + "'");
+    }
+    // Deliberately a no-op, not a value push: PSTDynamic's own model treats "this attribute
+    // isn't in the event" (pstree::findAttr() returning nullptr) as the one and only
+    // representation of undefined/absent - there's no separate "present but undefined" value
+    // to encode, so simply never adding the pair here already IS correct.
+    void with_undefined(std::string_view) override {}
+
+    pstree::Event& native() { return m_event; }
+    void reset() { m_event.clear(); }
+
+private:
+    pstree::Event m_event;
+};
+
+class pstree_matching_engine : public matching_engine {
+public:
+    explicit pstree_matching_engine(std::vector<attribute_def> attributes)
+        : m_parsing_tree(build_betree(attributes, m_unused_indices)),
+          m_pstd(build_pstree_schema(attributes)) {}
+
+    // Each inserted expression becomes one or more PSTDynamic subscriptions - one per DNF
+    // clause (see ast_to_pstree_dnf()'s own doc comment for why OR/NOT need this at all,
+    // PSTDynamic's own model being pure-conjunction) - sharing a fresh "clause id" mapped back
+    // to the caller's own `id` in m_clause_to_sub, so search() can deduplicate a subscription
+    // matched via more than one of its own OR'd clauses back down to a single result. Parsing
+    // reuses be-tree's own already-linked, already-tested parser (betree_make_sub(), against
+    // m_parsing_tree - a throwaway instance built purely to parse/type-check, never searched)
+    // rather than writing a second parser for the same grammar - see pstree_dialect.hpp's own
+    // doc comment for the full reasoning.
+    void insert(uint64_t id, const std::string& expression) override {
+        std::string translated;
+        try {
+            translated = translate_to_betree_dialect(expression);
+        } catch (const std::exception& e) {
+            throw matching_engine_error(e.what());
+        }
+
+        struct betree_sub* sub =
+            betree_make_sub(m_parsing_tree.get(), id, 0, nullptr, translated.c_str());
+        if (sub == nullptr) {
+            throw matching_engine_error("pstree: invalid expression: " + expression);
+        }
+        std::vector<pstree_clause> dnf;
+        try {
+            dnf = ast_to_pstree_dnf(sub->expr);
+        } catch (...) {
+            free_sub(sub);
+            throw;
+        }
+        free_sub(sub);
+
+        std::vector<uint64_t> insertedClauseIds;
+        try {
+            for (auto& clause : dnf) {
+                if (clause.empty()) {
+                    // An unconditionally-true DNF clause (a literal `true`/`not false`
+                    // somewhere in the expression) - PSTDynamic's own model has no way to
+                    // represent "matches every event", only a conjunction of real
+                    // predicates (insertSubscription() itself throws on an empty predicate
+                    // list) - a real, structural limitation, not an omission.
+                    throw matching_engine_error(
+                        "pstree: expression '" + expression +
+                        "' has an unconditionally-true clause (e.g. a literal 'true'), "
+                        "which pstree cannot index - every clause needs at least one "
+                        "real predicate");
+                }
+                uint64_t clauseId = m_next_clause_id++;
+                m_pstd.insertSubscription(pstree::Subscription{clauseId, clause});
+                insertedClauseIds.push_back(clauseId);
+                m_clause_to_sub[clauseId] = id;
+            }
+        } catch (const matching_engine_error&) {
+            for (auto clauseId : insertedClauseIds) {
+                m_pstd.deleteSubscription(clauseId);
+                m_clause_to_sub.erase(clauseId);
+            }
+            throw;
+        } catch (const std::exception& e) {
+            for (auto clauseId : insertedClauseIds) {
+                m_pstd.deleteSubscription(clauseId);
+                m_clause_to_sub.erase(clauseId);
+            }
+            throw matching_engine_error(e.what());
+        }
+    }
+
+    std::unique_ptr<event_sink> make_event() const override {
+        return std::make_unique<pstree_event_sink>();
+    }
+
+    std::vector<uint64_t> search(event_sink& event) const override {
+        auto& sink = static_cast<pstree_event_sink&>(event);
+        std::vector<uint64_t> result;
+        try {
+            auto clauseMatches = m_pstd.matchEvent(sink.native());
+            for (auto clauseId : clauseMatches) {
+                auto it = m_clause_to_sub.find(clauseId);
+                uint64_t subId = (it != m_clause_to_sub.end()) ? it->second : clauseId;
+                if (std::find(result.begin(), result.end(), subId) == result.end()) {
+                    result.push_back(subId);
+                }
+            }
+        } catch (const std::exception& e) {
+            sink.reset();
+            throw matching_engine_error(e.what());
+        }
+        sink.reset();
+        return result;
+    }
+
+    // pstree_event_sink is a plain, freshly-constructed std::vector<EventPair> builder with no
+    // native-engine allocation behind it worth pooling across rows (unlike a-tree/be-tree's own
+    // native event objects) - reset() already just clears the vector in place, so there is
+    // nothing this flag would unlock that reset() doesn't already give a caller regardless.
+    bool reuses_events() const override { return true; }
+
+private:
+    // Declaration order matters here: members initialize in this order, and m_parsing_tree's
+    // own initializer (below) passes m_unused_indices by reference into build_betree() - it
+    // must already be constructed (an empty vector, ready to receive .set() calls) by then.
+    small_attr_map<std::size_t> m_unused_indices;
+    be::Tree m_parsing_tree;
+    pstree::PSTDynamic m_pstd;
+    std::unordered_map<uint64_t, uint64_t> m_clause_to_sub;
+    uint64_t m_next_clause_id = 1;
+};
+
 } // namespace
 
 std::unique_ptr<matching_engine> build_matching_engine(
@@ -411,6 +610,8 @@ std::unique_ptr<matching_engine> build_matching_engine(
             auto tree = build_betree(attributes, indices);
             return std::make_unique<betree_matching_engine>(std::move(tree), std::move(indices));
         }
+        case engine_type::pstree:
+            return std::make_unique<pstree_matching_engine>(attributes);
     }
     throw matching_engine_error("unknown engine type");
 }

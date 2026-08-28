@@ -18,6 +18,7 @@ std::optional<binary_format> parse_format(const std::string& s) {
 std::optional<engine_type> parse_engine_type(const std::string& s) {
     if (s == "atree")  return engine_type::atree;
     if (s == "betree") return engine_type::betree;
+    if (s == "pstree") return engine_type::pstree;
     return std::nullopt;
 }
 

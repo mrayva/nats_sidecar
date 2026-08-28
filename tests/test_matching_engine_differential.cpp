@@ -7,6 +7,12 @@
 // type matrix - so a future engine upgrade that silently changes semantics
 // for a case neither file's authors thought to hand-pick still gets caught.
 //
+// pstree is checked too, against the same shared c.expect_match (not
+// cross-diffed against a-tree/be-tree the way they're diffed against each
+// other) for every case EXCEPT the ones touching a list-valued attribute or
+// "is empty" - pstree's own model has no representation for either (see
+// diff_case::pstree_supported's own comment).
+//
 // Deliberately table-driven and fully deterministic (no RNG) - this runs in
 // CI and a flaky differential test would be worse than no differential test.
 //
@@ -74,6 +80,13 @@ struct diff_case {
     bool expect_match;   // the *agreed* expected result, so a divergence and
                           // a shared-wrong-answer both get caught, not just
                           // disagreement between the two engines.
+    // false for any case touching a list-valued attribute (tags/scores) or
+    // "is empty" - pstree has no representation for either (see
+    // pstree_dialect.hpp's own doc comment: an event attribute is always a
+    // single value in PSTDynamic's model, and list operators/is-empty are
+    // rejected outright by ast_to_pstree_dnf()) - a real, structural
+    // limitation, not a gap in this test.
+    bool pstree_supported = true;
 };
 
 std::ostream& operator<<(std::ostream& os, const diff_case& c) {
@@ -93,6 +106,11 @@ TEST_P(matching_engine_differential, engines_agree) {
         << "a-tree gave an unexpected result for \"" << c.expr << "\" (case \"" << c.label << "\")";
     EXPECT_EQ(betree_result, c.expect_match)
         << "be-tree gave an unexpected result for \"" << c.expr << "\" (case \"" << c.label << "\")";
+
+    if (!c.pstree_supported) return;
+    bool pstree_result = matches(engine_type::pstree, c.expr, c.event);
+    EXPECT_EQ(pstree_result, c.expect_match)
+        << "pstree gave an unexpected result for \"" << c.expr << "\" (case \"" << c.label << "\")";
 }
 
 std::vector<diff_case> differential_cases() {
@@ -142,14 +160,22 @@ std::vector<diff_case> differential_cases() {
         {"not_in_false","count not in (1, 2, 3)", {.count = 2},  false},
 
         // --- is null / is not null ---
-        {"is_null_true",      "name is null",     {}, true},
-        {"is_null_false",     "name is null",     {.name = std::string("AAPL")}, false},
+        // is_null is excluded from pstree: with no other predicate in the subscription to
+        // fall back to, "name is null" is its own (only, therefore best) access predicate -
+        // and kIsNull can never be one (see pstree_dialect.hpp/pst_dynamic.hpp's own
+        // comments: there is structurally no way to index "this dimension was absent",
+        // since MatchEvent only ever consults a dimension's tree for events that DO have
+        // it) - PSTDynamic::insertSubscription() throws for exactly this reason.
+        // is_not_null has no such problem (it CAN be an access predicate, just an
+        // unselective one - "matches every leaf" - see the same comments) so it stays in.
+        {"is_null_true",      "name is null",     {}, true, false},
+        {"is_null_false",     "name is null",     {.name = std::string("AAPL")}, false, false},
         {"is_not_null_true",  "name is not null", {.name = std::string("AAPL")}, true},
         {"is_not_null_false", "name is not null", {}, false},
 
         // --- is empty (list attribute) ---
-        {"is_empty_true",  "tags is empty", {.tags = std::vector<std::string>{}}, true},
-        {"is_empty_false", "tags is empty", {.tags = std::vector<std::string>{"a"}}, false},
+        {"is_empty_true",  "tags is empty", {.tags = std::vector<std::string>{}}, true, false},
+        {"is_empty_false", "tags is empty", {.tags = std::vector<std::string>{"a"}}, false, false},
 
         // --- list-attribute membership: one of / none of ---
         // one_of/none_of apply to list-typed attributes (the literal list is
@@ -161,10 +187,10 @@ std::vector<diff_case> differential_cases() {
         // here: true iff the attribute's list and the literal list share at
         // least one element (a-tree's one_of()/none_of() do a sorted-merge
         // intersection check with no length-direction dependency).
-        {"one_of_true",  "tags one of (\"x\", \"y\")",  {.tags = std::vector<std::string>{"x", "z"}}, true},
-        {"one_of_false", "tags one of (\"x\", \"y\")",  {.tags = std::vector<std::string>{"z"}}, false},
-        {"none_of_true", "tags none of (\"x\", \"y\")", {.tags = std::vector<std::string>{"z"}}, true},
-        {"none_of_false","tags none of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x"}}, false},
+        {"one_of_true",  "tags one of (\"x\", \"y\")",  {.tags = std::vector<std::string>{"x", "z"}}, true, false},
+        {"one_of_false", "tags one of (\"x\", \"y\")",  {.tags = std::vector<std::string>{"z"}}, false, false},
+        {"none_of_true", "tags none of (\"x\", \"y\")", {.tags = std::vector<std::string>{"z"}}, true, false},
+        {"none_of_false","tags none of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x"}}, false, false},
 
         // --- all of: reconciled to be-tree's native semantic (the event's
         // attribute list must contain every listed value - "the event has
@@ -172,11 +198,11 @@ std::vector<diff_case> differential_cases() {
         // which rewrites "X all of (lits)" into a conjunction of singleton
         // "one of" checks before handing it to a-tree - see matching_engine
         // .all_of_reconciled_across_engines below for why this exists.
-        {"all_of_true",       "scores all of (1, 2)",    {.scores = std::vector<int64_t>{1, 2, 3}}, true},
-        {"all_of_missing_one","scores all of (1, 2)",    {.scores = std::vector<int64_t>{1, 3}},     false},
-        {"all_of_string_true","tags all of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x", "y", "z"}}, true},
-        {"all_of_string_missing", "tags all of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x"}}, false},
-        {"all_of_single_element", "scores all of (2)",   {.scores = std::vector<int64_t>{1, 2, 3}}, true},
+        {"all_of_true",       "scores all of (1, 2)",    {.scores = std::vector<int64_t>{1, 2, 3}}, true, false},
+        {"all_of_missing_one","scores all of (1, 2)",    {.scores = std::vector<int64_t>{1, 3}},     false, false},
+        {"all_of_string_true","tags all of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x", "y", "z"}}, true, false},
+        {"all_of_string_missing", "tags all of (\"x\", \"y\")", {.tags = std::vector<std::string>{"x"}}, false, false},
+        {"all_of_single_element", "scores all of (2)",   {.scores = std::vector<int64_t>{1, 2, 3}}, true, false},
     };
 }
 

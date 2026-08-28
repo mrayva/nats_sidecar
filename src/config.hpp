@@ -36,7 +36,8 @@ enum class binary_format {
 // Boolean-expression matching engine backing subscription_manager.
 enum class engine_type {
     atree,
-    betree
+    betree,
+    pstree
 };
 
 // One independent input source: a named group of subjects, feeding either a

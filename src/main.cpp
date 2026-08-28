@@ -46,7 +46,13 @@ void log_startup_banner(spdlog::logger& console, const sidecar::config& cfg) {
     console.info("nats_sidecar starting");
     console.info("  server: {}:{}", cfg.nats_address, cfg.nats_port);
     console.info("  input:  {} (format={})", fmt::join(cfg.input_subjects, ", "), static_cast<int>(cfg.format));
-    console.info("  engine: {}", cfg.engine == sidecar::engine_type::atree ? "atree" : "betree");
+    const char* engine_name = "betree";
+    switch (cfg.engine) {
+        case sidecar::engine_type::atree:  engine_name = "atree"; break;
+        case sidecar::engine_type::betree: engine_name = "betree"; break;
+        case sidecar::engine_type::pstree: engine_name = "pstree"; break;
+    }
+    console.info("  engine: {}", engine_name);
     console.info("  output: {}.<ID>", cfg.output_prefix);
     console.info("  attributes: {}", cfg.attributes.size());
     console.info("  worker threads: {}", sidecar::effective_worker_count(cfg));
