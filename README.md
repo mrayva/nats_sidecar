@@ -1667,25 +1667,74 @@ search time dropped **1.2x-5.0x** across the K range (largest gain at the larges
 74,776.45 ms at K=50,000). More importantly, pstree is no longer uniformly the worst of the three: at
 K=1,000 it's already faster than be-tree (69,719 vs. 48,044 events/s), and at K=50,000 it's faster
 than be-tree again (267 vs. 241 events/s) - it's only in the K=5,000-10,000 middle range that be-tree
-edges it out slightly (within ~1.1x). a-tree remains the fastest searcher throughout, by a real
-margin (1.3x at K=1,000 widening to ~5.0x at K=50,000) - pstree's search time still grows somewhat
-faster than linear with K (260x time for a 51x growth in raw match volume, K=1,000->50,000), but that
-residual super-linearity is now roughly the same order of magnitude as be-tree's own (200x for the
-same 51x match growth), not the outlier it looked like before this fix - a genuine, now-fairly-
-attributed gap to a-tree's more mature evaluator, not a leftover pstree-specific pathology. The
-un-profiled Bloom-filter-fragmentation hypothesis from the earlier writeup is retracted as an
-explanation for the K=50,000 blowup (that blowup is fully accounted for by the dedup bug above); it
-remains a plausible, still-unconfirmed contributor to pstree's smaller residual gap from a-tree, and
-is left as open follow-up, not restated as a finding.
+edges it out slightly (within ~1.1x). The un-profiled Bloom-filter-fragmentation hypothesis from the
+earlier writeup is retracted as an explanation for the K=50,000 blowup (fully accounted for by the
+dedup bug above).
 
-**Conclusion**: both the insert-side scaling issue and the search-side dedup bug are now fixed and
-verified across a 50x range of K. pstree's insert is unambiguously the fastest of the three engines
-at large K; its search is now competitive with be-tree (ahead at the extremes of the tested range,
-slightly behind in the middle) and behind a-tree by a real but no-longer-catastrophic margin.
-`engine: pstree` is a strong choice when subscription churn (frequent insert/delete) dominates, and
-is now a reasonable choice more broadly rather than one narrowly justified only by churn-heavy
-workloads; `atree` remains the fastest choice when search throughput at very large K is the primary
-concern.
+**A second real bottleneck found the same way, immediately after the dedup fix - profiling did not
+stop at "good enough."** Re-profiling `matching_engine_bench` at K=20,000/50,000 with the dedup fix
+in place showed `PSTDynamic::matchEvent()`'s own self-time still dominated by one thing:
+`subscriptions_.at(id)` - an `unordered_map` hash lookup, run once per raw candidate match, inside
+the innermost matching loop (`pst_dynamic.hpp`). `perf annotate` attributed ~63% of `matchEvent`'s
+self-time to this single call at a many-thousand-subscription K. **Fixed** (`pstree@3033469`):
+`LeafGroupState::groups` now stores a `const Subscription*` directly alongside each id, captured
+once at `InsertSubscription` time, instead of just the id - eliminating the lookup from the hot loop
+entirely. Safe because `unordered_map` never invalidates references/pointers to an element except by
+erasing that exact element, and `DeleteSubscription` always removes an id (and its pointer) from
+every group before erasing the subscription itself. Full 8-test pstree suite green, normal and
+ASan+UBSan+leak-detection.
+
+**Results, after both the dedup fix and the `unordered_map::at()` elimination:**
+
+| K | engine | insert | insert rate | search | search rate | total matches |
+|---:|---|---:|---:|---:|---:|---:|
+| 1,000  | atree  | 0.95 ms     | 1,057,521 subs/s | 221.48 ms    | 90,302 events/s | 5,286,377   |
+| 1,000  | betree | 3.28 ms     | 305,220 subs/s   | 393.44 ms    | 50,833 events/s | 5,286,377   |
+| 1,000  | pstree | 3.93 ms     | 254,315 subs/s   | 248.62 ms    | 80,444 events/s | 5,286,377   |
+| 5,000  | atree  | 9.46 ms     | 528,497 subs/s   | 1,353.10 ms  | 14,781 events/s | 27,180,339  |
+| 5,000  | betree | 45.67 ms    | 109,490 subs/s   | 2,471.47 ms  | 8,092 events/s  | 27,180,339  |
+| 5,000  | pstree | 19.53 ms    | 255,980 subs/s   | 1,986.40 ms  | 10,068 events/s | 27,180,339  |
+| 10,000 | atree  | 32.67 ms    | 306,111 subs/s   | 2,860.87 ms  | 6,991 events/s  | 54,413,004  |
+| 10,000 | betree | 197.54 ms   | 50,623 subs/s    | 5,383.31 ms  | 3,715 events/s  | 54,413,004  |
+| 10,000 | pstree | 35.76 ms    | 279,606 subs/s   | 4,762.44 ms  | 4,200 events/s  | 54,413,004  |
+| 50,000 | atree  | 751.95 ms   | 66,494 subs/s    | 14,547.29 ms | 1,375 events/s  | 271,572,457 |
+| 50,000 | betree | 7,832.73 ms | 6,383 subs/s     | 61,575.89 ms | 325 events/s    | 271,572,457 |
+| 50,000 | pstree | 197.25 ms   | 253,491 subs/s   | 34,806.38 ms | 575 events/s    | 271,572,457 |
+
+Match counts still agree exactly across all three engines at every K; insert numbers are consistent
+with earlier runs (search-only fix) - only run-to-run noise, no behavioral change.
+
+**pstree now beats be-tree at every tested K, not just the extremes**, and the gap to a-tree has
+roughly halved: pstree search is 1.1x-2.4x behind a-tree (was 1.3x-5.0x before this fix) and 1.1x-1.8x
+*ahead* of be-tree at every K (was: behind be-tree in the K=5,000-10,000 middle). pstree's own residual
+super-linearity also improved: 140x time growth for the same 51x match-volume increase (K=1,000-50,000),
+down from 260x, and now genuinely *better* than be-tree's own super-linearity (156x) at the same
+comparison - no longer the worst-scaling of the three on this metric.
+
+**A third, deeper cost was identified via the same profiling pass but NOT fixed here - a real
+architectural question, not a quick patch.** With both bugs above fixed, `matchEvent`'s own remaining
+self-time is now dominated (~86%, per `perf annotate`) by a chain of pointer dereferences needed just
+to start iterating one candidate's predicates: `subPtr -> Subscription::predicates.data() ->
+predicates[0].attr`. Each of these is a load from a genuinely different, independently-heap-allocated
+location (the `Subscription` sits in `subscriptions_`'s hashmap node storage; its `predicates` vector
+is a separate allocation) with no relationship to iteration order across different candidates - a
+textbook cache-miss-dominated pointer chase, not an algorithmic complexity problem. Separately,
+`pstree_matching_engine::search()`'s own remaining self-time is still dominated (~71%) by two
+per-match `unordered_map` operations (`m_clause_to_sub.find()` translating a DNF clause id back to
+the caller's subscription id, plus `m_seen_scratch.insert()` for dedup) - both real hashmap costs,
+just no longer *quadratic* ones. Closing either of these further would mean a genuine data-layout
+redesign (e.g. a more cache-friendly Subscription/predicate storage, or restructuring how DNF clause
+ids map back to subscription ids to avoid one of the two hashmap lookups) rather than a bug fix -
+tracked as identified, characterized, real follow-up debt, not chased further in this pass.
+
+**Conclusion**: the insert-side scaling issue and two independent real search-side bottlenecks (the
+O(n^2) dedup bug and the per-match hashmap lookup) are now fixed and verified across a 50x range of
+K. pstree's insert is unambiguously the fastest of the three engines at large K; its search now beats
+be-tree outright at every tested K and trails a-tree by a real but substantially narrowed margin
+(1.1x-2.4x, down from 1.3x-5.0x). `engine: pstree` is a strong all-around choice, not one narrowly
+justified only by churn-heavy workloads; `atree` remains the fastest choice when search throughput at
+very large K is the primary concern, though the remaining gap is now a data-layout question with a
+known shape, not an open mystery.
 
 ## License
 
