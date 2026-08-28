@@ -14,6 +14,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(SIDECAR_BUILD_TESTS "Build tests" ON)
+option(SIDECAR_BUILD_BENCHMARKS "Build matching-engine benchmarks" OFF)
 set(SIDECAR_SANITIZER "none" CACHE STRING "Sanitizer: none, address, or thread")
 set_property(CACHE SIDECAR_SANITIZER PROPERTY STRINGS none address thread)
 
@@ -208,4 +209,14 @@ if(SIDECAR_BUILD_TESTS)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
     )
     add_test(NAME sidecar_test COMMAND sidecar_test)
+endif()
+
+# --- benchmarks ---
+if(SIDECAR_BUILD_BENCHMARKS)
+    add_executable(matching_engine_bench benchmarks/matching_engine_bench.cpp)
+    target_link_libraries(matching_engine_bench PRIVATE sidecar_lib)
+    target_compile_options(matching_engine_bench PRIVATE ${SIDECAR_WARNING_FLAGS})
+    set_target_properties(matching_engine_bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
 endif()

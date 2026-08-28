@@ -8,7 +8,7 @@ include(FetchContent)
 FetchContent_Declare(
     atree
     GIT_REPOSITORY https://github.com/mrayva/a-tree.git
-    GIT_TAG        bc434fb8377279b4ac8e4a1b3620ec9d1b0a85e3
+    GIT_TAG        a9a8829cff2f4c61ea77d8b49a8595cc87018ddc
     GIT_SHALLOW    TRUE
     SYSTEM
 )

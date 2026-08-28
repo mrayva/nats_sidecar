@@ -15,7 +15,7 @@ include(FetchContent)
 FetchContent_Declare(
     pstree
     GIT_REPOSITORY https://github.com/mrayva/pstree.git
-    GIT_TAG        a3f8a0076f7b079cb13455c4e33a5871e2d2c7f2
+    GIT_TAG        c06c3dee357e2ea7690191829e08e2731a3a2629
     GIT_SHALLOW    TRUE
     SYSTEM
 )
