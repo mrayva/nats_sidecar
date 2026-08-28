@@ -1584,8 +1584,8 @@ classical "canonical decomposition" technique for stabbing queries, generalized 
 encoding's existing digit-trie), attaching a range predicate to O(depth) ancestor nodes - a small,
 per-attribute-type constant (16 for int64/double) independent of K - instead of O(leaves-covered).
 
-**Results, after the fix**, extended to K=50,000 to confirm the fix holds well past the original
-scale:
+**Results, after the insert-side fix** (before the search-side dedup fix described further below),
+extended to K=50,000 to confirm the insert fix holds well past the original scale:
 
 | K | engine | insert | insert rate | search | search rate | total matches |
 |---:|---|---:|---:|---:|---:|---:|
@@ -1613,40 +1613,79 @@ the **fastest** of the three engines to insert (197k subs/s vs. atree's 66k and 
 betree's own insert cost scales badly with K here too, for unrelated reasons not investigated as
 part of this work).
 
-**Search did not improve, and at K=50,000 it degrades faster than either competitor - a real,
-distinct finding, not a leftover piece of the same bug.** Search throughput is statistically
-unchanged from before the fix at K<=10,000 (e.g. 1,023 vs. 1,018 events/s at K=10,000) - expected,
-since the *old* design's `MatchPair` was already an O(1) leaf lookup; the old 15%-of-a-tree search
-figure was never caused by the same insert-side leaf-materialization bug, it reflects (a) genuine
-output-sensitivity (this adversarial workload's events legitimately match a large, K-proportional
-fraction of all subscriptions, so *any* correct engine's search time grows with K) and (b) pstree's
-own per-candidate `matchSubscription()` evaluator being intrinsically slower than a-tree/be-tree's
-more mature, hand-optimized evaluators - neither of which this fix touches. What's new at K=50,000:
-pstree's search time grew **19x** for a 5x increase in K (vs. atree's proportional ~5.2x and
-be-tree's ~10.5x) - worse than linear, and worse than either competitor. The likely mechanism (by
-code inspection, not yet confirmed via profiling): `PSTDynamic`'s dimension-signature Bloom-filter
-grouping (`LeafGroupState`, `pst_dynamic.hpp`) grows/shrinks its filter width based on *each
-bucket's own* subscriber count - and the canonical-decomposition fix, by design, spreads a
-`trade_price > X`-heavy workload's subscribers across up to `depth` separate buckets instead of one
-shared leaf. Each bucket ends up with a smaller local subscriber count than the old design's single
-leaf would have had, so each independently reaches a *smaller* Bloom-filter width, giving worse
-per-bucket false-positive precision - and since a single query can now touch several such
-under-sized buckets instead of one well-sized one, the wasted-evaluation cost compounds. This is a
-real tension between the insert-side fix (which requires fragmenting coverage across buckets) and a
-grouping mechanism designed around "all of a leaf's subscribers live in one place" - tracked as
-follow-up work in `mrayva/pstree`'s own README, not fixed here.
+**Search initially looked unfixed, and at K=50,000 appeared to degrade faster than either
+competitor.** The first re-benchmark after the insert-side fix showed search throughput essentially
+unchanged from before it (e.g. 1,023 vs. 1,018 events/s at K=10,000) and, at K=50,000, growing **19x**
+slower for only a 5x increase in K - worse than either competitor. At the time this was written up as
+a real but only-partially-understood cost, hypothesized (by code inspection, *not* confirmed via
+profiling) to be `PSTDynamic`'s dimension-signature Bloom-filter grouping losing precision as the
+insert-side fix spread each wide predicate's coverage across more, smaller buckets. That hypothesis
+was never actually profiled, and turned out to be looking in the wrong place entirely.
 
-**Conclusion**: the specific, measured "wide-range-predicate scaling issue" this investigation set
-out to fix - `PSTDynamic::insertSubscription()`'s O(leaf-count) insertion cost - is fixed, cleanly
-and completely verified across a 50x range of K. PSTDynamic is now genuinely fast to build for
-exactly the workload shape (many independent threshold-alert subscriptions) that used to be its
-worst case. It is **not**, however, fast to *search* at scale on this same workload - a real,
-different, and only partially understood cost that the fix did not address and that grows worse
-than either competitor's own search cost as K increases. `engine: pstree` is a strong choice when
-subscription *churn* (frequent insert/delete) dominates and the total live subscription count on any
-one dimension stays modest; it is not recommended over `atree`/`betree` when a single event is
-expected to match a large fraction of many thousands of live subscriptions, until the search-side
-fragmentation cost above gets its own follow-up fix.
+**The real cause, found via `perf record`/`perf annotate` on `matching_engine_bench` at K=20,000:
+an O(n^2) dedup loop in `nats_sidecar`'s own wrapper, not anywhere in pstree.**
+`pstree_matching_engine::search()` (`src/matching_engine.cpp`) maps each of PSTDynamic's matched DNF
+clause ids back to the caller's subscription id and de-duplicates repeat ids (a subscription with an
+`OR` becomes multiple PSTDynamic "subscriptions" internally, any number of which can match the same
+event) using `std::find(result.begin(), result.end(), subId)` - a linear scan of the
+already-deduplicated output vector, run once per raw clause match. For an adversarial workload where
+a large, K-proportional fraction of subscriptions genuinely match every event (thousands of matches
+per event at K=50,000), this is O(matches) work per match, i.e. **O(matches^2) per event** - and the
+profile confirmed it directly: 66.8% of *all* search-phase self-time at K=20,000 was inside this one
+function's own tight compare-and-branch loop (`perf annotate` shows the hot instructions are a bare
+`cmp`/`je` pair, the disassembled shape of `std::find` over a `vector<uint64_t>`), dwarfing
+`PSTDynamic::matchEvent()` itself (7.1% self-time) and everything else in pstree combined. This bug
+predates the canonical-ancestor-marker redesign entirely - it is orthogonal to it, just invisible
+until the insert-side fix stopped masking it. **Fixed** by replacing the `std::find`/`vector` scan
+with a reused `unordered_set<uint64_t>` scratch member (O(1) average dedup, cleared per call instead
+of reallocated) - output order and content are unchanged (dedup still keeps first-seen order), only
+the algorithmic complexity of finding it changes.
+
+**Results, after the dedup fix:**
+
+| K | engine | insert | insert rate | search | search rate | total matches |
+|---:|---|---:|---:|---:|---:|---:|
+| 1,000  | atree  | 0.95 ms     | 1,057,650 subs/s | 221.45 ms    | 90,315 events/s | 5,286,377   |
+| 1,000  | betree | 3.13 ms     | 319,331 subs/s   | 416.29 ms    | 48,044 events/s | 5,286,377   |
+| 1,000  | pstree | 3.84 ms     | 260,636 subs/s   | 286.87 ms    | 69,719 events/s | 5,286,377   |
+| 5,000  | atree  | 9.04 ms     | 553,388 subs/s   | 1,317.95 ms  | 15,175 events/s | 27,180,339  |
+| 5,000  | betree | 41.79 ms    | 119,632 subs/s   | 2,546.14 ms  | 7,855 events/s  | 27,180,339  |
+| 5,000  | pstree | 21.17 ms    | 236,180 subs/s   | 2,787.63 ms  | 7,175 events/s  | 27,180,339  |
+| 10,000 | atree  | 32.97 ms    | 303,304 subs/s   | 2,845.64 ms  | 7,028 events/s  | 54,413,004  |
+| 10,000 | betree | 215.73 ms   | 46,355 subs/s    | 5,803.07 ms  | 3,446 events/s  | 54,413,004  |
+| 10,000 | pstree | 51.17 ms    | 195,444 subs/s   | 6,487.35 ms  | 3,083 events/s  | 54,413,004  |
+| 50,000 | atree  | 759.92 ms   | 65,796 subs/s    | 15,075.71 ms | 1,327 events/s  | 271,572,457 |
+| 50,000 | betree | 8,383.14 ms | 5,964 subs/s     | 83,111.28 ms | 241 events/s    | 271,572,457 |
+| 50,000 | pstree | 315.66 ms   | 158,398 subs/s   | 74,776.45 ms | 267 events/s    | 271,572,457 |
+
+Match counts still agree exactly across all three engines at every K, and insert numbers are
+unchanged (this fix is search-only) - confirming the dedup fix is a pure performance change, not a
+behavioral one.
+
+**Search improved substantially, and the "worse than either competitor" result reverses.** pstree's
+search time dropped **1.2x-5.0x** across the K range (largest gain at the largest K: 371,186.76 ms ->
+74,776.45 ms at K=50,000). More importantly, pstree is no longer uniformly the worst of the three: at
+K=1,000 it's already faster than be-tree (69,719 vs. 48,044 events/s), and at K=50,000 it's faster
+than be-tree again (267 vs. 241 events/s) - it's only in the K=5,000-10,000 middle range that be-tree
+edges it out slightly (within ~1.1x). a-tree remains the fastest searcher throughout, by a real
+margin (1.3x at K=1,000 widening to ~5.0x at K=50,000) - pstree's search time still grows somewhat
+faster than linear with K (260x time for a 51x growth in raw match volume, K=1,000->50,000), but that
+residual super-linearity is now roughly the same order of magnitude as be-tree's own (200x for the
+same 51x match growth), not the outlier it looked like before this fix - a genuine, now-fairly-
+attributed gap to a-tree's more mature evaluator, not a leftover pstree-specific pathology. The
+un-profiled Bloom-filter-fragmentation hypothesis from the earlier writeup is retracted as an
+explanation for the K=50,000 blowup (that blowup is fully accounted for by the dedup bug above); it
+remains a plausible, still-unconfirmed contributor to pstree's smaller residual gap from a-tree, and
+is left as open follow-up, not restated as a finding.
+
+**Conclusion**: both the insert-side scaling issue and the search-side dedup bug are now fixed and
+verified across a 50x range of K. pstree's insert is unambiguously the fastest of the three engines
+at large K; its search is now competitive with be-tree (ahead at the extremes of the tested range,
+slightly behind in the middle) and behind a-tree by a real but no-longer-catastrophic margin.
+`engine: pstree` is a strong choice when subscription churn (frequent insert/delete) dominates, and
+is now a reasonable choice more broadly rather than one narrowly justified only by churn-heavy
+workloads; `atree` remains the fastest choice when search throughput at very large K is the primary
+concern.
 
 ## License
 
