@@ -67,6 +67,7 @@ TEST(config_parsing, parse_format) {
     EXPECT_EQ(sidecar::parse_format("ion"),         sidecar::binary_format::ion);
     EXPECT_EQ(sidecar::parse_format("bson"),        sidecar::binary_format::bson);
     EXPECT_EQ(sidecar::parse_format("beve"),        sidecar::binary_format::beve);
+    EXPECT_EQ(sidecar::parse_format("arrow"),       sidecar::binary_format::arrow);
     EXPECT_FALSE(sidecar::parse_format("invalid").has_value());
 }
 

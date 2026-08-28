@@ -43,6 +43,17 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
                 zerialize::Beve::Deserializer reader(bytes);
                 return match_message(tree, schema, reader, log, search_time_out);
             }
+            case binary_format::arrow:
+                // Arrow has no row-mode reader at all (it's inherently columnar - see
+                // arrow_columnar_rows.hpp's own file-level comment). Rejected at
+                // config-validation time (finalize_and_validate_config requires every
+                // connection to be columnar when format=arrow) - a row-mode arrow message
+                // should never reach this call at all.
+                if (log) {
+                    log->error("event_bridge: row-mode matching is not supported for "
+                               "format=arrow (Arrow is columnar-only)");
+                }
+                return std::nullopt;
         }
     } catch (const std::exception& e) {
         if (log) log->debug("event_bridge: deserialization failed: {}", e.what());
@@ -53,28 +64,22 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
 
 namespace {
 
-template <typename Protocol>
+// `Rows` is deduced from the `rows` argument (either a zerialize::ColumnarRows<Protocol::
+// Deserializer> for the 6 existing columnar-capable formats, or an ArrowColumnarRows - see
+// arrow_columnar_rows.hpp); `OutProtocol` is always explicit at the call site, since nothing
+// about `rows`'s own type determines what format matched rows should republish in. This split
+// (originally `template<typename Protocol>` deriving both the reader AND the writer from one
+// type) is what lets input and output format decouple - see config::output_format's own
+// comment for why (Arrow has no single-row encoder, so it can never be its own OutProtocol).
+template <typename OutProtocol, typename Rows>
 std::optional<std::vector<row_match>> match_columnar_batch(
     const matching_engine& tree,
     const attribute_schema& schema,
-    std::span<const uint8_t> bytes,
+    Rows& rows,
     const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out,
     std::size_t* rows_searched_out)
 {
-    typename Protocol::Deserializer reader(bytes);
-
-    // columnar_rows() walks `reader` (the columnar-shaped payload) directly,
-    // one row at a time - it does not build the row-major document
-    // expand_columnar() used to (a Writer pass, then a fresh Deserializer
-    // parsing exactly what was just written straight back in). That
-    // write-then-read round trip was itself the single largest CPU cost in
-    // this whole request path once the O(n^2) row/column-indexing bugs on
-    // both sides of it were fixed (confirmed via perf) - bigger than
-    // matching_engine::search(), populate_event(), and everything else in
-    // this function combined. See zerialize/columnar.hpp's columnar_rows()
-    // doc comment for how it gets the same values without materializing.
-    auto rows = zerialize::columnar_rows(reader);
     const std::size_t n = rows.size();
     if (rows_searched_out) *rows_searched_out = n;
 
@@ -129,7 +134,7 @@ std::optional<std::vector<row_match>> match_columnar_batch(
             return false;
         }
         if (!matches->empty()) {
-            result.push_back({std::move(*matches), serialize_row<Protocol>(row)});
+            result.push_back({std::move(*matches), serialize_row<OutProtocol>(row)});
         }
         return true;
     };
@@ -147,6 +152,47 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     return result;
 }
 
+// Dispatches on `out_fmt` to pick OutProtocol and call match_columnar_batch - the second half
+// of the double-dispatch that only Arrow input actually needs (see deserialize_and_match_columnar
+// below: non-arrow input uses `format`'s own Protocol directly, without going through this).
+// `arrow` itself is never a valid `out_fmt` - config-validation (cli.cpp) rejects it at startup;
+// reachable here only if that guard is bypassed.
+template <typename Rows>
+std::optional<std::vector<row_match>> dispatch_columnar_output(
+    const matching_engine& tree,
+    const attribute_schema& schema,
+    Rows& rows,
+    binary_format out_fmt,
+    const std::shared_ptr<spdlog::logger>& log,
+    std::optional<std::chrono::nanoseconds>* search_time_out,
+    std::size_t* rows_searched_out)
+{
+    switch (out_fmt) {
+        case binary_format::msgpack:
+            return match_columnar_batch<zerialize::MsgPack>(tree, schema, rows, log, search_time_out, rows_searched_out);
+        case binary_format::cbor:
+            return match_columnar_batch<zerialize::CBOR>(tree, schema, rows, log, search_time_out, rows_searched_out);
+        case binary_format::flexbuffers:
+            return match_columnar_batch<zerialize::Flex>(tree, schema, rows, log, search_time_out, rows_searched_out);
+        case binary_format::zera:
+            return match_columnar_batch<zerialize::Zera>(tree, schema, rows, log, search_time_out, rows_searched_out);
+        case binary_format::ion:
+            return match_columnar_batch<zerialize::Ion>(tree, schema, rows, log, search_time_out, rows_searched_out);
+        case binary_format::beve:
+            return match_columnar_batch<zerialize::Beve>(tree, schema, rows, log, search_time_out, rows_searched_out);
+        case binary_format::bson:
+            // Valid as an OUTPUT format even for a columnar connection, unlike bson as an
+            // INPUT format (rejected below): serialize_row() only ever encodes one row (a
+            // document), never the batch's own root-level array, so BSON's root-array
+            // limitation (see the input-side rejection's own comment) never applies here.
+            return match_columnar_batch<zerialize::Bson>(tree, schema, rows, log, search_time_out, rows_searched_out);
+        case binary_format::arrow:
+            if (log) log->error("event_bridge: output_format=arrow is not supported (Arrow is read-only)");
+            return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 std::optional<std::vector<row_match>> deserialize_and_match_columnar(
@@ -156,40 +202,96 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     std::span<const char> payload,
     const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out,
-    std::size_t* rows_searched_out)
+    std::size_t* rows_searched_out,
+    std::optional<binary_format> output_format)
 {
     try {
+        // Arrow input is handled entirely separately from the other 6 formats: it has its own
+        // reader type (ArrowColumnarRows, not a zerialize columnar_rows() view), and - unlike
+        // every other format, which is required to keep output_format == format (v1 scope, see
+        // config::output_format's own comment) - it always needs the second output dispatch,
+        // since output_format is required to be set and different whenever format == arrow
+        // (enforced by finalize_and_validate_config()).
+        if (format == binary_format::arrow) {
+            ArrowColumnarRows rows(payload);
+            if (rows_searched_out) *rows_searched_out = rows.size();
+            if (!output_format) {
+                // finalize_and_validate_config() (cli.cpp) requires output_format to be set
+                // whenever format=arrow (Arrow has no single-row encoder of its own) -
+                // reachable here only if that guard is bypassed.
+                if (log) log->error("event_bridge: format=arrow requires output_format to be set");
+                return std::nullopt;
+            }
+            return dispatch_columnar_output(tree, schema, rows, *output_format, log, search_time_out, rows_searched_out);
+        }
+
         auto bytes = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
 
+        // Every non-arrow format keeps output_format == format (v1 scope, enforced at
+        // config-validation time) - OutProtocol is `format`'s own Protocol directly, the same
+        // single-dispatch shape (and the same template instantiations) as before output_format
+        // existed at all. columnar_rows() walks `reader` (the columnar-shaped payload) directly,
+        // one row at a time - it does not build the row-major document expand_columnar() used
+        // to (a Writer pass, then a fresh Deserializer parsing exactly what was just written
+        // straight back in). That write-then-read round trip was itself the single largest CPU
+        // cost in this whole request path once the O(n^2) row/column-indexing bugs on both
+        // sides of it were fixed (confirmed via perf) - bigger than matching_engine::search(),
+        // populate_event(), and everything else in this function combined. See
+        // zerialize/columnar.hpp's columnar_rows() doc comment for how it gets the same values
+        // without materializing.
         switch (format) {
-            case binary_format::msgpack:
-                return match_columnar_batch<zerialize::MsgPack>(
-                    tree, schema, bytes, log, search_time_out, rows_searched_out);
-            case binary_format::cbor:
-                return match_columnar_batch<zerialize::CBOR>(
-                    tree, schema, bytes, log, search_time_out, rows_searched_out);
-            case binary_format::flexbuffers:
-                return match_columnar_batch<zerialize::Flex>(
-                    tree, schema, bytes, log, search_time_out, rows_searched_out);
-            case binary_format::zera:
-                return match_columnar_batch<zerialize::Zera>(
-                    tree, schema, bytes, log, search_time_out, rows_searched_out);
-            case binary_format::ion:
-                return match_columnar_batch<zerialize::Ion>(
-                    tree, schema, bytes, log, search_time_out, rows_searched_out);
-            case binary_format::beve:
-                return match_columnar_batch<zerialize::Beve>(
-                    tree, schema, bytes, log, search_time_out, rows_searched_out);
+            case binary_format::msgpack: {
+                zerialize::MsgPack::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                if (rows_searched_out) *rows_searched_out = rows.size();
+                return match_columnar_batch<zerialize::MsgPack>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            }
+            case binary_format::cbor: {
+                zerialize::CBOR::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                if (rows_searched_out) *rows_searched_out = rows.size();
+                return match_columnar_batch<zerialize::CBOR>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            }
+            case binary_format::flexbuffers: {
+                zerialize::Flex::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                if (rows_searched_out) *rows_searched_out = rows.size();
+                return match_columnar_batch<zerialize::Flex>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            }
+            case binary_format::zera: {
+                zerialize::Zera::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                if (rows_searched_out) *rows_searched_out = rows.size();
+                return match_columnar_batch<zerialize::Zera>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            }
+            case binary_format::ion: {
+                zerialize::Ion::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                if (rows_searched_out) *rows_searched_out = rows.size();
+                return match_columnar_batch<zerialize::Ion>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            }
+            case binary_format::beve: {
+                zerialize::Beve::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                if (rows_searched_out) *rows_searched_out = rows.size();
+                return match_columnar_batch<zerialize::Beve>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            }
             case binary_format::bson:
                 // Rejected at config-validation time (finalize_and_validate_config) -
                 // a bson+columnar connection should never reach this call at all.
                 // See event_bridge.hpp's deserialize_and_match_columnar doc comment
-                // for why (root-level-array round-trip is not safe for BSON).
+                // for why (root-level-array round-trip is not safe for BSON as an INPUT
+                // format - note this does NOT apply to bson as an *output* format, see
+                // dispatch_columnar_output's own bson case above).
                 if (log) {
                     log->error("event_bridge: columnar batching is not supported "
                               "for format=bson");
                 }
+                return std::nullopt;
+            case binary_format::arrow:
+                // Unreachable - handled at the top of this function. The switch must stay
+                // exhaustive regardless.
                 return std::nullopt;
         }
     } catch (const std::exception& e) {

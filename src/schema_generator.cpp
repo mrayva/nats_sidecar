@@ -1,4 +1,5 @@
 #include "schema_generator.hpp"
+#include "arrow_columnar_rows.hpp"
 #include <limits>
 #include <memory>
 #include <zerialize/zerialize.hpp>
@@ -123,6 +124,20 @@ void generate_schema(const std::string& path, binary_format format) {
         }
         case binary_format::beve: {
             zerialize::Beve::Deserializer reader(bytes);
+            print_schema(reader);
+            break;
+        }
+        case binary_format::arrow: {
+            // `path` is a raw Arrow IPC stream (as produced by pg_arrow's rows_to_arrow()),
+            // not a zerialize-encoded document - a whole columnar batch, not a single row.
+            // Reuses the same generic print_schema() everything else does: ArrowColumnarRows
+            // starts positioned at row 0 by default, so this infers types by sniffing that
+            // row's values, same as every other format - not by reading batch->schema()'s own
+            // static types directly, which would also work (and work on an empty batch, where
+            // this can't) but isn't needed for this CLI convenience feature to work correctly
+            // on the common case of a non-empty sample file.
+            std::span<const char> char_bytes(buf.data(), buf.size());
+            ArrowColumnarRows reader(char_bytes);
             print_schema(reader);
             break;
         }

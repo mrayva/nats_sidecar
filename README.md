@@ -6,7 +6,7 @@ Content-based filtering sidecar for NATS. Receives binary-encoded messages on a 
 
 - Boolean expression subscriptions (e.g. `temperature > 30.0 AND location = "warehouse"`)
 - Two selectable matching engines (a-tree, be-tree) sharing the same expression syntax
-- Supports MessagePack, CBOR, FlexBuffers, Zera, Ion, BSON, and BEVE binary formats
+- Supports MessagePack, CBOR, FlexBuffers, Zera, Ion, BSON, and BEVE binary formats, plus read-only Apache Arrow columnar input (see "Arrow columnar input" below)
 - Multi-threaded worker pool for parallel message processing with RCU snapshot-based lock-free reads
 - Soft-state leases via NATS KV with automatic TTL-based cleanup
 - Expression deduplication across clients
@@ -19,6 +19,7 @@ Content-based filtering sidecar for NATS. Receives binary-encoded messages on a 
 - CMake 3.25+
 - Rust toolchain (for building the a-tree FFI library)
 - [vcpkg](https://github.com/microsoft/vcpkg) (for C++ dependencies)
+- `libarrow-dev` (system package, found via pkg-config - not a vcpkg dependency; see "Arrow columnar input" below). On Ubuntu: `sudo apt-get install libarrow-dev`.
 
 ## Building
 
@@ -75,7 +76,8 @@ the legacy single-connection config shape - they're rejected if the config file 
 | `-a, --address HOST` | NATS server address |
 | `-p, --port PORT` | NATS server port |
 | `-i, --input-subject SUBJ` | Input NATS subject (repeatable: `-i a -i b` for multiple inputs) |
-| `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`) |
+| `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`, `arrow`) |
+| `--output-format FMT` | Republish format for columnar batches, if different from `--format` (see "Arrow columnar input") |
 | `--engine ENGINE` | Matching engine (`atree`, `betree`, `pstree`); defaults to `atree` |
 | `--output-prefix PREFIX` | Output subject prefix (defaults to input subject) |
 | `--queue-group GROUP` | Input queue group for load balancing (plain, non-durable mode) |
@@ -128,7 +130,9 @@ nats_port: 4222
 # connections" below for running several independently-configured inputs
 # (mixing durable and best-effort mode) in one process.
 input_subjects: ["sensor.data"]
-format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve
+format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve | arrow
+# output_format: msgpack  # optional; required (and must differ from `format`) when format: arrow
+                           # - see "Arrow columnar input" below. Unset means "same as format".
 engine: atree             # atree | betree | pstree
 
 # Output: matched messages published to <output_prefix>.<subscription_id>,
@@ -251,6 +255,63 @@ Two things worth knowing before enabling it:
 - `publish_max_inflight` now bounds one *batch* in flight, not one *message* - a single credit can
   cover up to (rows matched) x (subscriptions per row) outbound frames instead of just
   (subscriptions per row), so size it accordingly for a columnar connection carrying large batches.
+
+### Arrow columnar input
+
+`format: arrow` consumes [Apache Arrow](https://arrow.apache.org/) IPC stream batches - the exact
+bytes produced by the [`pg_arrow`](https://github.com/mrayva/pg_arrow) Postgres extension's
+`rows_to_arrow(anyarray) -> bytea`, one `RecordBatch` per message. It's a distinct code path from
+the other 7 formats (`src/arrow_columnar_rows.hpp`), not routed through `zerialize`, since Arrow's
+columnar arrays support true random access rather than needing zerialize's own sequential-decode
+machinery.
+
+Arrow input has two hard constraints, both enforced at startup with a clear error:
+
+- **Columnar-only.** Every connection must set `columnar: true` when `format: arrow` - there is no
+  row-mode Arrow reader (a one-row `RecordBatch` is nearly all fixed overhead, the same reason
+  `pg_arrow` itself has no `row_to_arrow`).
+- **Read-only, so `output_format` is required.** Arrow has no practical single-row encoder, so
+  matched rows can't be republished as Arrow - `output_format` must be set to a *different*
+  non-arrow format (e.g. `output_format: msgpack`) telling the sidecar what to re-encode matches
+  as. `output_format: arrow` is rejected.
+
+For every other (non-arrow) `format`, `output_format` - if set at all - must equal `format`;
+cross-format translation among the 6 non-arrow formats is not yet supported (`output_format` exists
+as a general, format-agnostic mechanism for this reason, but only Arrow's asymmetry requires it
+today). Like `format` itself, `output_format` is process-wide, not per-connection.
+
+**Type mapping** (Arrow -> `attribute_type`):
+
+| Arrow type | `attribute_type` | Notes |
+|---|---|---|
+| `int16` / `int32` / `int64` | `integer` | |
+| `float32` / `float64` | `float` | |
+| `boolean` | `boolean` | |
+| `utf8` | `string` | zero-copy view into Arrow's own buffer |
+| `binary` | `string` | raw bytes reinterpreted as a string, **not** base64-tagged (unlike `pg_arrow`'s own `arrow_to_jsonb`) - `attribute_type` has no blob kind |
+| `decimal128(p,s)` | `string` | exact decimal text (`Decimal128Array::FormatValue`), not a lossy double |
+| `date32`, `timestamp` | **unsupported** | rejected at read time (clear error naming the column) - `attribute_type` has no timestamp kind, and silently mapping to `integer` risks a silently-wrong threshold comparison |
+
+No Arrow list/struct/nested type ever appears in `pg_arrow`'s own output (rejected at the SQL
+layer), so `string_list`/`integer_list` attributes are simply unreachable via Arrow input.
+
+Example:
+
+```yaml
+connections:
+  - name: prices
+    mode: core
+    subjects: ["prices.arrow"]
+    columnar: true
+
+format: arrow
+output_format: msgpack
+attributes:
+  - name: symbol
+    type: string
+  - name: price
+    type: float
+```
 
 ### Attribute Types
 
@@ -1455,7 +1516,7 @@ attributes:
     type: string_list
 ```
 
-The format defaults to `msgpack` if `-f` is not specified. Supported formats: `msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`.
+The format defaults to `msgpack` if `-f` is not specified. Supported formats: `msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`, `arrow` (the sample file is then a whole Arrow IPC batch, e.g. from `pg_arrow`'s `rows_to_arrow()`, not a single-row zerialize message - type is read from row 0's own values, same as every other format).
 
 For arrays, the generator peeks at the first element to distinguish `integer_list` from `string_list`. Null or unrecognizable fields default to `string` with a warning on stderr.
 

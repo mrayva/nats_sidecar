@@ -31,7 +31,7 @@ jobs:
       - name: Install build tools
         run: >-
           sudo apt-get update && sudo apt-get install -y
-          g++-${{ matrix.gcc }} ninja-build
+          g++-${{ matrix.gcc }} ninja-build libarrow-dev
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11.6
@@ -102,7 +102,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build
+        run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build libarrow-dev
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11.6

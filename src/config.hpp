@@ -22,7 +22,10 @@ struct attribute_def {
     attribute_type type;
 };
 
-// Supported binary serialization formats
+// Supported binary serialization formats. `arrow` is read-only: valid as a
+// connection's input `format`, never valid as `config::output_format` - see
+// that field's own comment for why (Arrow has no sensible single-row
+// encoder), and finalize_and_validate_config() for the rejection.
 enum class binary_format {
     msgpack,
     cbor,
@@ -30,7 +33,8 @@ enum class binary_format {
     zera,
     ion,
     bson,
-    beve
+    beve,
+    arrow
 };
 
 // Boolean-expression matching engine backing subscription_manager.
@@ -119,6 +123,23 @@ struct config {
     std::string input_stream_storage = "file";
 
     binary_format format = binary_format::msgpack;
+
+    // Republish format for matched rows, decoupled from the input `format`
+    // above. Unset (the default) means "same as `format`" - zero behavior
+    // change for every config that doesn't set this. Process-wide, not
+    // per-connection, matching `format` itself.
+    //
+    // v1 scope: only meaningful (and required) when format == binary_format
+    // ::arrow, since Arrow has no sensible single-row encoder (a one-row
+    // RecordBatch is almost all fixed overhead - the same reason pg_arrow's
+    // own rows_to_arrow() has no single-row counterpart). For every other
+    // format, if set at all it must equal `format` - full cross-format
+    // translation among the non-arrow formats is deliberately not built yet
+    // (see finalize_and_validate_config()). Only meaningful for columnar
+    // connections - row mode has no re-encode step to decouple (see
+    // event_bridge.cpp's row-mode dispatch, which rejects binary_format::
+    // arrow outright).
+    std::optional<binary_format> output_format;
 
     // Output - matched messages published to <output_prefix>.<BE-ID>,
     // shared by every input connection (a client's boolean expression

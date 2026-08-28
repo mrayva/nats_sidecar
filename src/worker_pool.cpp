@@ -37,7 +37,7 @@ worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
                          subscription_manager& sub_mgr,
                          nats_asio::iconnection_sptr conn,
                          std::shared_ptr<spdlog::logger> log)
-    : m_ioc(ioc), m_format(cfg.format), m_schema(schema),
+    : m_ioc(ioc), m_format(cfg.format), m_output_format(cfg.output_format), m_schema(schema),
       m_sub_mgr(sub_mgr), m_conn(std::move(conn)), m_log(std::move(log)),
       m_thread_count(cfg.worker_threads > 0 ? cfg.worker_threads
                                             : std::thread::hardware_concurrency()),
@@ -221,7 +221,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         if (qm.columnar) {
             row_matches = deserialize_and_match_columnar(
                 *snap->tree, m_schema, m_format, payload_span, m_log,
-                &search_time, &rows_searched);
+                &search_time, &rows_searched, m_output_format);
         } else {
             auto matches = deserialize_and_match(
                 *snap->tree, m_schema, m_format, payload_span, m_log, &search_time);

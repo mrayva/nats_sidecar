@@ -139,6 +139,12 @@ private:
 
     asio::io_context& m_ioc;
     binary_format m_format;
+    // Set once at construction from cfg.output_format (see that field's own comment) - unset
+    // means "same as m_format", passed straight through to deserialize_and_match_columnar's own
+    // identically-defaulted parameter. Row-mode ignores this entirely (see enqueue()/worker_loop
+    // below - only the columnar branch reads it), since row-mode has no re-encode step to
+    // decouple.
+    std::optional<binary_format> m_output_format;
     const attribute_schema& m_schema;
     subscription_manager& m_sub_mgr;
     nats_asio::iconnection_sptr m_conn;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "arrow_columnar_rows.hpp"
 #include "config.hpp"
 #include "matching_engine.hpp"
 #include <chrono>
@@ -213,7 +214,9 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
 // One row of a columnar batch that matched at least one subscription.
 struct row_match {
     std::vector<uint64_t> matched_ids;
-    std::vector<char> payload;   // this row's own standalone bytes, same format as the input batch
+    std::vector<char> payload;   // this row's own standalone bytes, in the connection's output_format
+                                  // (config::output_format if set, else the same format as the input
+                                  // batch - see deserialize_and_match_columnar's own comment)
 };
 
 // Writes `row` (one row of a zerialize::columnar_rows() view - a
@@ -256,6 +259,15 @@ std::vector<char> serialize_row(const Reader& row) {
 // deliberate scope decision someone still needs to make (new test coverage,
 // a config-validation change, a README update) - not a side effect of this
 // perf change, so the exclusion stays as-is for now.
+// `output_format` selects the republish encoding for matched rows, decoupled from `format`
+// (the input encoding) - see config::output_format's own comment. `nullopt` (the default) means
+// "same as `format`" - today's behavior, zero change for every caller that doesn't care about
+// the distinction. Only `format == binary_format::arrow` may pass a genuinely different,
+// explicit `output_format` - finalize_and_validate_config() (cli.cpp) enforces this at startup,
+// but this function does not re-validate it, so a caller bypassing that (e.g. a future direct
+// programmatic use) that passes a mismatched pair for a non-arrow `format` gets
+// undefined-but-safe behavior: the explicit `output_format` wins, silently diverging from
+// `format`, not a crash - validate before calling if that matters.
 std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     const matching_engine& tree,
     const attribute_schema& schema,
@@ -263,6 +275,7 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     std::span<const char> payload,
     const std::shared_ptr<spdlog::logger>& log,
     std::optional<std::chrono::nanoseconds>* search_time_out = nullptr,
-    std::size_t* rows_searched_out = nullptr);
+    std::size_t* rows_searched_out = nullptr,
+    std::optional<binary_format> output_format = std::nullopt);
 
 } // namespace sidecar

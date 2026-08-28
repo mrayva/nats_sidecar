@@ -12,6 +12,7 @@ std::optional<binary_format> parse_format(const std::string& s) {
     if (s == "ion")         return binary_format::ion;
     if (s == "bson")        return binary_format::bson;
     if (s == "beve")        return binary_format::beve;
+    if (s == "arrow")       return binary_format::arrow;
     return std::nullopt;
 }
 
@@ -165,6 +166,12 @@ config load_config(const std::string& path) {
         auto fmt = parse_format(n.as<std::string>());
         if (!fmt) throw std::runtime_error("config: invalid 'format': " + n.as<std::string>());
         cfg.format = *fmt;
+    }
+
+    if (auto n = root["output_format"]) {
+        auto fmt = parse_format(n.as<std::string>());
+        if (!fmt) throw std::runtime_error("config: invalid 'output_format': " + n.as<std::string>());
+        cfg.output_format = *fmt;
     }
 
     if (auto n = root["input_queue_group"]) cfg.input_queue_group = n.as<std::string>();

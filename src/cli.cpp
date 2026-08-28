@@ -17,7 +17,11 @@ cxxopts::Options build_cli_options() {
         ("i,input-subject", "Input NATS subject (repeatable for multiple inputs; "
                              "replaces any config-file input_subjects entirely if given)",
                              cxxopts::value<std::vector<std::string>>())
-        ("f,format", "Binary format (msgpack|cbor|flexbuffers|zera|ion|bson|beve)", cxxopts::value<std::string>())
+        ("f,format", "Binary format (msgpack|cbor|flexbuffers|zera|ion|bson|beve|arrow)", cxxopts::value<std::string>())
+        ("output-format", "Republish format for matched rows, decoupled from --format "
+                           "(msgpack|cbor|flexbuffers|zera|ion|bson|beve) - required when "
+                           "--format=arrow (arrow is read-only), must equal --format otherwise",
+                           cxxopts::value<std::string>())
         ("engine", "Matching engine (atree|betree|pstree)", cxxopts::value<std::string>())
         ("output-prefix", "Output subject prefix", cxxopts::value<std::string>())
         ("queue-group", "Input queue group for load balancing", cxxopts::value<std::string>())
@@ -127,6 +131,14 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
         cfg.format = *fmt_opt;
     }
 
+    if (result.count("output-format")) {
+        auto fmt_opt = parse_format(result["output-format"].as<std::string>());
+        if (!fmt_opt) {
+            return fmt::format("Invalid output-format: {}", result["output-format"].as<std::string>());
+        }
+        cfg.output_format = *fmt_opt;
+    }
+
     if (result.count("engine")) {
         auto eng_opt = parse_engine_type(result["engine"].as<std::string>());
         if (!eng_opt) {
@@ -154,6 +166,27 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
 
     return std::nullopt;
 }
+
+namespace {
+
+// For error messages only - parse_format() is the authoritative string<->enum
+// mapping used everywhere else; this just needs to name a value back to the
+// user, not round-trip.
+const char* binary_format_name(binary_format f) {
+    switch (f) {
+        case binary_format::msgpack:     return "msgpack";
+        case binary_format::cbor:        return "cbor";
+        case binary_format::flexbuffers: return "flexbuffers";
+        case binary_format::zera:        return "zera";
+        case binary_format::ion:         return "ion";
+        case binary_format::bson:        return "bson";
+        case binary_format::beve:        return "beve";
+        case binary_format::arrow:       return "arrow";
+    }
+    return "?";
+}
+
+} // namespace
 
 std::optional<std::string> finalize_and_validate_config(config& cfg) {
     auto conns = cfg.effective_connections();
@@ -235,6 +268,39 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
             return fmt::format(
                 "connection '{}': columnar batching is not supported with format=bson", c.name);
         }
+    }
+
+    // Arrow is read-only and columnar-only (see binary_format::arrow's and
+    // config::output_format's own comments): it has no row-mode reader at
+    // all (event_bridge.cpp rejects it outright there) and no single-row
+    // encoder (a one-row RecordBatch is almost all fixed overhead, the same
+    // reason pg_arrow's own rows_to_arrow() has no per-row counterpart) -
+    // every connection must be columnar, and output_format must be set to a
+    // different, non-arrow format. Checked as "any non-columnar connection"
+    // rather than "no columnar connection", the inverse of the bson check
+    // above, since format is process-wide but columnar is per-connection.
+    if (cfg.format == binary_format::arrow) {
+        for (const auto& c : conns) {
+            if (!c.columnar) {
+                return fmt::format(
+                    "connection '{}': format=arrow requires every connection to set "
+                    "columnar: true (Arrow has no row-mode reader)", c.name);
+            }
+        }
+        if (!cfg.output_format) {
+            return "output_format is required when format=arrow (Arrow has no single-row "
+                   "encoder - pick a republish format, e.g. output_format: msgpack)";
+        }
+        if (*cfg.output_format == binary_format::arrow) {
+            return "output_format cannot be arrow (Arrow is read-only - has no encoder)";
+        }
+    } else if (cfg.output_format && *cfg.output_format != cfg.format) {
+        // v1 scope: cross-format translation among the non-arrow formats
+        // isn't built yet - see config::output_format's own comment.
+        return fmt::format(
+            "output_format ({}) must equal format ({}) unless format=arrow "
+            "(cross-format translation among non-arrow formats is not yet supported)",
+            binary_format_name(*cfg.output_format), binary_format_name(cfg.format));
     }
 
     // Cross-connection uniqueness: a collision in any of these would either

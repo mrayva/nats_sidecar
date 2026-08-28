@@ -307,6 +307,104 @@ TEST(cli, finalize_and_validate_config_accepts_columnar_with_non_bson_format) {
     EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
 }
 
+TEST(cli, finalize_and_validate_config_rejects_arrow_with_non_columnar_connection) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"a.in"};
+    a.columnar = false;
+    cfg.connections = {a};
+    cfg.format = sidecar::binary_format::arrow;
+    cfg.output_format = sidecar::binary_format::msgpack;
+    cfg.attributes = {{"value", sidecar::attribute_type::integer}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("columnar"), std::string::npos);
+    EXPECT_NE(err->find("arrow"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_rejects_arrow_without_output_format) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"a.in"};
+    a.columnar = true;
+    cfg.connections = {a};
+    cfg.format = sidecar::binary_format::arrow;
+    cfg.attributes = {{"value", sidecar::attribute_type::integer}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("output_format"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_rejects_arrow_output_format) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"a.in"};
+    a.columnar = true;
+    cfg.connections = {a};
+    cfg.format = sidecar::binary_format::arrow;
+    cfg.output_format = sidecar::binary_format::arrow;
+    cfg.attributes = {{"value", sidecar::attribute_type::integer}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("output_format"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_accepts_arrow_with_columnar_and_output_format) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"a.in"};
+    a.columnar = true;
+    cfg.connections = {a};
+    cfg.format = sidecar::binary_format::arrow;
+    cfg.output_format = sidecar::binary_format::msgpack;
+    cfg.attributes = {{"value", sidecar::attribute_type::integer}};
+
+    EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
+}
+
+TEST(cli, finalize_and_validate_config_rejects_mismatched_output_format_for_non_arrow) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"a.in"};
+    a.columnar = true;
+    cfg.connections = {a};
+    cfg.format = sidecar::binary_format::msgpack;
+    cfg.output_format = sidecar::binary_format::cbor;
+    cfg.attributes = {{"value", sidecar::attribute_type::integer}};
+
+    auto err = sidecar::finalize_and_validate_config(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("output_format"), std::string::npos);
+}
+
+TEST(cli, finalize_and_validate_config_accepts_matching_output_format_for_non_arrow) {
+    sidecar::config cfg;
+    sidecar::input_connection a;
+    a.name = "a";
+    a.mode = "core";
+    a.subjects = {"a.in"};
+    a.columnar = true;
+    cfg.connections = {a};
+    cfg.format = sidecar::binary_format::msgpack;
+    cfg.output_format = sidecar::binary_format::msgpack;
+    cfg.attributes = {{"value", sidecar::attribute_type::integer}};
+
+    EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
+}
+
 TEST(cli, effective_worker_count_uses_configured_value_when_nonzero) {
     sidecar::config cfg;
     cfg.worker_threads = 7;

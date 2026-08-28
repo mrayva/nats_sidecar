@@ -69,6 +69,31 @@ find_package(libzip CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
+# Apache Arrow (arrow_columnar_rows.hpp) - deliberately NOT added to vcpkg.json/resolved via
+# vcpkg like every dependency above. vcpkg's own arrow port is one of its heaviest/most fragile
+# (large transitive dependency graph, slow to build, historical breakage) - a real cost on every
+# clean CI run and first-time contributor setup for a single new input format. Provisioned as a
+# system package instead (apt-get install libarrow-dev in CI - see .github/workflows/*.yml),
+# exactly how pg_arrow (the Postgres extension producing this project's Arrow input) already
+# gets Arrow on every box this project builds on.
+#
+# Found via pkg-config, NOT find_package(Arrow CONFIG) - deliberately, not for lack of trying.
+# Arrow's CMake CONFIG package re-resolves its own full transitive dependency graph (re2,
+# utf8proc, and more depending on which optional Arrow components the system package was built
+# with) via find_package() calls of its own - and since this project sets
+# CMAKE_TOOLCHAIN_FILE=vcpkg.cmake, vcpkg's toolchain intercepts EVERY find_package() call
+# project-wide, not just the ones for packages actually listed in vcpkg.json, and tries to
+# resolve Arrow's own dependencies as vcpkg ports too. Some of those happen to succeed by
+# coincidence (re2), others fail outright (utf8proc - Arrow's own Findutf8proc.cmake module
+# looks for a target named the way vcpkg's own port names it, which no plain system
+# libutf8proc-dev package provides). Rather than patching one transitive dependency at a time
+# with no guarantee more won't surface, pkg-config sidesteps the whole problem: `arrow.pc` is
+# just a flat list of compiler/linker flags, no CMake target graph to re-resolve - exactly how
+# pg_arrow.cpp's own Makefile already links against this same library on this same box
+# (`pkg-config --cflags/--libs arrow`), confirmed working here too before adopting it.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(Arrow REQUIRED IMPORTED_TARGET arrow)
+
 # Warnings for first-party targets only (sidecar_lib/nats_sidecar/sidecar_test).
 # FetchContent'd deps are marked SYSTEM above/below so their headers don't
 # trigger these when pulled into our translation units.
@@ -165,8 +190,18 @@ target_link_libraries(sidecar_lib
         cxxopts::cxxopts
         nlohmann_json::nlohmann_json
         Threads::Threads
+        PkgConfig::Arrow
         sidecar_sanitizers
 )
+
+# libarrow.so's own transitive dependency on the system libprotobuf.so.32 has an undefined
+# __cxa_call_terminate@CXXABI_1.3.15 reference that genuinely resolves fine at runtime
+# (confirmed via ldd - libprotobuf.so.32 finds libstdc++.so.6 with no missing symbols) but trips
+# the static linker's default (Ubuntu-hardening-flag-driven) strict verification of every
+# transitively-needed .so's own symbols, not just the ones this project links directly. The
+# standard fix for exactly this class of false positive: tell the linker to trust the dynamic
+# loader for shared libraries it wasn't asked to fully resolve.
+target_link_options(sidecar_lib PUBLIC -Wl,--allow-shlib-undefined)
 
 target_compile_definitions(sidecar_lib PUBLIC FLATBUFFERS_LOCALE_INDEPENDENT=0)
 target_compile_options(sidecar_lib PRIVATE ${SIDECAR_WARNING_FLAGS})
@@ -186,6 +221,7 @@ if(SIDECAR_BUILD_TESTS)
     find_package(GTest CONFIG REQUIRED)
 
     add_executable(sidecar_test
+        tests/test_arrow_columnar.cpp
         tests/test_cli.cpp
         tests/test_config_loading.cpp
         tests/test_dialect.cpp
