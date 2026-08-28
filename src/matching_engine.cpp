@@ -9,8 +9,8 @@
 #include <tree.h>
 #include <pstree/pst_dynamic.hpp>
 
-#include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace sidecar {
 
@@ -565,10 +565,23 @@ public:
         std::vector<uint64_t> result;
         try {
             auto clauseMatches = m_pstd.matchEvent(sink.native());
+            // Dedup via a hash set, not std::find over `result` - a linear scan here is
+            // O(matches) per match, i.e. O(matches^2) per event overall. At scale (many
+            // independent wide-range predicates matching a large fraction of subscriptions per
+            // event - see nats_sidecar's own matching-engine benchmark/README), matches per
+            // event can reach into the thousands, and the quadratic scan dominated total search
+            // time: confirmed via `perf record`/`perf annotate` on matching_engine_bench at
+            // K=20,000 - 66.8% of ALL search-phase self-time was in this function's own compare-
+            // and-branch loop, not in PSTDynamic::matchEvent (7.1%) or anywhere else in pstree.
+            // m_seen_scratch is a member (not a local) reused across calls, cleared here, to
+            // avoid a fresh heap allocation on every event - the same reuse pattern already used
+            // elsewhere in this codebase for other per-row hot paths.
+            m_seen_scratch.clear();
+            result.reserve(clauseMatches.size());
             for (auto clauseId : clauseMatches) {
                 auto it = m_clause_to_sub.find(clauseId);
                 uint64_t subId = (it != m_clause_to_sub.end()) ? it->second : clauseId;
-                if (std::find(result.begin(), result.end(), subId) == result.end()) {
+                if (m_seen_scratch.insert(subId).second) {
                     result.push_back(subId);
                 }
             }
@@ -595,6 +608,10 @@ private:
     pstree::PSTDynamic m_pstd;
     std::unordered_map<uint64_t, uint64_t> m_clause_to_sub;
     uint64_t m_next_clause_id = 1;
+    // Scratch set for search()'s dedup pass - see its own comment. `mutable` because search()
+    // is const (the same const-but-reuses-scratch-state pattern as pstree_event_sink's own
+    // reuses_events()==true contract).
+    mutable std::unordered_set<uint64_t> m_seen_scratch;
 };
 
 } // namespace
