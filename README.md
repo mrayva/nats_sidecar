@@ -1540,7 +1540,7 @@ not kept in the repo) found zero further disagreements after the fix, and this f
 exercise a handful of subscriptions at a time - never had a chance to catch it. This is exactly the
 kind of bug that scale-dependent testing (not hand-picked small examples) exists to find.
 
-**Results, after the fix** (RelWithDebInfo, one host, 20,000 events per K):
+**Results, before any fix** (RelWithDebInfo, one host, 20,000 events per K):
 
 | K | engine | insert | insert rate | search | search rate | total matches |
 |---:|---|---:|---:|---:|---:|---:|
@@ -1557,42 +1557,96 @@ kind of bug that scale-dependent testing (not hand-picked small examples) exists
 Match counts agree exactly across all three engines at every K - the correctness bar this
 comparison needs to mean anything.
 
-**pstree does not win here - and degrades far faster than either a-tree or be-tree as K grows.**
-At K=1,000 it's already the slowest to insert (5-14x a-tree/be-tree) but competitive on search
-(within 1.4x of a-tree). By K=10,000, pstree's insert rate has fallen 17x further behind a-tree
-(vs. 3.3x at K=1,000) and its search rate has fallen from 1.4x slower than a-tree to 6.9x slower -
+**pstree did not win here, and degraded far faster than either a-tree or be-tree as K grew.** At
+K=1,000 it was already the slowest to insert (5-14x a-tree/be-tree) but competitive on search
+(within 1.4x of a-tree). By K=10,000, pstree's insert rate had fallen 17x further behind a-tree
+(vs. 3.3x at K=1,000) and its search rate had fallen from 1.4x slower than a-tree to 6.9x slower -
 a real, disproportionate blowup, not a fixed constant-factor gap.
 
-**Root cause is architectural, not a bug, and traces directly to this benchmark's own workload
-shape.** `PSTDynamic::insertSubscription()` (`pst_dynamic.hpp`) attaches a subscription to *every
-leaf* its access predicate's range covers - correct and necessary, since `MatchEvent`'s O(1)
-per-event lookup (`matchPair`) only works if every leaf already knows every predicate covering it,
-with no further search at match time. For an equality predicate this is one leaf; for `trade_price
-> X` (30% of this benchmark's generated subscriptions have this as their *only* predicate, so it's
-forced to be the access predicate) it's every leaf from X to the domain maximum - roughly half the
-leaves in that dimension's tree, on average, given X is uniform over the domain. As more
-`trade_price > X` subscriptions insert (each with an independent random threshold), the price
-dimension's tree partitions ever more finely, so each new wide-range insertion touches
-proportionally more, smaller leaves - and every event landing in a leaf shared by many such
-subscriptions pays a linear scan over all of them at match time (`MatchEvent`'s per-group loop).
-This is quadratic-leaning insertion cost and matching cost that degrades with subscription-set
-density, not a fixed per-operation cost - exactly what the numbers above show, and exactly the
-scenario Section 2.3's own selectivity ranking (`{=} > {∈} > {in} > {<,≤,>,≥} > ...`) is implicitly
-warning about: PS-Tree's design assumes an access predicate is *usually* narrow (an equality, or a
-bounded range), and degrades hard when a subscription's *only* available predicate is a wide,
-unbounded comparison - a very common real subscription shape ("alert me when price exceeds $X")
-that this benchmark deliberately includes 30% of, and that the paper's own selectivity heuristic
-has no way to avoid when it's the only predicate offered.
+**Root cause was architectural, not a bug.** `PSTDynamic::insertSubscription()` attached a
+subscription to *every leaf* its access predicate's range covered - correct and necessary under the
+paper's own design, since `MatchEvent`'s O(1) per-event lookup only works if every leaf already
+knows every predicate covering it, with no further search at match time. For an equality predicate
+this is one leaf; for `trade_price > X` (30% of this benchmark's generated subscriptions have this
+as their *only* predicate, so it's forced to be the access predicate) it was every leaf from X to
+the domain maximum - roughly half the leaves in that dimension's tree, on average. As more
+`trade_price > X` subscriptions inserted, the tree partitioned ever more finely, so each new
+wide-range insertion touched proportionally more, smaller leaves - quadratic-leaning insertion cost
+that grows with subscription-set density, exactly what Section 2.3's own selectivity ranking
+(`{=} > {∈} > {in} > {<,≤,>,≥} > ...`) implicitly warns about: PS-Tree's design assumes an access
+predicate is *usually* narrow, and has no defense when a subscription's only available predicate is
+a wide, unbounded comparison - a very common real subscription shape ("alert me when price exceeds
+$X").
 
-**Conclusion**: on this workload, PSTDynamic does not reproduce the paper's own self-reported
-advantage over BE-Tree/A-Tree - it's slower on both index construction and matching time, by a
-growing margin as the subscription count increases. This doesn't invalidate the paper's own
-results (which likely used workloads with narrower/bounded access predicates, or evaluated at
-scales where this benchmark's specific bottleneck - many independent wide-range predicates sharing
-one dimension - wasn't dominant), but it does mean **this project's own real subscription shapes
-(threshold alerts being a common one) are not a good match for PS-Tree/PSTDynamic as implemented
-here** - `engine: pstree` remains available (see the "Expression Syntax" section for its supported
-operators and limitations) but isn't recommended over `atree`/`betree` for this kind of workload.
+**Fixed** (`mrayva/pstree@54a66dc` - see that repo's own README for the full design): the
+leaf-materialization approach for range operators was replaced with canonical ancestor markers (the
+classical "canonical decomposition" technique for stabbing queries, generalized to the value
+encoding's existing digit-trie), attaching a range predicate to O(depth) ancestor nodes - a small,
+per-attribute-type constant (16 for int64/double) independent of K - instead of O(leaves-covered).
+
+**Results, after the fix**, extended to K=50,000 to confirm the fix holds well past the original
+scale:
+
+| K | engine | insert | insert rate | search | search rate | total matches |
+|---:|---|---:|---:|---:|---:|---:|
+| 1,000  | atree  | 1.10 ms     | 906,468 subs/s  | 225.31 ms    | 88,768 events/s  | 5,286,377   |
+| 1,000  | betree | 3.15 ms     | 317,525 subs/s  | 400.74 ms    | 49,907 events/s  | 5,286,377   |
+| 1,000  | pstree | 4.20 ms     | 238,284 subs/s  | 334.73 ms    | 59,750 events/s  | 5,286,377   |
+| 5,000  | atree  | 9.00 ms     | 555,424 subs/s  | 1,320.73 ms  | 15,143 events/s  | 27,180,339  |
+| 5,000  | betree | 46.03 ms    | 108,635 subs/s  | 2,532.58 ms  | 7,897 events/s   | 27,180,339  |
+| 5,000  | pstree | 24.45 ms    | 204,484 subs/s  | 6,206.57 ms  | 3,222 events/s   | 27,180,339  |
+| 10,000 | atree  | 32.30 ms    | 309,571 subs/s  | 2,837.66 ms  | 7,048 events/s   | 54,413,004  |
+| 10,000 | betree | 220.03 ms   | 45,448 subs/s   | 5,704.79 ms  | 3,506 events/s   | 54,413,004  |
+| 10,000 | pstree | 46.62 ms    | 214,481 subs/s  | 19,548.38 ms | 1,023 events/s   | 54,413,004  |
+| 50,000 | atree  | 760.74 ms   | 65,725 subs/s   | 14,903.86 ms | 1,342 events/s   | 271,572,457 |
+| 50,000 | betree | 7,895.31 ms | 6,333 subs/s    | 59,806.84 ms | 334 events/s     | 271,572,457 |
+| 50,000 | pstree | 253.78 ms   | 197,019 subs/s  | 371,186.76 ms| 54 events/s      | 271,572,457 |
+
+Match counts still agree exactly across all three engines at every K, confirming the redesign
+preserved correctness while changing the complexity.
+
+**Insert is completely fixed - a clean, unambiguous win.** pstree's insert rate is now flat across
+the entire K=1,000-50,000 range (roughly 200-240k subs/s, no downward trend at all) instead of
+falling from 69k to 4k subs/s as K grew - exactly the O(depth), K-independent behavior the redesign
+targeted. At K=10,000, insert improved **52x** (4,108 -> 214,481 subs/s); at K=50,000 pstree is now
+the **fastest** of the three engines to insert (197k subs/s vs. atree's 66k and betree's 6.3k -
+betree's own insert cost scales badly with K here too, for unrelated reasons not investigated as
+part of this work).
+
+**Search did not improve, and at K=50,000 it degrades faster than either competitor - a real,
+distinct finding, not a leftover piece of the same bug.** Search throughput is statistically
+unchanged from before the fix at K<=10,000 (e.g. 1,023 vs. 1,018 events/s at K=10,000) - expected,
+since the *old* design's `MatchPair` was already an O(1) leaf lookup; the old 15%-of-a-tree search
+figure was never caused by the same insert-side leaf-materialization bug, it reflects (a) genuine
+output-sensitivity (this adversarial workload's events legitimately match a large, K-proportional
+fraction of all subscriptions, so *any* correct engine's search time grows with K) and (b) pstree's
+own per-candidate `matchSubscription()` evaluator being intrinsically slower than a-tree/be-tree's
+more mature, hand-optimized evaluators - neither of which this fix touches. What's new at K=50,000:
+pstree's search time grew **19x** for a 5x increase in K (vs. atree's proportional ~5.2x and
+be-tree's ~10.5x) - worse than linear, and worse than either competitor. The likely mechanism (by
+code inspection, not yet confirmed via profiling): `PSTDynamic`'s dimension-signature Bloom-filter
+grouping (`LeafGroupState`, `pst_dynamic.hpp`) grows/shrinks its filter width based on *each
+bucket's own* subscriber count - and the canonical-decomposition fix, by design, spreads a
+`trade_price > X`-heavy workload's subscribers across up to `depth` separate buckets instead of one
+shared leaf. Each bucket ends up with a smaller local subscriber count than the old design's single
+leaf would have had, so each independently reaches a *smaller* Bloom-filter width, giving worse
+per-bucket false-positive precision - and since a single query can now touch several such
+under-sized buckets instead of one well-sized one, the wasted-evaluation cost compounds. This is a
+real tension between the insert-side fix (which requires fragmenting coverage across buckets) and a
+grouping mechanism designed around "all of a leaf's subscribers live in one place" - tracked as
+follow-up work in `mrayva/pstree`'s own README, not fixed here.
+
+**Conclusion**: the specific, measured "wide-range-predicate scaling issue" this investigation set
+out to fix - `PSTDynamic::insertSubscription()`'s O(leaf-count) insertion cost - is fixed, cleanly
+and completely verified across a 50x range of K. PSTDynamic is now genuinely fast to build for
+exactly the workload shape (many independent threshold-alert subscriptions) that used to be its
+worst case. It is **not**, however, fast to *search* at scale on this same workload - a real,
+different, and only partially understood cost that the fix did not address and that grows worse
+than either competitor's own search cost as K increases. `engine: pstree` is a strong choice when
+subscription *churn* (frequent insert/delete) dominates and the total live subscription count on any
+one dimension stays modest; it is not recommended over `atree`/`betree` when a single event is
+expected to match a large fraction of many thousands of live subscriptions, until the search-side
+fragmentation cost above gets its own follow-up fix.
 
 ## License
 
