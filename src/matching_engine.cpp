@@ -23,7 +23,21 @@ constexpr int64_t kBetreeIntMin = -1'000'000'000LL;
 constexpr int64_t kBetreeIntMax = 1'000'000'000LL;
 constexpr double kBetreeFloatMin = -1e9;
 constexpr double kBetreeFloatMax = 1e9;
-constexpr std::size_t kBetreeStringCount = 1024;
+// kBetreeStringCount is a HARD cap, not a hint, despite betree_cpp.hpp's own add_string() doc
+// comment calling it "Estimated number of unique string values (for optimization)": confirmed by
+// reading be-tree's own get_id_for_string() (config.cpp) directly - it returns INVALID_STR (which
+// then surfaces as "invalid expression" at insert()) the moment a (name, attribute) pair would be
+// the (count+1)th DISTINCT string value ever seen for that attribute, across every subscription
+// this Tree instance has ever parsed - "invalid expression" here does not mean the expression
+// itself is malformed, only that this schema's string domain is full. Found via a real failure:
+// the K=32000 exchange/symbol set-membership benchmark (symbols drawn from an 11,951-value real
+// pool, up to 128 per subscription) hit this almost immediately with the old 1024 bound - only 25/
+// 32000 subscribes succeeded. Bumping this costs nothing at runtime: get_id_for_string's own
+// backing store (string_map, config.cpp's add_to_string_map) is a plain dynamically-growing
+// hashmap, not an array preallocated to `count` slots - `count` is purely a logical ceiling, never
+// a memory reservation. 65536 comfortably covers this project's real NYSE symbol universe (a
+// single table's own distinct-symbol pool is in the thousands) with headroom, at zero extra cost.
+constexpr std::size_t kBetreeStringCount = 65536;
 
 // PS-Tree's own string encoding (order_key.hpp's StringCodec) is a FIXED-depth tree - one
 // inner-node level per character position, sized by this constant - not a variable-length
