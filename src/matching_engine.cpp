@@ -490,6 +490,24 @@ public:
         : m_parsing_tree(build_betree(attributes, m_unused_indices)),
           m_pstd(build_pstree_schema(attributes)) {}
 
+    // Frees every `betree_sub*` insert() ever parsed against m_parsing_tree - see insert()'s
+    // own comment for why this can't happen any earlier (a real, confirmed use-after-free found
+    // via a live gdb backtrace under real subscribe load: be-tree's own config->pred_map
+    // (hashmap.cpp's assign_pred/jsw_rbfind) stores RAW pointers into a sub's own AST predicate
+    // nodes for cross-sub deduplication, and persists for m_parsing_tree's WHOLE lifetime, not
+    // just one betree_make_sub() call - freeing a sub right after parsing it (the original code
+    // here) leaves pred_map's own rbtree holding dangling pointers that a LATER insert() call's
+    // own predicate comparison (bool_expr_cmp, called from jsw_rbfind) can dereference. Confirmed
+    // safe to defer: jsw_rbdelete() (jsw_rbtree.cpp) only frees the rbtree's own node wrappers,
+    // never the void* data they store, so pred_map's own destruction (inside m_parsing_tree's
+    // destructor, which runs AFTER this one - C++ destroys the body first, then members in
+    // reverse declaration order) never touches this memory - no double-free.
+    ~pstree_matching_engine() override {
+        for (struct betree_sub* sub : m_parsed_subs) {
+            free_sub(sub);
+        }
+    }
+
     // Reserved top bit of the PSTDynamic-subscription-id space: SET means "this is a
     // synthetic clause id, look it up in m_clause_to_sub"; CLEAR means "this literal value
     // IS the caller's own subscription id" (see insert()'s own comment for when each path is
@@ -520,6 +538,12 @@ public:
     // against m_parsing_tree - a throwaway instance built purely to parse/type-check, never
     // searched) rather than writing a second parser for the same grammar - see
     // pstree_dialect.hpp's own doc comment for the full reasoning.
+    //
+    // `sub` is deliberately NOT freed here (on either the success or the dnf-extraction-failure
+    // path) - see this class's own destructor for why an immediate free_sub() is a real,
+    // confirmed use-after-free (be-tree's own config->pred_map retains raw pointers into a
+    // sub's predicate AST nodes for cross-sub deduplication, for m_parsing_tree's whole
+    // lifetime, not just this one call) and why deferring to the destructor is safe.
     void insert(uint64_t id, const std::string& expression) override {
         std::string translated;
         try {
@@ -533,14 +557,8 @@ public:
         if (sub == nullptr) {
             throw matching_engine_error("pstree: invalid expression: " + expression);
         }
-        std::vector<pstree_clause> dnf;
-        try {
-            dnf = ast_to_pstree_dnf(sub->expr);
-        } catch (...) {
-            free_sub(sub);
-            throw;
-        }
-        free_sub(sub);
+        m_parsed_subs.push_back(sub);
+        std::vector<pstree_clause> dnf = ast_to_pstree_dnf(sub->expr);
 
         bool useDirectId = (dnf.size() == 1) && ((id & kSyntheticIdBit) == 0);
 
@@ -637,6 +655,10 @@ private:
     // must already be constructed (an empty vector, ready to receive .set() calls) by then.
     small_attr_map<std::size_t> m_unused_indices;
     be::Tree m_parsing_tree;
+    // Every betree_sub* insert() has ever parsed against m_parsing_tree, freed only in this
+    // class's own destructor - see both the destructor's and insert()'s own comments for why
+    // freeing any earlier is a real, confirmed use-after-free.
+    std::vector<struct betree_sub*> m_parsed_subs;
     pstree::PSTDynamic m_pstd;
     std::unordered_map<uint64_t, uint64_t> m_clause_to_sub;
     uint64_t m_next_clause_id = 1;
