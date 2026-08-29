@@ -28,6 +28,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Add Apache Arrow apt repository
+        # libarrow-dev isn't in Ubuntu's own apt repos - confirmed directly (a bare
+        # `apt-get install libarrow-dev` here failed with "Unable to locate package" on a real
+        # CI run, ubuntu-24.04/noble) - Arrow's own apt-source bootstrap package is required
+        # first. Codename hardcoded to "noble" to match runs-on: ubuntu-24.04 above, not
+        # detected via lsb_release, since the runner's own OS is already pinned there.
+        run: |
+          curl -fsSL -o /tmp/apache-arrow-apt-source.deb \
+            https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-noble.deb
+          sudo apt-get install -y -V /tmp/apache-arrow-apt-source.deb
+
       - name: Install build tools
         run: >-
           sudo apt-get update && sudo apt-get install -y
@@ -100,6 +111,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Add Apache Arrow apt repository
+        run: |
+          curl -fsSL -o /tmp/apache-arrow-apt-source.deb \
+            https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-noble.deb
+          sudo apt-get install -y -V /tmp/apache-arrow-apt-source.deb
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build libarrow-dev
