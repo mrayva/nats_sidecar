@@ -129,43 +129,43 @@ TEST(event_bridge_matching, matches_across_all_binary_formats) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     uint64_t id = mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto payload = zerialize::dyn::map({{"value", 42}});
 
     auto msgpack_result = match_with<zerialize::MsgPack>(
-        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log());
+        *snap, schema, sidecar::binary_format::msgpack, payload, make_log());
     ASSERT_TRUE(msgpack_result.has_value());
     EXPECT_TRUE(contains(*msgpack_result, id));
 
     auto cbor_result = match_with<zerialize::CBOR>(
-        *snap->tree, schema, sidecar::binary_format::cbor, payload, make_log());
+        *snap, schema, sidecar::binary_format::cbor, payload, make_log());
     ASSERT_TRUE(cbor_result.has_value());
     EXPECT_TRUE(contains(*cbor_result, id));
 
     auto flex_result = match_with<zerialize::Flex>(
-        *snap->tree, schema, sidecar::binary_format::flexbuffers, payload, make_log());
+        *snap, schema, sidecar::binary_format::flexbuffers, payload, make_log());
     ASSERT_TRUE(flex_result.has_value());
     EXPECT_TRUE(contains(*flex_result, id));
 
     auto zera_result = match_with<zerialize::Zera>(
-        *snap->tree, schema, sidecar::binary_format::zera, payload, make_log());
+        *snap, schema, sidecar::binary_format::zera, payload, make_log());
     ASSERT_TRUE(zera_result.has_value());
     EXPECT_TRUE(contains(*zera_result, id));
 
     auto ion_result = match_with<zerialize::Ion>(
-        *snap->tree, schema, sidecar::binary_format::ion, payload, make_log());
+        *snap, schema, sidecar::binary_format::ion, payload, make_log());
     ASSERT_TRUE(ion_result.has_value());
     EXPECT_TRUE(contains(*ion_result, id));
 
     auto bson_result = match_with<zerialize::Bson>(
-        *snap->tree, schema, sidecar::binary_format::bson, payload, make_log());
+        *snap, schema, sidecar::binary_format::bson, payload, make_log());
     ASSERT_TRUE(bson_result.has_value());
     EXPECT_TRUE(contains(*bson_result, id));
 
     auto beve_result = match_with<zerialize::Beve>(
-        *snap->tree, schema, sidecar::binary_format::beve, payload, make_log());
+        *snap, schema, sidecar::binary_format::beve, payload, make_log());
     ASSERT_TRUE(beve_result.has_value());
     EXPECT_TRUE(contains(*beve_result, id));
 }
@@ -175,12 +175,12 @@ TEST(event_bridge_matching, does_not_match_when_expression_false) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto buf = zerialize::serialize<zerialize::MsgPack>(zerialize::dyn::map({{"value", 5}}));
     auto result = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
+        *snap, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->empty());
 }
@@ -190,8 +190,8 @@ TEST(event_bridge_matching, type_mismatch_marks_undefined_and_does_not_match) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     // "value" is declared as an integer but sent as a string - populate_event
     // should mark it undefined rather than throwing, and undefined can't
@@ -199,7 +199,7 @@ TEST(event_bridge_matching, type_mismatch_marks_undefined_and_does_not_match) {
     auto buf = zerialize::serialize<zerialize::MsgPack>(
         zerialize::dyn::map({{"value", std::string("not-a-number")}}));
     auto result = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
+        *snap, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->empty());
 }
@@ -215,8 +215,8 @@ TEST(event_bridge_matching, matches_bool_string_and_list_attributes) {
     // Boolean attributes are tested by bare identifier (truthiness), not
     // `= true` - see a-tree's grammar.lalrpop Expression::"identifier" rule.
     uint64_t id = mgr.subscribe("active and location = \"warehouse\"", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto payload = zerialize::dyn::map({
         {"active", true},
@@ -225,7 +225,7 @@ TEST(event_bridge_matching, matches_bool_string_and_list_attributes) {
     });
     auto buf = zerialize::serialize<zerialize::MsgPack>(payload);
     auto result = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
+        *snap, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(contains(*result, id));
 }
@@ -241,20 +241,20 @@ TEST(event_bridge_matching, matches_end_to_end_with_betree_engine) {
     // dialect translation -> be-tree parse -> deserialize -> match) works
     // end to end, not just the direct matching_engine API.
     uint64_t id = mgr.subscribe("value > 10 and symbol not in (\"GOOG\", \"TSLA\")", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto buf = zerialize::serialize<zerialize::MsgPack>(
         zerialize::dyn::map({{"value", 42}, {"symbol", std::string("AAPL")}}));
     auto result = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
+        *snap, schema, sidecar::binary_format::msgpack, as_char_span(buf), make_log());
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(contains(*result, id));
 
     auto non_matching = zerialize::serialize<zerialize::MsgPack>(
         zerialize::dyn::map({{"value", 42}, {"symbol", std::string("GOOG")}}));
     auto result2 = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::msgpack,
+        *snap, schema, sidecar::binary_format::msgpack,
         as_char_span(non_matching), make_log());
     ASSERT_TRUE(result2.has_value());
     EXPECT_TRUE(result2->empty());
@@ -265,13 +265,13 @@ TEST(event_bridge_matching, search_time_out_populated_when_search_runs) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto buf = zerialize::serialize<zerialize::MsgPack>(zerialize::dyn::map({{"value", 42}}));
     std::optional<std::chrono::nanoseconds> search_time;
     auto result = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::msgpack, as_char_span(buf),
+        *snap, schema, sidecar::binary_format::msgpack, as_char_span(buf),
         make_log(), &search_time);
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(search_time.has_value());
@@ -283,15 +283,15 @@ TEST(event_bridge_matching, search_time_out_left_unset_when_search_never_runs) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     // 0xc1 is reserved/invalid in MessagePack - deserialization fails before
     // matching_engine::search() is ever reached.
     std::vector<char> garbage{static_cast<char>(0xc1)};
     std::optional<std::chrono::nanoseconds> search_time;
     auto result = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::msgpack,
+        *snap, schema, sidecar::binary_format::msgpack,
         std::span<const char>(garbage.data(), garbage.size()), make_log(), &search_time);
     EXPECT_FALSE(result.has_value());
     EXPECT_FALSE(search_time.has_value());
@@ -347,21 +347,21 @@ TEST(event_bridge_columnar, matches_multiple_rows_independently_across_all_suppo
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     uint64_t id = mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     check_columnar_multi_row_match<zerialize::MsgPack>(
-        *snap->tree, schema, sidecar::binary_format::msgpack, id);
+        *snap, schema, sidecar::binary_format::msgpack, id);
     check_columnar_multi_row_match<zerialize::CBOR>(
-        *snap->tree, schema, sidecar::binary_format::cbor, id);
+        *snap, schema, sidecar::binary_format::cbor, id);
     check_columnar_multi_row_match<zerialize::Flex>(
-        *snap->tree, schema, sidecar::binary_format::flexbuffers, id);
+        *snap, schema, sidecar::binary_format::flexbuffers, id);
     check_columnar_multi_row_match<zerialize::Zera>(
-        *snap->tree, schema, sidecar::binary_format::zera, id);
+        *snap, schema, sidecar::binary_format::zera, id);
     check_columnar_multi_row_match<zerialize::Ion>(
-        *snap->tree, schema, sidecar::binary_format::ion, id);
+        *snap, schema, sidecar::binary_format::ion, id);
     check_columnar_multi_row_match<zerialize::Beve>(
-        *snap->tree, schema, sidecar::binary_format::beve, id);
+        *snap, schema, sidecar::binary_format::beve, id);
 }
 
 TEST(event_bridge_columnar, empty_batch_returns_empty_result_not_malformed) {
@@ -369,11 +369,11 @@ TEST(event_bridge_columnar, empty_batch_returns_empty_result_not_malformed) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto result = match_columnar_with<zerialize::MsgPack>(
-        *snap->tree, schema, sidecar::binary_format::msgpack,
+        *snap, schema, sidecar::binary_format::msgpack,
         zerialize::dyn::map({}), make_log());
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->empty());
@@ -384,13 +384,13 @@ TEST(event_bridge_columnar, malformed_shape_returns_nullopt) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     // A normal (non-columnar) scalar row sent to the columnar path: "value"
     // is a bare int, not an array - expand_columnar rejects this outright.
     auto result = match_columnar_with<zerialize::MsgPack>(
-        *snap->tree, schema, sidecar::binary_format::msgpack,
+        *snap, schema, sidecar::binary_format::msgpack,
         zerialize::dyn::map({{"value", 42}}), make_log());
     EXPECT_FALSE(result.has_value());
 }
@@ -403,15 +403,15 @@ TEST(event_bridge_columnar, mismatched_column_lengths_returns_nullopt) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto payload = zerialize::dyn::map({
         {"value", zerialize::dyn::array({5, 42})},
         {"tag", zerialize::dyn::array({std::string("a")})},   // one fewer than "value"
     });
     auto result = match_columnar_with<zerialize::MsgPack>(
-        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log());
+        *snap, schema, sidecar::binary_format::msgpack, payload, make_log());
     EXPECT_FALSE(result.has_value());
 }
 
@@ -422,8 +422,8 @@ TEST(event_bridge_columnar, list_attribute_extracts_own_per_row_value) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     uint64_t id = mgr.subscribe("tags one of (\"a\")", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     // Each row's own "tags" value is itself an array (a list attribute) -
     // the columnar batch shape wraps that in one more array level, one
@@ -435,7 +435,7 @@ TEST(event_bridge_columnar, list_attribute_extracts_own_per_row_value) {
         })},
     });
     auto result = match_columnar_with<zerialize::MsgPack>(
-        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log());
+        *snap, schema, sidecar::binary_format::msgpack, payload, make_log());
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_TRUE(contains((*result)[0].matched_ids, id));
@@ -447,8 +447,8 @@ TEST(event_bridge_columnar, null_composite_row_produces_all_undefined_event) {
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     // "is null" is the only expression that can match a fully-undefined row.
     uint64_t id = mgr.subscribe("value is null", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     // pg_zerialize represents a wholly-NULL composite row as null at that
     // index in every column's array.
@@ -456,7 +456,7 @@ TEST(event_bridge_columnar, null_composite_row_produces_all_undefined_event) {
         {"value", zerialize::dyn::array({zerialize::dyn::Value(), 42})},
     });
     auto result = match_columnar_with<zerialize::MsgPack>(
-        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log());
+        *snap, schema, sidecar::binary_format::msgpack, payload, make_log());
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_TRUE(contains((*result)[0].matched_ids, id));
@@ -467,13 +467,13 @@ TEST(event_bridge_columnar, rows_searched_out_reflects_batch_row_count) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto payload = zerialize::dyn::map({{"value", zerialize::dyn::array({1, 2, 3, 4, 5})}});
     std::size_t rows_searched = 0;
     auto result = match_columnar_with<zerialize::MsgPack>(
-        *snap->tree, schema, sidecar::binary_format::msgpack, payload, make_log(),
+        *snap, schema, sidecar::binary_format::msgpack, payload, make_log(),
         nullptr, &rows_searched);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(rows_searched, 5u);
@@ -484,13 +484,13 @@ TEST(event_bridge_matching, unrecognized_binary_returns_nullopt) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     // 0xc1 is reserved/invalid in MessagePack.
     std::vector<char> garbage{static_cast<char>(0xc1)};
     auto result = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::msgpack,
+        *snap, schema, sidecar::binary_format::msgpack,
         std::span<const char>(garbage.data(), garbage.size()), make_log());
     EXPECT_FALSE(result.has_value());
 }

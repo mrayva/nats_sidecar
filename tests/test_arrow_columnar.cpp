@@ -272,8 +272,8 @@ TEST(event_bridge_arrow, arrow_input_msgpack_output_matches_and_decodes) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     uint64_t id = mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     // Row 0 (value=5) doesn't match, rows 1 and 2 (42, 100) do - same shape as the equivalent
     // zerialize-format columnar test in test_event_bridge.cpp.
@@ -281,7 +281,7 @@ TEST(event_bridge_arrow, arrow_input_msgpack_output_matches_and_decodes) {
 
     std::size_t rows_searched = 0;
     auto result = sidecar::deserialize_and_match_columnar(
-        *snap->tree, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
         nullptr, &rows_searched, sidecar::binary_format::msgpack);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(rows_searched, 3u);
@@ -302,14 +302,14 @@ TEST(event_bridge_arrow, arrow_input_without_output_format_returns_nullopt) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto stream = build_arrow_ipc_stream({"value"}, {int64_array({42})});
     // output_format defaults to nullopt - reachable in practice only if
     // finalize_and_validate_config's own guard is bypassed; must still fail gracefully here.
     auto result = sidecar::deserialize_and_match_columnar(
-        *snap->tree, schema, sidecar::binary_format::arrow, as_span(stream), make_log());
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log());
     EXPECT_FALSE(result.has_value());
 }
 
@@ -318,12 +318,12 @@ TEST(event_bridge_arrow, arrow_as_output_format_returns_nullopt) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto stream = build_arrow_ipc_stream({"value"}, {int64_array({42})});
     auto result = sidecar::deserialize_and_match_columnar(
-        *snap->tree, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
         nullptr, nullptr, sidecar::binary_format::arrow);
     EXPECT_FALSE(result.has_value());
 }
@@ -333,12 +333,12 @@ TEST(event_bridge_arrow, arrow_input_with_date32_column_returns_nullopt) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto stream = build_arrow_ipc_stream({"day"}, {date32_array({0, 1})});
     auto result = sidecar::deserialize_and_match_columnar(
-        *snap->tree, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
         nullptr, nullptr, sidecar::binary_format::msgpack);
     EXPECT_FALSE(result.has_value());
 }
@@ -348,11 +348,11 @@ TEST(event_bridge_arrow, row_mode_rejects_arrow_format) {
     sidecar::attribute_schema schema(defs);
     sidecar::subscription_manager mgr(defs, "test.output", make_log());
     mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap && snap->tree);
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
 
     auto stream = build_arrow_ipc_stream({"value"}, {int64_array({42})});
     auto result = sidecar::deserialize_and_match(
-        *snap->tree, schema, sidecar::binary_format::arrow, as_span(stream), make_log());
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log());
     EXPECT_FALSE(result.has_value());
 }

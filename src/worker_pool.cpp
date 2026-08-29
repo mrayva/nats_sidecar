@@ -192,19 +192,6 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         m_queued_messages.fetch_sub(1, std::memory_order_relaxed);
         m_queued_bytes.fetch_sub(qm.payload.size(), std::memory_order_relaxed);
 
-        // Get current snapshot — lock-free atomic load
-        auto snap = m_sub_mgr.snapshot();
-        if (!snap || !snap->tree) {
-            // No active subscriptions to check against - legitimately
-            // nothing to do, same as the "no match" case below. Acked (not
-            // left pending): a subscribe request only ever looks at
-            // messages from that point forward, so there's no future
-            // consumer who'd want this message redelivered.
-            if (qm.js_msg) spawn_ack(qm.js_sub, std::move(*qm.js_msg));
-            qm.payload.clear();
-            continue;
-        }
-
         std::span<const char> payload_span(qm.payload.data(), qm.payload.size());
 
         // row_matches unifies both paths: a non-columnar message always
@@ -218,17 +205,35 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         std::size_t rows_searched = 1;
         std::optional<std::vector<row_match>> row_matches;
 
-        if (qm.columnar) {
-            row_matches = deserialize_and_match_columnar(
-                *snap->tree, m_schema, m_format, payload_span, m_log,
-                &search_time, &rows_searched, m_output_format);
-        } else {
-            auto matches = deserialize_and_match(
-                *snap->tree, m_schema, m_format, payload_span, m_log, &search_time);
-            if (matches) {
-                row_matches.emplace();
-                if (!matches->empty()) {
-                    row_matches->push_back({std::move(*matches), std::move(qm.payload)});
+        {
+            // Synchronous, lock-protected read access to the current live tree. tree_guard's
+            // shared_lock must not survive past this block - never held across the
+            // asio::co_spawn'd publish coroutine below (which can suspend on backpressure/drain) -
+            // see subscription_manager::tree_read_guard's own doc comment for why.
+            auto tree_guard = m_sub_mgr.acquire_tree();
+            if (!tree_guard) {
+                // No active subscriptions to check against - legitimately
+                // nothing to do, same as the "no match" case below. Acked (not
+                // left pending): a subscribe request only ever looks at
+                // messages from that point forward, so there's no future
+                // consumer who'd want this message redelivered.
+                if (qm.js_msg) spawn_ack(qm.js_sub, std::move(*qm.js_msg));
+                qm.payload.clear();
+                continue;
+            }
+
+            if (qm.columnar) {
+                row_matches = deserialize_and_match_columnar(
+                    *tree_guard, m_schema, m_format, payload_span, m_log,
+                    &search_time, &rows_searched, m_output_format);
+            } else {
+                auto matches = deserialize_and_match(
+                    *tree_guard, m_schema, m_format, payload_span, m_log, &search_time);
+                if (matches) {
+                    row_matches.emplace();
+                    if (!matches->empty()) {
+                        row_matches->push_back({std::move(*matches), std::move(qm.payload)});
+                    }
                 }
             }
         }
@@ -289,8 +294,24 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         // I/O thread only after the write that made the message durable
         // downstream actually succeeded is what keeps ack ordered strictly
         // after publish, not a separate, potentially-racing step.
+        // Resolve output subjects synchronously here, on the worker thread - not inside the async
+        // publish coroutine, which is the whole point of subscription_manager::output_subject()
+        // existing as a separate, brief-shared-lock call rather than part of an object handed
+        // across the coroutine's suspension points (see tree_guard's own comment above). Scoped
+        // to just the ids this message actually matched (typically small), not every active
+        // subscription - unlike the old tree_snapshot::output_subjects map, which was rebuilt in
+        // full on every single subscribe/unsubscribe.
+        std::unordered_map<uint64_t, std::string> output_subjects;
+        for (const auto& rm : *row_matches) {
+            for (uint64_t sub_id : rm.matched_ids) {
+                if (output_subjects.count(sub_id)) continue;
+                if (auto subj = m_sub_mgr.output_subject(sub_id)) {
+                    output_subjects.emplace(sub_id, std::move(*subj));
+                }
+            }
+        }
+
         auto matches_to_publish = std::move(*row_matches);
-        auto snap_copy = std::move(snap);
         auto conn = m_conn;
         auto log = m_log;
         auto counters = m_publish_counters;
@@ -301,7 +322,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         // Post publish work to the ASIO I/O thread
         asio::co_spawn(m_ioc,
             [matches_to_publish = std::move(matches_to_publish),
-             snap_copy = std::move(snap_copy),
+             output_subjects = std::move(output_subjects),
              conn = std::move(conn),
              log,
              counters,
@@ -319,7 +340,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                     pub_frames frames;
                     for (const auto& rm : matches_to_publish) {
                         auto row_frames = build_pub_frames(
-                            rm.matched_ids, snap_copy->output_subjects,
+                            rm.matched_ids, output_subjects,
                             std::span<const char>(rm.payload.data(), rm.payload.size()));
                         frames.wire += row_frames.wire;
                         frames.count += row_frames.count;

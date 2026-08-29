@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/null_sink.h>
+#include <chrono>
 
 namespace {
 
@@ -105,71 +106,65 @@ TEST(subscription_manager, invalid_expression_throws) {
     EXPECT_EQ(mgr.active_count(), 0u);
 }
 
-// --- Snapshot-specific tests ---
+// --- Tree/output-subject tests (acquire_tree()/output_subject() - see subscription_manager.hpp's
+// own comments for why these replaced the old snapshot()/tree_snapshot pair: the old RCU
+// snapshot published a whole new tree_snapshot object on every write, which is exactly the
+// O(K^2) rebuild-from-scratch cost this class was redesigned to eliminate. There's now one live
+// tree mutated in place, so there's no more "old, still-immutable snapshot" concept to test -
+// what these tests verify instead is that acquire_tree()/output_subject() correctly reflect
+// current state as it evolves. ---
 
-TEST(subscription_manager, snapshot_valid_after_subscribe) {
+TEST(subscription_manager, tree_valid_after_subscribe) {
     sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
 
     uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
 
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap);
-    ASSERT_TRUE(snap->tree);
-    EXPECT_EQ(snap->active_count, 1u);
-    EXPECT_EQ(snap->output_subjects.size(), 1u);
+    auto tree = mgr.acquire_tree();
+    ASSERT_TRUE(tree);
+    EXPECT_EQ(mgr.active_count(), 1u);
 
-    auto it = snap->output_subjects.find(id);
-    ASSERT_NE(it, snap->output_subjects.end());
-    EXPECT_EQ(it->second, "test.output." + std::to_string(id));
+    auto subj = mgr.output_subject(id);
+    ASSERT_TRUE(subj.has_value());
+    EXPECT_EQ(*subj, "test.output." + std::to_string(id));
 }
 
-TEST(subscription_manager, snapshot_valid_after_remove) {
+TEST(subscription_manager, output_subject_absent_after_remove) {
     sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
 
     uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
     mgr.remove_lease(id, "client-1");
 
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap);
-    ASSERT_TRUE(snap->tree);
-    EXPECT_EQ(snap->active_count, 0u);
-    EXPECT_TRUE(snap->output_subjects.empty());
+    auto tree = mgr.acquire_tree();
+    ASSERT_TRUE(tree);
+    EXPECT_EQ(mgr.active_count(), 0u);
+    EXPECT_FALSE(mgr.output_subject(id).has_value());
 }
 
-TEST(subscription_manager, old_snapshot_remains_valid_after_new_publish) {
+TEST(subscription_manager, output_subject_reflects_growth_incrementally) {
     sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
 
     uint64_t id1 = mgr.subscribe("temperature > 30.0", "client-1");
-    auto old_snap = mgr.snapshot();
+    EXPECT_EQ(mgr.active_count(), 1u);
+    ASSERT_TRUE(mgr.output_subject(id1).has_value());
 
-    // Add another subscription — triggers new snapshot
+    // Add another subscription — the live tree grows in place (see this file's own top-of-block
+    // comment); id1's own subject must remain unaffected by id2's insertion.
     uint64_t id2 = mgr.subscribe("severity = 5", "client-2");
-    auto new_snap = mgr.snapshot();
 
-    // Old snapshot still valid with 1 subscription
-    ASSERT_TRUE(old_snap);
-    ASSERT_TRUE(old_snap->tree);
-    EXPECT_EQ(old_snap->active_count, 1u);
-    EXPECT_EQ(old_snap->output_subjects.size(), 1u);
-    EXPECT_NE(old_snap->output_subjects.find(id1), old_snap->output_subjects.end());
-
-    // New snapshot has 2 subscriptions
-    ASSERT_TRUE(new_snap);
-    ASSERT_TRUE(new_snap->tree);
-    EXPECT_EQ(new_snap->active_count, 2u);
-    EXPECT_EQ(new_snap->output_subjects.size(), 2u);
-    EXPECT_NE(new_snap->output_subjects.find(id1), new_snap->output_subjects.end());
-    EXPECT_NE(new_snap->output_subjects.find(id2), new_snap->output_subjects.end());
+    EXPECT_EQ(mgr.active_count(), 2u);
+    auto subj1 = mgr.output_subject(id1);
+    auto subj2 = mgr.output_subject(id2);
+    ASSERT_TRUE(subj1.has_value());
+    ASSERT_TRUE(subj2.has_value());
+    EXPECT_NE(*subj1, *subj2);
 }
 
-TEST(subscription_manager, snapshot_empty_on_construction) {
+TEST(subscription_manager, tree_empty_on_construction) {
     sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
 
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap);
-    ASSERT_TRUE(snap->tree);
-    EXPECT_EQ(snap->active_count, 0u);
-    EXPECT_TRUE(snap->output_subjects.empty());
+    auto tree = mgr.acquire_tree();
+    ASSERT_TRUE(tree);
+    EXPECT_EQ(mgr.active_count(), 0u);
 }
 
 TEST(subscription_manager, restores_stable_id_and_advances_sequence) {
@@ -181,9 +176,50 @@ TEST(subscription_manager, restores_stable_id_and_advances_sequence) {
     auto restored = mgr.get_subscription(42);
     ASSERT_TRUE(restored.has_value());
     EXPECT_EQ(restored->lease_holders.size(), 2u);
-    EXPECT_EQ(mgr.snapshot()->output_subjects.at(42), "test.output.42");
+    EXPECT_EQ(mgr.output_subject(42).value(), "test.output.42");
 
     EXPECT_EQ(mgr.subscribe("severity = 5", "client-3"), 43u);
+}
+
+// Regression guard for the O(K^2) bulk-subscribe cost this class was redesigned to eliminate:
+// subscribe() used to rebuild the whole matching tree from scratch (re-parsing every prior
+// expression) on every single call, so the Nth subscribe cost O(N). With true incremental
+// insert(), per-call cost should be roughly constant, so subscribing the second half of N should
+// not take dramatically longer wall-clock time than the first half. A generous 3x ratio
+// threshold (not e.g. 1.2x) keeps this robust against ordinary timing noise while still failing
+// hard on an accidental reintroduction of the quadratic rebuild (which would make the second
+// half take roughly N/2 times as long as the first, not a small constant factor).
+TEST(subscription_manager, subscribe_cost_is_not_quadratic) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
+
+    constexpr int kTotal = 2000;
+    constexpr int kHalf = kTotal / 2;
+
+    auto expr_for = [](int i) {
+        return "severity = " + std::to_string(i);
+    };
+
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kHalf; ++i) {
+        mgr.subscribe(expr_for(i), "client-1");
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    for (int i = kHalf; i < kTotal; ++i) {
+        mgr.subscribe(expr_for(i), "client-1");
+    }
+    auto t2 = std::chrono::steady_clock::now();
+
+    EXPECT_EQ(mgr.active_count(), static_cast<std::size_t>(kTotal));
+
+    auto first_half = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    auto second_half = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+    // Both halves insert the same number of subscriptions into a tree of comparable size (the
+    // second half's tree is at most 2x the first half's) - under the old O(K^2) rebuild, the
+    // second half would take roughly (1.5x kHalf)/(0.5x kHalf) = 3x longer on average; under
+    // true incremental insert, both halves should cost roughly the same.
+    EXPECT_LT(second_half, first_half * 3 + 1000)
+        << "first_half=" << first_half << "us second_half=" << second_half << "us "
+        << "(a large second_half/first_half ratio suggests the O(K^2) rebuild regressed)";
 }
 
 TEST(subscription_manager, rejects_conflicting_restored_records) {
@@ -212,8 +248,8 @@ TEST(subscription_manager, independent_instances_restoring_same_id_agree_on_outp
     ASSERT_TRUE(mgr_a.restore(client_assigned_id, "location = \"NYC\"", "client-1"));
     ASSERT_TRUE(mgr_b.restore(client_assigned_id, "location = \"NYC\"", "client-1"));
 
-    const auto& topic_a = mgr_a.snapshot()->output_subjects.at(client_assigned_id);
-    const auto& topic_b = mgr_b.snapshot()->output_subjects.at(client_assigned_id);
+    const auto topic_a = mgr_a.output_subject(client_assigned_id).value();
+    const auto topic_b = mgr_b.output_subject(client_assigned_id).value();
     EXPECT_EQ(topic_a, topic_b);
     EXPECT_EQ(topic_a, "sc.real.out." + std::to_string(client_assigned_id));
 
@@ -225,7 +261,7 @@ TEST(subscription_manager, independent_instances_restoring_same_id_agree_on_outp
     mgr_c.subscribe("severity = 5", "some-other-client");
     mgr_c.subscribe("active", "some-other-client");
     ASSERT_TRUE(mgr_c.restore(client_assigned_id, "location = \"NYC\"", "client-1"));
-    EXPECT_EQ(mgr_c.snapshot()->output_subjects.at(client_assigned_id), topic_a);
+    EXPECT_EQ(mgr_c.output_subject(client_assigned_id).value(), topic_a);
 }
 
 // --- engine=betree: same subscribe/lease/snapshot behavior, different backing engine ---
@@ -254,17 +290,16 @@ TEST(subscription_manager_betree, invalid_expression_throws) {
     EXPECT_EQ(mgr.active_count(), 0u);
 }
 
-TEST(subscription_manager_betree, snapshot_valid_after_subscribe) {
+TEST(subscription_manager_betree, tree_valid_after_subscribe) {
     sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
                                       sidecar::engine_type::betree);
 
     uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
 
-    auto snap = mgr.snapshot();
-    ASSERT_TRUE(snap);
-    ASSERT_TRUE(snap->tree);
-    EXPECT_EQ(snap->active_count, 1u);
-    EXPECT_EQ(snap->output_subjects.at(id), "test.output." + std::to_string(id));
+    auto tree = mgr.acquire_tree();
+    ASSERT_TRUE(tree);
+    EXPECT_EQ(mgr.active_count(), 1u);
+    EXPECT_EQ(mgr.output_subject(id).value(), "test.output." + std::to_string(id));
 }
 
 TEST(subscription_manager_betree, space_separated_keyword_works_natively) {
