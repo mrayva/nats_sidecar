@@ -105,25 +105,34 @@ inline bool is_supported_type(arrow::Type::type t) {
 class ArrowCellView {
 public:
     ArrowCellView() = default;
-    ArrowCellView(const arrow::Array* array, std::int64_t row) : array_(array), row_(row) {}
+    // type_id() is a pure function of `array` alone (never `row`) - cached here ONCE instead of
+    // re-derived by every accessor below. Found via `perf annotate` on a real N=12 fleet run
+    // under real load (not a synthetic benchmark): array_->type_id() involves a real, measurable
+    // shared_ptr<ArrayData>/shared_ptr<DataType> chase through Arrow's own internal object graph
+    // (arrow::ArrayData, arrow::DataType) - `populate_event()`'s generic dispatch (event_bridge.hpp)
+    // calls an isXxx() check THEN the matching asXxx() accessor for every cell (e.g. isFloat()
+    // then asDouble() for a float_val attribute), each independently re-deriving type_id() -
+    // exactly 2x the necessary work per cell for every attribute type actually reachable from
+    // populate_event's own dispatch shape. Caching removes that redundancy entirely - array_'s
+    // type can never change mid-lifetime of one ArrowCellView, so this is a pure perf fix with
+    // no behavior change.
+    ArrowCellView(const arrow::Array* array, std::int64_t row)
+        : array_(array), row_(row), type_(array != nullptr ? array->type_id() : arrow::Type::NA) {}
 
     bool isNull() const { return array_ == nullptr || array_->IsNull(row_); }
-    bool isBool() const { return !isNull() && array_->type_id() == arrow::Type::BOOL; }
+    bool isBool() const { return !isNull() && type_ == arrow::Type::BOOL; }
     bool isInt() const {
         if (isNull()) return false;
-        auto t = array_->type_id();
-        return t == arrow::Type::INT16 || t == arrow::Type::INT32 || t == arrow::Type::INT64;
+        return type_ == arrow::Type::INT16 || type_ == arrow::Type::INT32 || type_ == arrow::Type::INT64;
     }
     bool isUInt() const { return false; } // pg_arrow never emits an unsigned Arrow type
     bool isFloat() const {
         if (isNull()) return false;
-        auto t = array_->type_id();
-        return t == arrow::Type::FLOAT || t == arrow::Type::DOUBLE;
+        return type_ == arrow::Type::FLOAT || type_ == arrow::Type::DOUBLE;
     }
     bool isString() const {
         if (isNull()) return false;
-        auto t = array_->type_id();
-        return t == arrow::Type::STRING || t == arrow::Type::BINARY || t == arrow::Type::DECIMAL128;
+        return type_ == arrow::Type::STRING || type_ == arrow::Type::BINARY || type_ == arrow::Type::DECIMAL128;
     }
     bool isBlob()  const { return false; } // binary maps to string, not blob - see this file's own header comment
     bool isMap()   const { return false; }
@@ -133,7 +142,7 @@ public:
     std::int16_t asInt16() const { return static_cast<std::int16_t>(asInt64()); }
     std::int32_t asInt32() const { return static_cast<std::int32_t>(asInt64()); }
     std::int64_t asInt64() const {
-        switch (array_->type_id()) {
+        switch (type_) {
             case arrow::Type::INT16: return static_cast<const arrow::Int16Array&>(*array_).Value(row_);
             case arrow::Type::INT32: return static_cast<const arrow::Int32Array&>(*array_).Value(row_);
             case arrow::Type::INT64: return static_cast<const arrow::Int64Array&>(*array_).Value(row_);
@@ -146,7 +155,7 @@ public:
     [[noreturn]] std::uint64_t asUInt64() const { arrow_detail::unsupported("asUInt64"); }
     float  asFloat()  const { return static_cast<float>(asDouble()); }
     double asDouble() const {
-        switch (array_->type_id()) {
+        switch (type_) {
             case arrow::Type::FLOAT:  return static_cast<const arrow::FloatArray&>(*array_).Value(row_);
             case arrow::Type::DOUBLE: return static_cast<const arrow::DoubleArray&>(*array_).Value(row_);
             default: arrow_detail::unsupported("asDouble");
@@ -157,7 +166,7 @@ public:
     // data - cached here so the returned string_view stays valid for as long as this
     // ArrowCellView instance does (see this file's own header comment on why that's enough).
     std::string_view asStringView() const {
-        switch (array_->type_id()) {
+        switch (type_) {
             case arrow::Type::STRING: {
                 auto v = static_cast<const arrow::StringArray&>(*array_).GetView(row_);
                 return std::string_view(v.data(), v.size());
@@ -195,6 +204,7 @@ public:
 private:
     const arrow::Array* array_ = nullptr;
     std::int64_t row_ = 0;
+    arrow::Type::type type_ = arrow::Type::NA;
     mutable std::optional<std::string> decimal_cache_;
 };
 
