@@ -44,9 +44,22 @@ constexpr std::size_t kBetreeStringCount = 65536;
 // comparison like a-tree/be-tree's own string handling. A string longer than this is silently
 // TRUNCATED at encode time (bytes past this length never affect which predicate space it
 // falls into), so two distinct strings sharing this-many-byte prefix are indistinguishable to
-// pstree. Chosen generously for typical attribute values (names, symbols, categories, ids);
-// documented as a real, structural limitation in README.md, not a bug.
-constexpr std::size_t kPstreeStringMaxLen = 128;
+// pstree. Real, measured cost to setting this too generously: PSTree::matchPoint() walks this
+// many tree levels on every single lookup (a hashtable probe per level) regardless of the
+// actual string's length or whether any range predicate even exists on this attribute - `perf`
+// showed this walk dominating pstree's own search cost at moderate K once the (unrelated)
+// access-predicate selection bug was fixed (see PSTDynamic's own history) - for a workload with
+// only equality-style predicates (this project's own set-membership benchmarks), every level
+// past the real content is pure overhead with zero payoff. Was 128; the real NYSE symbol
+// universe this project actually queries (nyse_eqy_us_all_trade_20260102's own "Symbol" column)
+// tops out at 9 characters (verified directly against the live table), so 32 leaves >3x
+// headroom over any real value seen while recovering most of the available win (measured:
+// K=4000 search throughput 1.06M/s -> 1.75M/s, ~1.65x; K=32000 ~130k/s -> ~141k/s, ~1.09x -
+// smaller at high K since a different cost, matchValue's own comparison, dominates there
+// instead - see project memory). Still a real, structural truncation limit for any FUTURE
+// attribute value genuinely longer than 32 bytes, documented in README.md - raise it (the cost
+// scales linearly with the value, not exponentially) if a real schema ever needs that.
+constexpr std::size_t kPstreeStringMaxLen = 32;
 }
 
 namespace {

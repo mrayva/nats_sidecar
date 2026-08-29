@@ -363,11 +363,15 @@ no way to represent either):
   indexable predicate alongside `is null` works fine; `"X is null"` alone (or every branch of an
   `or` reducing to bare `is null` checks) is rejected at subscribe time. `is not null` has no such
   problem - it's always indexable (as an unselective "matches every leaf" fallback).
-- String attributes are compared only up to a fixed prefix length (`kPstreeStringMaxLen`, 128 bytes,
+- String attributes are compared only up to a fixed prefix length (`kPstreeStringMaxLen`, 32 bytes,
   in `matching_engine.cpp`) - PS-Tree's string encoding is a fixed-depth tree, one level per byte
-  position, not a variable-length comparison. Two distinct strings sharing a 128-byte prefix are
+  position, not a variable-length comparison. Two distinct strings sharing a 32-byte prefix are
   indistinguishable to `pstree`; unlikely to matter for realistic attribute values (names, symbols,
-  categories, ids) but worth knowing if an attribute can hold long strings.
+  categories, ids) but worth knowing if an attribute can hold long strings - raise the constant
+  (cost scales linearly with it, not exponentially) if one genuinely needs to. Kept deliberately
+  small rather than defaulting to something very generous: PSTree::matchPoint() walks this many
+  tree levels on every lookup regardless of the actual string's length, real, measured overhead
+  for a real workload - see matching_engine.cpp's own comment for the numbers.
 
 Independent throughput comparison against a-tree/be-tree (the paper's own self-reported benchmarks
 are not otherwise verified here) is future work - see the project status notes for the current
