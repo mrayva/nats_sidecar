@@ -1,8 +1,8 @@
 // Cross-engine differential checker: loads a REAL expression file (e.g. one of the
-// exchange/symbol set-membership benchmark files under nyse-matrix/logs-setmember/), inserts
-// every expression into all three engines, then searches each with a handful of real sample
-// (exchange, symbol) rows and confirms atree/betree/pstree agree on the exact set of matched
-// subscription ids for every row.
+// exchange/symbol(/trade_volume) set-membership benchmark files under
+// nyse-matrix/logs-setmember/), inserts every expression into all three engines, then searches
+// each with a handful of real sample (exchange, symbol, trade_volume) rows and confirms
+// atree/betree/pstree agree on the exact set of matched subscription ids for every row.
 //
 // This exists because the three existing correctness safety nets - matching_engine_differential
 // (46 gtest cases, small hand-picked expressions) and each engine's own unit tests - all missed a
@@ -13,7 +13,13 @@
 // exact real workload instead. Kept as a reusable tool for the next such investigation, not a
 // one-off.
 //
-// Usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol per line]
+// trade_volume (added 2026-08-29, alongside gen_set_membership_subs.py's own --volume-fraction):
+// every row now also carries a real "Trade Volume" sample value, so this tool can validate the
+// new `trade_volume >= lo and trade_volume <= hi` range-predicate shape (including volume-only
+// subscriptions) across all three engines, not just the atree-only manual smoke test that
+// exercised it first.
+//
+// Usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol,trade_volume per line]
 //   (rows_file optional - defaults to a real 19-row sample, one per NYSE exchange letter,
 //   originally pulled via `psql ... TABLESAMPLE SYSTEM (2)` against the live table)
 #include "matching_engine.hpp"
@@ -40,11 +46,17 @@ std::vector<std::string> read_exprs(const std::string& path) {
     return out;
 }
 
-std::set<uint64_t> search_row(matching_engine& engine, const std::string& exchange,
-                               const std::string& symbol) {
+struct sample_row {
+    std::string exchange;
+    std::string symbol;
+    int64_t trade_volume;
+};
+
+std::set<uint64_t> search_row(matching_engine& engine, const sample_row& row) {
     auto ev = engine.make_event();
-    ev->with_string("exchange", exchange);
-    ev->with_string("symbol", symbol);
+    ev->with_string("exchange", row.exchange);
+    ev->with_string("symbol", row.symbol);
+    ev->with_integer("trade_volume", row.trade_volume);
     auto matched = engine.search(*ev);
     return std::set<uint64_t>(matched.begin(), matched.end());
 }
@@ -55,7 +67,7 @@ int main(int argc, char** argv) {
     std::string expr_path = argc > 1 ? argv[1] : "";
     std::string rows_path = argc > 2 ? argv[2] : "";
     if (expr_path.empty()) {
-        std::fprintf(stderr, "usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol per line]\n");
+        std::fprintf(stderr, "usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol,trade_volume per line]\n");
         return 2;
     }
     auto exprs = read_exprs(expr_path);
@@ -64,6 +76,7 @@ int main(int argc, char** argv) {
     std::vector<attribute_def> attrs = {
         {"exchange", attribute_type::string},
         {"symbol", attribute_type::string},
+        {"trade_volume", attribute_type::integer},
     };
 
     std::vector<std::pair<engine_type, const char*>> engines = {
@@ -91,13 +104,14 @@ int main(int argc, char** argv) {
         trees.push_back(std::move(tree));
     }
 
-    // Real (exchange, symbol) pairs sampled directly from the actual published table (one per
-    // real distinct exchange letter).
-    std::vector<std::pair<std::string, std::string>> rows = {
-        {"A", "AKAN"}, {"B", "ZTS"}, {"C", "IWM"}, {"D", "USB"}, {"G", "MDLZ"},
-        {"H", "NVDA"}, {"J", "IAU"}, {"K", "SOXL"}, {"L", "ANIP"}, {"M", "ZTS"},
-        {"N", "ET"}, {"P", "UNH"}, {"Q", "MRVL"}, {"T", "NYT"}, {"U", "BBAI"},
-        {"V", "TREX"}, {"X", "IREN"}, {"Y", "ZURA"}, {"Z", "FLNC"},
+    // Real (exchange, symbol, trade_volume) triples sampled directly from the actual published
+    // table (one per real distinct exchange letter).
+    std::vector<sample_row> rows = {
+        {"A", "ACCO", 100}, {"B", "XOP", 70}, {"C", "SVC", 100}, {"D", "AXTI", 100},
+        {"G", "XRT", 100}, {"H", "SQQQ", 100}, {"J", "GDXJ", 17}, {"K", "ZYME", 1},
+        {"L", "MEC", 1}, {"M", "EVO", 43}, {"N", "XPO", 3}, {"P", "LVRO", 10},
+        {"Q", "KOPN", 33}, {"T", "ZSL", 100}, {"U", "MSTU", 400}, {"V", "INFY", 500},
+        {"X", "XPEV", 12}, {"Y", "OKE", 13}, {"Z", "DY", 4},
     };
     if (!rows_path.empty()) {
         rows.clear();
@@ -105,23 +119,27 @@ int main(int argc, char** argv) {
         std::string line;
         while (std::getline(f, line)) {
             if (line.empty()) continue;
-            auto comma = line.find(',');
-            if (comma == std::string::npos) continue;
-            rows.emplace_back(line.substr(0, comma), line.substr(comma + 1));
+            auto comma1 = line.find(',');
+            if (comma1 == std::string::npos) continue;
+            auto comma2 = line.find(',', comma1 + 1);
+            if (comma2 == std::string::npos) continue;
+            rows.push_back({line.substr(0, comma1), line.substr(comma1 + 1, comma2 - comma1 - 1),
+                             std::stoll(line.substr(comma2 + 1))});
         }
     }
 
     int disagreements = 0;
-    for (auto& [exch, sym] : rows) {
+    for (auto& row : rows) {
         std::vector<std::set<uint64_t>> results;
         for (std::size_t i = 0; i < trees.size(); ++i) {
-            results.push_back(search_row(*trees[i], exch, sym));
+            results.push_back(search_row(*trees[i], row));
         }
         bool all_equal = std::all_of(results.begin() + 1, results.end(),
                                       [&](const auto& s) { return s == results[0]; });
-        std::fprintf(stderr, "%s/%s: atree=%zu betree=%zu pstree=%zu  %s\n",
-                     exch.c_str(), sym.c_str(), results[0].size(), results[1].size(),
-                     results[2].size(), all_equal ? "AGREE" : "DISAGREE");
+        std::fprintf(stderr, "%s/%s/%lld: atree=%zu betree=%zu pstree=%zu  %s\n",
+                     row.exchange.c_str(), row.symbol.c_str(),
+                     static_cast<long long>(row.trade_volume), results[0].size(),
+                     results[1].size(), results[2].size(), all_equal ? "AGREE" : "DISAGREE");
         if (!all_equal) {
             ++disagreements;
             // Print a few ids present in one but not another.
