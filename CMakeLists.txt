@@ -255,4 +255,20 @@ if(SIDECAR_BUILD_BENCHMARKS)
     set_target_properties(matching_engine_bench PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+
+    # Reusable perf-profiling target (isolates matching_engine::search() cost, zero I/O) and
+    # cross-engine differential checker (real expressions + real sample rows, all three engines
+    # must agree) - see each .cpp's own comment for what they're for and how to run them. Both
+    # have already found and helped verify fixes for two real bugs.
+    add_executable(perf_search_loop benchmarks/perf_search_loop.cpp)
+    target_link_libraries(perf_search_loop PRIVATE sidecar_lib)
+    set_target_properties(perf_search_loop PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
+    add_executable(diag_engine_diff benchmarks/diag_engine_diff.cpp)
+    target_link_libraries(diag_engine_diff PRIVATE sidecar_lib)
+    set_target_properties(diag_engine_diff PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
 endif()
