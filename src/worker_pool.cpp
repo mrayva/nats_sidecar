@@ -385,7 +385,16 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                     // every write for this message succeeded" ordering -
                     // just via several co_await write_raw() calls instead of
                     // one when a message's fan-out is large.
+                    // Reserved upfront to chunk_bytes - found via `perf` profiling the
+                    // io_context thread specifically under real sustained load (2026-08-30):
+                    // over half its own CPU time was std::string internals
+                    // (_M_append/__memmove/_M_check_length/_S_copy, not socket I/O at all),
+                    // because `wire` grew purely via repeated reallocate-and-copy on every
+                    // append_pub_frame() call, chunk after chunk, for every single publish
+                    // task. std::string::clear() retains capacity, so this reserve pays off
+                    // for every chunk within one task, not just the first.
                     std::string wire;
+                    wire.reserve(chunk_bytes);
                     std::size_t chunk_count = 0;
                     std::size_t total_published = 0;
                     bool write_failed = false;
