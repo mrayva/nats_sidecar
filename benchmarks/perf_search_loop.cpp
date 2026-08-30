@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
         {"symbol", attribute_type::string},
         {"trade_volume", attribute_type::integer},
         {"trade_price", attribute_type::float_val},
+        {"narrow_metric", attribute_type::float_val},
     };
 
     auto build_start = std::chrono::steady_clock::now();
@@ -89,21 +90,29 @@ int main(int argc, char** argv) {
     // Real (exchange, symbol, trade_volume, trade_price) rows sampled directly from the actual
     // published table (one per real distinct exchange letter) - same exchange/symbol set used
     // by the earlier differential check, trade_volume/trade_price values from diag_engine_diff's
-    // own real sample.
+    // own real sample. narrow_metric (added 2026-08-30, alongside gen_blindspot_subs.py) is
+    // SYNTHETIC - computed via the exact same per-symbol hash formula as diag_engine_diff.cpp's
+    // own narrow_metric and run_cycle_blindspot.sh's publish SQL, so this file's own literal
+    // values stay real/deterministic (not made up) despite the underlying attribute itself
+    // being synthetic - see those files' own comments for why.
     struct sample_row {
         std::string exchange;
         std::string symbol;
         int64_t trade_volume;
         double trade_price;
+        double narrow_metric;
     };
     std::vector<sample_row> rows = {
-        {"A", "AKAN", 100, 118.65}, {"B", "ZTS", 70, 5.77}, {"C", "IWM", 100, 24.71},
-        {"D", "USB", 100, 22.1175}, {"G", "MDLZ", 100, 122.49}, {"H", "NVDA", 100, 55.87},
-        {"J", "IAU", 17, 37.64}, {"K", "SOXL", 1, 46.68}, {"L", "ANIP", 1, 150.26},
-        {"M", "ZTS", 43, 13.25}, {"N", "ET", 3, 63.73}, {"P", "UNH", 10, 1.23},
-        {"Q", "MRVL", 33, 101.93}, {"T", "NYT", 100, 118.48}, {"U", "BBAI", 400, 4.1},
-        {"V", "TREX", 500, 211.15}, {"X", "IREN", 12, 90.13}, {"Y", "ZURA", 13, 349.16},
-        {"Z", "FLNC", 4, 326.39},
+        {"A", "AKAN", 100, 118.65, 0.00176}, {"B", "ZTS", 70, 5.77, -0.00609},
+        {"C", "IWM", 100, 24.71, -0.0009}, {"D", "USB", 100, 22.1175, -0.00114},
+        {"G", "MDLZ", 100, 122.49, -0.00196}, {"H", "NVDA", 100, 55.87, 0.00495},
+        {"J", "IAU", 17, 37.64, -0.00384}, {"K", "SOXL", 1, 46.68, -0.00205},
+        {"L", "ANIP", 1, 150.26, -0.00675}, {"M", "ZTS", 43, 13.25, -0.00609},
+        {"N", "ET", 3, 63.73, -0.00869}, {"P", "UNH", 10, 1.23, -0.00257},
+        {"Q", "MRVL", 33, 101.93, 0.0006}, {"T", "NYT", 100, 118.48, -0.00366},
+        {"U", "BBAI", 400, 4.1, -0.00677}, {"V", "TREX", 500, 211.15, -0.00214},
+        {"X", "IREN", 12, 90.13, 0.00053}, {"Y", "ZURA", 13, 349.16, 0.00895},
+        {"Z", "FLNC", 4, 326.39, -0.00965},
     };
 
     // reuses_events()==true for all three engines - one event_sink object reused across every
@@ -126,6 +135,7 @@ int main(int argc, char** argv) {
         event->with_string("symbol", row.symbol);
         event->with_integer("trade_volume", row.trade_volume);
         event->with_float("trade_price", row.trade_price);
+        event->with_float("narrow_metric", row.narrow_metric);
         auto matched = tree->search(*event);
         total_matches += matched.size();
         row_idx = (row_idx + 1) % rows.size();

@@ -271,4 +271,12 @@ if(SIDECAR_BUILD_BENCHMARKS)
     set_target_properties(diag_engine_diff PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+
+    # Demonstrates/cross-checks the list-valued-attribute blind spot (pstree has no
+    # representation for list attributes at all) - see the .cpp's own comment.
+    add_executable(diag_list_attr benchmarks/diag_list_attr.cpp)
+    target_link_libraries(diag_list_attr PRIVATE sidecar_lib)
+    set_target_properties(diag_list_attr PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
 endif()
