@@ -24,7 +24,15 @@
 // also validates the double-precision comparison path (vs. trade_volume's int64_t one) across
 // all three engines.
 //
-// Usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol,trade_volume,trade_price per line]
+// narrow_metric (added 2026-08-30, alongside gen_blindspot_subs.py's own --narrow-fraction):
+// a SYNTHETIC float attribute (no real NYSE column has this narrow a domain - see that script's
+// own docs) with a deliberately tiny real-world range ([-0.01, 0.01]), targeting a real
+// upstream-documented be-tree weakness (narrow float domains split poorly with its integer-style
+// partitioning). Values here are computed with the exact same per-symbol hash formula
+// run_cycle_blindspot.sh's own publish SQL uses, so they're real (deterministic, not made up),
+// just not sourced from the live table.
+//
+// Usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol,trade_volume,trade_price,narrow_metric per line]
 //   (rows_file optional - defaults to a real 19-row sample, one per NYSE exchange letter,
 //   originally pulled via `psql ... TABLESAMPLE SYSTEM (2)` against the live table)
 #include "matching_engine.hpp"
@@ -56,6 +64,7 @@ struct sample_row {
     std::string symbol;
     int64_t trade_volume;
     double trade_price;
+    double narrow_metric;
 };
 
 std::set<uint64_t> search_row(matching_engine& engine, const sample_row& row) {
@@ -64,6 +73,7 @@ std::set<uint64_t> search_row(matching_engine& engine, const sample_row& row) {
     ev->with_string("symbol", row.symbol);
     ev->with_integer("trade_volume", row.trade_volume);
     ev->with_float("trade_price", row.trade_price);
+    ev->with_float("narrow_metric", row.narrow_metric);
     auto matched = engine.search(*ev);
     return std::set<uint64_t>(matched.begin(), matched.end());
 }
@@ -85,6 +95,7 @@ int main(int argc, char** argv) {
         {"symbol", attribute_type::string},
         {"trade_volume", attribute_type::integer},
         {"trade_price", attribute_type::float_val},
+        {"narrow_metric", attribute_type::float_val},
     };
 
     std::vector<std::pair<engine_type, const char*>> engines = {
@@ -117,13 +128,16 @@ int main(int argc, char** argv) {
     // trade_price were sampled independently (different rows), so this isn't one single real
     // row per exchange, but every individual value is real.
     std::vector<sample_row> rows = {
-        {"A", "ACCO", 100, 118.65}, {"B", "XOP", 70, 5.77}, {"C", "SVC", 100, 24.71},
-        {"D", "AXTI", 100, 22.1175}, {"G", "XRT", 100, 122.49}, {"H", "SQQQ", 100, 55.87},
-        {"J", "GDXJ", 17, 37.64}, {"K", "ZYME", 1, 46.68}, {"L", "MEC", 1, 150.26},
-        {"M", "EVO", 43, 13.25}, {"N", "XPO", 3, 63.73}, {"P", "LVRO", 10, 1.23},
-        {"Q", "KOPN", 33, 101.93}, {"T", "ZSL", 100, 118.48}, {"U", "MSTU", 400, 4.1},
-        {"V", "INFY", 500, 211.15}, {"X", "XPEV", 12, 90.13}, {"Y", "OKE", 13, 349.16},
-        {"Z", "DY", 4, 326.39},
+        {"A", "ACCO", 100, 118.65, 0.003}, {"B", "XOP", 70, 5.77, 0.00839},
+        {"C", "SVC", 100, 24.71, 0.009}, {"D", "AXTI", 100, 22.1175, 0.00594},
+        {"G", "XRT", 100, 122.49, -0.00106}, {"H", "SQQQ", 100, 55.87, -0.0047},
+        {"J", "GDXJ", 17, 37.64, 0.00366}, {"K", "ZYME", 1, 46.68, -0.00539},
+        {"L", "MEC", 1, 150.26, 0.00928}, {"M", "EVO", 43, 13.25, 0.00855},
+        {"N", "XPO", 3, 63.73, 0.00407}, {"P", "LVRO", 10, 1.23, -0.00424},
+        {"Q", "KOPN", 33, 101.93, 0.00702}, {"T", "ZSL", 100, 118.48, -0.00869},
+        {"U", "MSTU", 400, 4.1, 0.00715}, {"V", "INFY", 500, 211.15, -0.00234},
+        {"X", "XPEV", 12, 90.13, -0.00615}, {"Y", "OKE", 13, 349.16, -0.00698},
+        {"Z", "DY", 4, 326.39, -0.00632},
     };
     if (!rows_path.empty()) {
         rows.clear();
@@ -137,9 +151,12 @@ int main(int argc, char** argv) {
             if (comma2 == std::string::npos) continue;
             auto comma3 = line.find(',', comma2 + 1);
             if (comma3 == std::string::npos) continue;
+            auto comma4 = line.find(',', comma3 + 1);
+            if (comma4 == std::string::npos) continue;
             rows.push_back({line.substr(0, comma1), line.substr(comma1 + 1, comma2 - comma1 - 1),
                              std::stoll(line.substr(comma2 + 1, comma3 - comma2 - 1)),
-                             std::stod(line.substr(comma3 + 1))});
+                             std::stod(line.substr(comma3 + 1, comma4 - comma3 - 1)),
+                             std::stod(line.substr(comma4 + 1))});
         }
     }
 
@@ -151,10 +168,11 @@ int main(int argc, char** argv) {
         }
         bool all_equal = std::all_of(results.begin() + 1, results.end(),
                                       [&](const auto& s) { return s == results[0]; });
-        std::fprintf(stderr, "%s/%s/%lld/%.4f: atree=%zu betree=%zu pstree=%zu  %s\n",
+        std::fprintf(stderr, "%s/%s/%lld/%.4f/%.5f: atree=%zu betree=%zu pstree=%zu  %s\n",
                      row.exchange.c_str(), row.symbol.c_str(),
-                     static_cast<long long>(row.trade_volume), row.trade_price, results[0].size(),
-                     results[1].size(), results[2].size(), all_equal ? "AGREE" : "DISAGREE");
+                     static_cast<long long>(row.trade_volume), row.trade_price, row.narrow_metric,
+                     results[0].size(), results[1].size(), results[2].size(),
+                     all_equal ? "AGREE" : "DISAGREE");
         if (!all_equal) {
             ++disagreements;
             // Print a few ids present in one but not another.
