@@ -95,10 +95,7 @@ dnf_result to_dnf_bool_expr(const struct ast_bool_expr& b, bool negate) {
         case AST_BOOL_VARIABLE: {
             // A bare boolean identifier ("flag") means "flag = true"; negated, "flag =
             // false" - both directly representable as kEq, no need for kNe here.
-            pstree::SubPredicate pred;
-            pred.attr = b.variable.attr;
-            pred.op = pstree::CmpOp::kEq;
-            pred.vals = {pstree::Value(!negate)};
+            pstree::SubPredicate pred{b.variable.attr, pstree::CmpOp::kEq, {pstree::Value(!negate)}};
             return single_predicate(std::move(pred));
         }
         case AST_BOOL_LITERAL:
