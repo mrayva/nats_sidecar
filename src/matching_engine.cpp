@@ -39,27 +39,17 @@ constexpr double kBetreeFloatMax = 1e9;
 // single table's own distinct-symbol pool is in the thousands) with headroom, at zero extra cost.
 constexpr std::size_t kBetreeStringCount = 65536;
 
-// PS-Tree's own string encoding (order_key.hpp's StringCodec) is a FIXED-depth tree - one
-// inner-node level per character position, sized by this constant - not a variable-length
-// comparison like a-tree/be-tree's own string handling. A string longer than this is silently
-// TRUNCATED at encode time (bytes past this length never affect which predicate space it
-// falls into), so two distinct strings sharing this-many-byte prefix are indistinguishable to
-// pstree. Real, measured cost to setting this too generously: PSTree::matchPoint() walks this
-// many tree levels on every single lookup (a hashtable probe per level) regardless of the
-// actual string's length or whether any range predicate even exists on this attribute - `perf`
-// showed this walk dominating pstree's own search cost at moderate K once the (unrelated)
-// access-predicate selection bug was fixed (see PSTDynamic's own history) - for a workload with
-// only equality-style predicates (this project's own set-membership benchmarks), every level
-// past the real content is pure overhead with zero payoff. Was 128; the real NYSE symbol
-// universe this project actually queries (nyse_eqy_us_all_trade_20260102's own "Symbol" column)
-// tops out at 9 characters (verified directly against the live table), so 32 leaves >3x
-// headroom over any real value seen while recovering most of the available win (measured:
-// K=4000 search throughput 1.06M/s -> 1.75M/s, ~1.65x; K=32000 ~130k/s -> ~141k/s, ~1.09x -
-// smaller at high K since a different cost, matchValue's own comparison, dominates there
-// instead - see project memory). Still a real, structural truncation limit for any FUTURE
-// attribute value genuinely longer than 32 bytes, documented in README.md - raise it (the cost
-// scales linearly with the value, not exponentially) if a real schema ever needs that.
-constexpr std::size_t kPstreeStringMaxLen = 32;
+// PS-Tree's own string handling used to be a FIXED-depth, one-inner-node-level-per-character
+// tree (order_key.hpp's StringCodec), which silently TRUNCATED any string longer than a
+// configured bound and paid a real, measured per-comparison cost proportional to that bound
+// (this constant used to be 32, chosen specifically to bound that cost - see git history for
+// the full measurement). pstree now INTERNS string attribute values into small integer ids at
+// event-population/predicate-insert time instead (see pstree's own StringInternTable in
+// pst_dynamic.hpp for why that's correctness-safe here specifically: this project's shared
+// grammar, be-tree's parser.y, can never produce an ordering predicate against a string
+// attribute, and interning only needs to preserve equality/set-membership, not order) - both
+// the length-truncation limit and the per-comparison cost this constant used to bound are gone;
+// pstree::AttrSchema's stringMaxLen field is now unused (kept only for source compatibility).
 }
 
 namespace {
@@ -453,16 +443,19 @@ std::vector<pstree::AttrSchema> build_pstree_schema(const std::vector<attribute_
     for (const auto& attr : attributes) {
         switch (attr.type) {
             case attribute_type::boolean:
-                schema.push_back({attr.name, pstree::ValueType::kBoolean});
+                schema.push_back({attr.name, pstree::ValueType::kBoolean, 0, nullptr});
                 break;
             case attribute_type::integer:
-                schema.push_back({attr.name, pstree::ValueType::kInteger});
+                schema.push_back({attr.name, pstree::ValueType::kInteger, 0, nullptr});
                 break;
             case attribute_type::float_val:
-                schema.push_back({attr.name, pstree::ValueType::kFloat});
+                schema.push_back({attr.name, pstree::ValueType::kFloat, 0, nullptr});
                 break;
             case attribute_type::string:
-                schema.push_back({attr.name, pstree::ValueType::kString, kPstreeStringMaxLen});
+                // stringMaxLen/stringIntern (last two fields) are unused/ignored by pstree since
+                // string interning replaced StringCodec - see StringInternTable's own comment
+                // (pst_dynamic.hpp) and matching_engine.cpp's own comment above this function.
+                schema.push_back({attr.name, pstree::ValueType::kString, 0, nullptr});
                 break;
             case attribute_type::string_list:
             case attribute_type::integer_list:

@@ -13,10 +13,19 @@
 // string-sort bug and pstree's kElemOf/kNotElemOf linear-scan bug (see both repos' own commit
 // history) - kept here as a reusable tool for the next one, not a one-off.
 //
-// Usage: perf_search_loop <atree|betree|pstree> <expr_file> [seconds=10]
+// Usage: perf_search_loop <atree|betree|pstree> <expr_file> [seconds=10] [--int-attrs]
 //   perf record -F 999 --call-graph dwarf -o out.data -- \
 //       ./bin/perf_search_loop betree path/to/exprs.txt 15
 //   perf report -i out.data --stdio -g none | less
+//
+// --int-attrs (added 2026-08-30, for the string-vs-integer attribute matching-cost experiment):
+// swaps the exchange/symbol schema from string-typed to integer-typed (exchange_id/symbol_id),
+// matching nyse-matrix/translate_to_int_attrs.py's own output and sql/build_intattrs_lookup.sql's
+// surrogate keys - point this at a *_intattrs expr file, not a plain string one, or every
+// expression will fail to insert (undeclared exchange_id/symbol_id attributes vs. exchange/
+// symbol). See diag_int_attrs.cpp for the correctness bridge confirming a string file and its
+// translated int file are semantically identical before trusting any throughput delta measured
+// between them here.
 #include "matching_engine.hpp"
 #include "config.hpp"
 
@@ -45,12 +54,19 @@ std::vector<std::string> read_exprs(const std::string& path) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: perf_search_loop <atree|betree|pstree> <expr_file> [seconds=10]\n");
+        std::fprintf(stderr, "usage: perf_search_loop <atree|betree|pstree> <expr_file> "
+                              "[seconds=10] [--int-attrs]\n");
         return 2;
     }
     std::string engine_name = argv[1];
     std::string expr_path = argv[2];
-    int seconds = argc > 3 ? std::atoi(argv[3]) : 10;
+    int seconds = 10;
+    bool int_attrs = false;
+    for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--int-attrs") int_attrs = true;
+        else seconds = std::atoi(argv[i]);
+    }
 
     engine_type type;
     if (engine_name == "atree") type = engine_type::atree;
@@ -62,8 +78,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loaded %zu expressions from %s\n", exprs.size(), expr_path.c_str());
 
     std::vector<attribute_def> attrs = {
-        {"exchange", attribute_type::string},
-        {"symbol", attribute_type::string},
+        int_attrs ? attribute_def{"exchange_id", attribute_type::integer}
+                  : attribute_def{"exchange", attribute_type::string},
+        int_attrs ? attribute_def{"symbol_id", attribute_type::integer}
+                  : attribute_def{"symbol", attribute_type::string},
         {"trade_volume", attribute_type::integer},
         {"trade_price", attribute_type::float_val},
         {"narrow_metric", attribute_type::float_val},
@@ -95,24 +113,31 @@ int main(int argc, char** argv) {
     // own narrow_metric and run_cycle_blindspot.sh's publish SQL, so this file's own literal
     // values stay real/deterministic (not made up) despite the underlying attribute itself
     // being synthetic - see those files' own comments for why.
+    // exchange_id/symbol_id (added 2026-08-30, string-vs-integer attribute matching-cost
+    // experiment) are this same symbol set's real surrogate keys from exchange_lookup/
+    // symbol_lookup - see sql/build_intattrs_lookup.sql - fetched directly via psql, not
+    // invented, so --int-attrs exercises the identical real entities as the string path, just
+    // referenced by integer id instead of by name.
     struct sample_row {
         std::string exchange;
         std::string symbol;
+        int64_t exchange_id;
+        int64_t symbol_id;
         int64_t trade_volume;
         double trade_price;
         double narrow_metric;
     };
     std::vector<sample_row> rows = {
-        {"A", "AKAN", 100, 118.65, 0.00176}, {"B", "ZTS", 70, 5.77, -0.00609},
-        {"C", "IWM", 100, 24.71, -0.0009}, {"D", "USB", 100, 22.1175, -0.00114},
-        {"G", "MDLZ", 100, 122.49, -0.00196}, {"H", "NVDA", 100, 55.87, 0.00495},
-        {"J", "IAU", 17, 37.64, -0.00384}, {"K", "SOXL", 1, 46.68, -0.00205},
-        {"L", "ANIP", 1, 150.26, -0.00675}, {"M", "ZTS", 43, 13.25, -0.00609},
-        {"N", "ET", 3, 63.73, -0.00869}, {"P", "UNH", 10, 1.23, -0.00257},
-        {"Q", "MRVL", 33, 101.93, 0.0006}, {"T", "NYT", 100, 118.48, -0.00366},
-        {"U", "BBAI", 400, 4.1, -0.00677}, {"V", "TREX", 500, 211.15, -0.00214},
-        {"X", "IREN", 12, 90.13, 0.00053}, {"Y", "ZURA", 13, 349.16, 0.00895},
-        {"Z", "FLNC", 4, 326.39, -0.00965},
+        {"A", "AKAN", 1, 366, 100, 118.65, 0.00176}, {"B", "ZTS", 2, 11937, 70, 5.77, -0.00609},
+        {"C", "IWM", 3, 5708, 100, 24.71, -0.0009}, {"D", "USB", 4, 10957, 100, 22.1175, -0.00114},
+        {"G", "MDLZ", 5, 6700, 100, 122.49, -0.00196}, {"H", "NVDA", 6, 7597, 100, 55.87, 0.00495},
+        {"J", "IAU", 7, 5186, 17, 37.64, -0.00384}, {"K", "SOXL", 8, 9865, 1, 46.68, -0.00205},
+        {"L", "ANIP", 9, 535, 1, 150.26, -0.00675}, {"M", "ZTS", 10, 11937, 43, 13.25, -0.00609},
+        {"N", "ET", 11, 3485, 3, 63.73, -0.00869}, {"P", "UNH", 12, 10902, 10, 1.23, -0.00257},
+        {"Q", "MRVL", 13, 7007, 33, 101.93, 0.0006}, {"T", "NYT", 14, 7677, 100, 118.48, -0.00366},
+        {"U", "BBAI", 15, 1010, 400, 4.1, -0.00677}, {"V", "TREX", 16, 10611, 500, 211.15, -0.00214},
+        {"X", "IREN", 17, 5598, 12, 90.13, 0.00053}, {"Y", "ZURA", 18, 11941, 13, 349.16, 0.00895},
+        {"Z", "FLNC", 19, 3970, 4, 326.39, -0.00965},
     };
 
     // reuses_events()==true for all three engines - one event_sink object reused across every
@@ -131,8 +156,13 @@ int main(int argc, char** argv) {
     std::size_t row_idx = 0;
     while (std::chrono::steady_clock::now() < deadline) {
         auto& row = rows[row_idx];
-        event->with_string("exchange", row.exchange);
-        event->with_string("symbol", row.symbol);
+        if (int_attrs) {
+            event->with_integer("exchange_id", row.exchange_id);
+            event->with_integer("symbol_id", row.symbol_id);
+        } else {
+            event->with_string("exchange", row.exchange);
+            event->with_string("symbol", row.symbol);
+        }
         event->with_integer("trade_volume", row.trade_volume);
         event->with_float("trade_price", row.trade_price);
         event->with_float("narrow_metric", row.narrow_metric);

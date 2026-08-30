@@ -279,4 +279,12 @@ if(SIDECAR_BUILD_BENCHMARKS)
     set_target_properties(diag_list_attr PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+
+    # Correctness bridge for the string-vs-integer attribute matching-cost experiment - see the
+    # .cpp's own comment and nyse-matrix/translate_to_int_attrs.py.
+    add_executable(diag_int_attrs benchmarks/diag_int_attrs.cpp)
+    target_link_libraries(diag_int_attrs PRIVATE sidecar_lib)
+    set_target_properties(diag_int_attrs PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
 endif()
