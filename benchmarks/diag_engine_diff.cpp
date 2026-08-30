@@ -19,7 +19,12 @@
 // subscriptions) across all three engines, not just the atree-only manual smoke test that
 // exercised it first.
 //
-// Usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol,trade_volume per line]
+// trade_price (added 2026-08-30, alongside gen_set_membership_subs.py's own --price-fraction):
+// same idea as trade_volume, against the real "Trade Price" column - a FLOAT attribute, so this
+// also validates the double-precision comparison path (vs. trade_volume's int64_t one) across
+// all three engines.
+//
+// Usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol,trade_volume,trade_price per line]
 //   (rows_file optional - defaults to a real 19-row sample, one per NYSE exchange letter,
 //   originally pulled via `psql ... TABLESAMPLE SYSTEM (2)` against the live table)
 #include "matching_engine.hpp"
@@ -50,6 +55,7 @@ struct sample_row {
     std::string exchange;
     std::string symbol;
     int64_t trade_volume;
+    double trade_price;
 };
 
 std::set<uint64_t> search_row(matching_engine& engine, const sample_row& row) {
@@ -57,6 +63,7 @@ std::set<uint64_t> search_row(matching_engine& engine, const sample_row& row) {
     ev->with_string("exchange", row.exchange);
     ev->with_string("symbol", row.symbol);
     ev->with_integer("trade_volume", row.trade_volume);
+    ev->with_float("trade_price", row.trade_price);
     auto matched = engine.search(*ev);
     return std::set<uint64_t>(matched.begin(), matched.end());
 }
@@ -67,7 +74,7 @@ int main(int argc, char** argv) {
     std::string expr_path = argc > 1 ? argv[1] : "";
     std::string rows_path = argc > 2 ? argv[2] : "";
     if (expr_path.empty()) {
-        std::fprintf(stderr, "usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol,trade_volume per line]\n");
+        std::fprintf(stderr, "usage: diag_engine_diff <expr_file> [rows_file: exchange,symbol,trade_volume,trade_price per line]\n");
         return 2;
     }
     auto exprs = read_exprs(expr_path);
@@ -77,6 +84,7 @@ int main(int argc, char** argv) {
         {"exchange", attribute_type::string},
         {"symbol", attribute_type::string},
         {"trade_volume", attribute_type::integer},
+        {"trade_price", attribute_type::float_val},
     };
 
     std::vector<std::pair<engine_type, const char*>> engines = {
@@ -104,14 +112,18 @@ int main(int argc, char** argv) {
         trees.push_back(std::move(tree));
     }
 
-    // Real (exchange, symbol, trade_volume) triples sampled directly from the actual published
-    // table (one per real distinct exchange letter).
+    // Real (exchange, symbol, trade_volume, trade_price) quadruples sampled directly from the
+    // actual published table (one per real distinct exchange letter) - trade_volume and
+    // trade_price were sampled independently (different rows), so this isn't one single real
+    // row per exchange, but every individual value is real.
     std::vector<sample_row> rows = {
-        {"A", "ACCO", 100}, {"B", "XOP", 70}, {"C", "SVC", 100}, {"D", "AXTI", 100},
-        {"G", "XRT", 100}, {"H", "SQQQ", 100}, {"J", "GDXJ", 17}, {"K", "ZYME", 1},
-        {"L", "MEC", 1}, {"M", "EVO", 43}, {"N", "XPO", 3}, {"P", "LVRO", 10},
-        {"Q", "KOPN", 33}, {"T", "ZSL", 100}, {"U", "MSTU", 400}, {"V", "INFY", 500},
-        {"X", "XPEV", 12}, {"Y", "OKE", 13}, {"Z", "DY", 4},
+        {"A", "ACCO", 100, 118.65}, {"B", "XOP", 70, 5.77}, {"C", "SVC", 100, 24.71},
+        {"D", "AXTI", 100, 22.1175}, {"G", "XRT", 100, 122.49}, {"H", "SQQQ", 100, 55.87},
+        {"J", "GDXJ", 17, 37.64}, {"K", "ZYME", 1, 46.68}, {"L", "MEC", 1, 150.26},
+        {"M", "EVO", 43, 13.25}, {"N", "XPO", 3, 63.73}, {"P", "LVRO", 10, 1.23},
+        {"Q", "KOPN", 33, 101.93}, {"T", "ZSL", 100, 118.48}, {"U", "MSTU", 400, 4.1},
+        {"V", "INFY", 500, 211.15}, {"X", "XPEV", 12, 90.13}, {"Y", "OKE", 13, 349.16},
+        {"Z", "DY", 4, 326.39},
     };
     if (!rows_path.empty()) {
         rows.clear();
@@ -123,8 +135,11 @@ int main(int argc, char** argv) {
             if (comma1 == std::string::npos) continue;
             auto comma2 = line.find(',', comma1 + 1);
             if (comma2 == std::string::npos) continue;
+            auto comma3 = line.find(',', comma2 + 1);
+            if (comma3 == std::string::npos) continue;
             rows.push_back({line.substr(0, comma1), line.substr(comma1 + 1, comma2 - comma1 - 1),
-                             std::stoll(line.substr(comma2 + 1))});
+                             std::stoll(line.substr(comma2 + 1, comma3 - comma2 - 1)),
+                             std::stod(line.substr(comma3 + 1))});
         }
     }
 
@@ -136,9 +151,9 @@ int main(int argc, char** argv) {
         }
         bool all_equal = std::all_of(results.begin() + 1, results.end(),
                                       [&](const auto& s) { return s == results[0]; });
-        std::fprintf(stderr, "%s/%s/%lld: atree=%zu betree=%zu pstree=%zu  %s\n",
+        std::fprintf(stderr, "%s/%s/%lld/%.4f: atree=%zu betree=%zu pstree=%zu  %s\n",
                      row.exchange.c_str(), row.symbol.c_str(),
-                     static_cast<long long>(row.trade_volume), results[0].size(),
+                     static_cast<long long>(row.trade_volume), row.trade_price, results[0].size(),
                      results[1].size(), results[2].size(), all_equal ? "AGREE" : "DISAGREE");
         if (!all_equal) {
             ++disagreements;

@@ -65,6 +65,7 @@ int main(int argc, char** argv) {
         {"exchange", attribute_type::string},
         {"symbol", attribute_type::string},
         {"trade_volume", attribute_type::integer},
+        {"trade_price", attribute_type::float_val},
     };
 
     auto build_start = std::chrono::steady_clock::now();
@@ -85,20 +86,24 @@ int main(int argc, char** argv) {
                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                      build_end - build_start).count()));
 
-    // Real (exchange, symbol, trade_volume) triples sampled directly from the actual published
-    // table (one per real distinct exchange letter) - same exchange/symbol set used by the
-    // earlier differential check, trade_volume values from diag_engine_diff's own real sample.
+    // Real (exchange, symbol, trade_volume, trade_price) rows sampled directly from the actual
+    // published table (one per real distinct exchange letter) - same exchange/symbol set used
+    // by the earlier differential check, trade_volume/trade_price values from diag_engine_diff's
+    // own real sample.
     struct sample_row {
         std::string exchange;
         std::string symbol;
         int64_t trade_volume;
+        double trade_price;
     };
     std::vector<sample_row> rows = {
-        {"A", "AKAN", 100}, {"B", "ZTS", 70}, {"C", "IWM", 100}, {"D", "USB", 100},
-        {"G", "MDLZ", 100}, {"H", "NVDA", 100}, {"J", "IAU", 17}, {"K", "SOXL", 1},
-        {"L", "ANIP", 1}, {"M", "ZTS", 43}, {"N", "ET", 3}, {"P", "UNH", 10},
-        {"Q", "MRVL", 33}, {"T", "NYT", 100}, {"U", "BBAI", 400}, {"V", "TREX", 500},
-        {"X", "IREN", 12}, {"Y", "ZURA", 13}, {"Z", "FLNC", 4},
+        {"A", "AKAN", 100, 118.65}, {"B", "ZTS", 70, 5.77}, {"C", "IWM", 100, 24.71},
+        {"D", "USB", 100, 22.1175}, {"G", "MDLZ", 100, 122.49}, {"H", "NVDA", 100, 55.87},
+        {"J", "IAU", 17, 37.64}, {"K", "SOXL", 1, 46.68}, {"L", "ANIP", 1, 150.26},
+        {"M", "ZTS", 43, 13.25}, {"N", "ET", 3, 63.73}, {"P", "UNH", 10, 1.23},
+        {"Q", "MRVL", 33, 101.93}, {"T", "NYT", 100, 118.48}, {"U", "BBAI", 400, 4.1},
+        {"V", "TREX", 500, 211.15}, {"X", "IREN", 12, 90.13}, {"Y", "ZURA", 13, 349.16},
+        {"Z", "FLNC", 4, 326.39},
     };
 
     // reuses_events()==true for all three engines - one event_sink object reused across every
@@ -120,6 +125,7 @@ int main(int argc, char** argv) {
         event->with_string("exchange", row.exchange);
         event->with_string("symbol", row.symbol);
         event->with_integer("trade_volume", row.trade_volume);
+        event->with_float("trade_price", row.trade_price);
         auto matched = tree->search(*event);
         total_matches += matched.size();
         row_idx = (row_idx + 1) % rows.size();
