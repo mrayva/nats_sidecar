@@ -1,5 +1,6 @@
 #include "subscription_registry.hpp"
 #include <nlohmann/json.hpp>
+#include <unistd.h>
 #include <algorithm>
 #include <cstdio>
 #include <string_view>
@@ -170,6 +171,14 @@ asio::awaitable<std::pair<uint64_t, nats_asio::status>> subscription_registry::r
         co_return std::pair<uint64_t, nats_asio::status>{0, create_status};
     }
 
+    // DIAGNOSTIC (temporary, added while chasing a real cross-talk bug found
+    // 2026-08-29 - see the "hash collision" branch below): log the raw
+    // create-status error text too, in case kv_create_impl's substring-based
+    // already_exists classification is itself occasionally misfiring on an
+    // unrelated server error.
+    m_log->info("subscription_registry: [diag] create already_exists for '{}' key={} raw_error='{}'",
+                expression, key, create_status.error());
+
     // Someone else already registered this expression - adopt their id.
     // Nothing ever writes to this key again after its one creation (entries
     // are permanent), so its revision is still exactly the winning create's
@@ -186,12 +195,31 @@ asio::awaitable<std::pair<uint64_t, nats_asio::status>> subscription_registry::r
             std::string_view(entry.value.data(), entry.value.size()));
         const auto existing_expression = existing.at("expression").get<std::string>();
         if (existing_expression != expression) {
-            // Astronomically unlikely at 64 bits for realistic subscription
-            // counts, but must be a hard error, never a silent misroute of
-            // one client's filter to another's output topic.
+            // DIAGNOSTIC (temporary): before treating this as a real
+            // collision, immediately re-read the same key a second time.
+            // If the second read comes back correct, that's strong evidence
+            // of a transport-level misdelivered reply (a stale/duplicate
+            // response for a different concurrent request landing here)
+            // rather than genuine data corruption in the KV store itself -
+            // narrows which layer (nats_asio's request/reply plumbing vs.
+            // real storage corruption) is actually at fault.
+            auto [retry_entry, retry_status] = co_await m_conn->kv_get(m_bucket, key, timeout);
+            std::string retry_expression = "<retry-failed>";
+            if (!retry_status.failed()) {
+                try {
+                    auto retry_json = nlohmann::json::parse(std::string_view(
+                        retry_entry.value.data(), retry_entry.value.size()));
+                    retry_expression = retry_json.at("expression").get<std::string>();
+                } catch (const std::exception& e) {
+                    retry_expression = std::string("<retry-parse-failed: ") + e.what() + ">";
+                }
+            }
             m_log->error(
-                "subscription_registry: hash collision on key '{}' - '{}' vs existing '{}'",
-                key, expression, existing_expression);
+                "subscription_registry: [diag] hash collision on key '{}' - new='{}' "
+                "first_read(rev={})='{}' retry_read(rev={})='{}' self_healed={} pid={}",
+                key, expression, entry.revision, existing_expression, retry_entry.revision,
+                retry_expression, retry_expression == expression,
+                static_cast<long long>(getpid()));
             co_return std::pair<uint64_t, nats_asio::status>{
                 0, nats_asio::status(nats_asio::error_code::operation_failed)};
         }
