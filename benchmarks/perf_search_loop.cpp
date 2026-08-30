@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
     std::vector<attribute_def> attrs = {
         {"exchange", attribute_type::string},
         {"symbol", attribute_type::string},
+        {"trade_volume", attribute_type::integer},
     };
 
     auto build_start = std::chrono::steady_clock::now();
@@ -84,13 +85,20 @@ int main(int argc, char** argv) {
                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                      build_end - build_start).count()));
 
-    // Real (exchange, symbol) pairs sampled directly from the actual published table (one per
-    // real distinct exchange letter) - same set used by the earlier differential check.
-    std::vector<std::pair<std::string, std::string>> rows = {
-        {"A", "AKAN"}, {"B", "ZTS"}, {"C", "IWM"}, {"D", "USB"}, {"G", "MDLZ"},
-        {"H", "NVDA"}, {"J", "IAU"}, {"K", "SOXL"}, {"L", "ANIP"}, {"M", "ZTS"},
-        {"N", "ET"}, {"P", "UNH"}, {"Q", "MRVL"}, {"T", "NYT"}, {"U", "BBAI"},
-        {"V", "TREX"}, {"X", "IREN"}, {"Y", "ZURA"}, {"Z", "FLNC"},
+    // Real (exchange, symbol, trade_volume) triples sampled directly from the actual published
+    // table (one per real distinct exchange letter) - same exchange/symbol set used by the
+    // earlier differential check, trade_volume values from diag_engine_diff's own real sample.
+    struct sample_row {
+        std::string exchange;
+        std::string symbol;
+        int64_t trade_volume;
+    };
+    std::vector<sample_row> rows = {
+        {"A", "AKAN", 100}, {"B", "ZTS", 70}, {"C", "IWM", 100}, {"D", "USB", 100},
+        {"G", "MDLZ", 100}, {"H", "NVDA", 100}, {"J", "IAU", 17}, {"K", "SOXL", 1},
+        {"L", "ANIP", 1}, {"M", "ZTS", 43}, {"N", "ET", 3}, {"P", "UNH", 10},
+        {"Q", "MRVL", 33}, {"T", "NYT", 100}, {"U", "BBAI", 400}, {"V", "TREX", 500},
+        {"X", "IREN", 12}, {"Y", "ZURA", 13}, {"Z", "FLNC", 4},
     };
 
     // reuses_events()==true for all three engines - one event_sink object reused across every
@@ -108,9 +116,10 @@ int main(int argc, char** argv) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     std::size_t row_idx = 0;
     while (std::chrono::steady_clock::now() < deadline) {
-        auto& [exch, sym] = rows[row_idx];
-        event->with_string("exchange", exch);
-        event->with_string("symbol", sym);
+        auto& row = rows[row_idx];
+        event->with_string("exchange", row.exchange);
+        event->with_string("symbol", row.symbol);
+        event->with_integer("trade_volume", row.trade_volume);
         auto matched = tree->search(*event);
         total_matches += matched.size();
         row_idx = (row_idx + 1) % rows.size();
