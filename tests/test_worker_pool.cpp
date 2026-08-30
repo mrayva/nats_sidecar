@@ -308,6 +308,54 @@ TEST(worker_pool, publish_flushes_in_bounded_chunks_when_fan_out_is_large) {
     }
 }
 
+TEST(worker_pool, publish_bytes_backpressure_drops_when_estimated_size_exceeds_cap) {
+    // Guards against the follow-up half of the same 2026-08-29 bug: bounding
+    // one task's own buffer (publish_chunk_bytes) doesn't bound the
+    // AGGREGATE across many concurrently in-flight tasks - up to
+    // publish_max_inflight * publish_chunk_bytes could still accumulate, and
+    // in a real re-run RIGHT AFTER the chunking fix, RSS climbed toward
+    // multiple GB/instance again before it was caught. publish_max_inflight_
+    // bytes reserves each task's upfront estimated size against an
+    // aggregate cap before it's even spawned - here the cap is small enough
+    // that a single small match's own estimate already exceeds it, so the
+    // task must be dropped before ever calling write_raw, exactly like the
+    // existing publish_max_inflight task-count cap already does.
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    cfg.publish_max_inflight_bytes = 10;
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::atomic<int> write_raw_calls{0};
+    conn->on_write_raw = [&](std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        write_raw_calls.fetch_add(1);
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(42)));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().processed > 0; }, std::chrono::seconds(2)));
+    // No publish work should ever be posted once the byte cap rejects it;
+    // give the (absent) publish coroutine a moment it can't use.
+    ioc.restart();
+    ioc.run_for(std::chrono::milliseconds(50));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.matched, 1u);
+    EXPECT_EQ(stats.published, 0u);
+    EXPECT_EQ(stats.publish_tasks_dropped, 1u);
+    EXPECT_EQ(stats.publish_inflight, 0u);
+    EXPECT_EQ(stats.publish_inflight_bytes, 0u);
+    EXPECT_EQ(write_raw_calls.load(), 0)
+        << "the estimated-size byte cap must reject the task before it ever writes";
+}
+
 // --- Columnar batches (enqueue(..., columnar=true)) ---
 
 TEST(worker_pool, columnar_batch_matches_each_row_independently_and_writes_once) {

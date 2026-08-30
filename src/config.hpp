@@ -187,11 +187,22 @@ struct config {
 
     // Max bytes worker_pool accumulates before flushing a partial publish
     // wire buffer (see worker_pool.cpp's publish coroutine) - bounds peak
-    // per-task memory to this regardless of how many subscriptions a
+    // PER-TASK memory to this regardless of how many subscriptions a
     // message's rows collectively match (a real bug found 2026-08-29: an
     // unbounded combined buffer, one full payload copy per match, hit 3GB+
     // RSS per instance under a high-fan-out workload).
     std::size_t publish_chunk_bytes = 4ULL * 1024 * 1024;
+
+    // Max AGGREGATE bytes reserved across every currently in-flight publish
+    // task at once (an upfront estimate per task, released when it
+    // completes) - publish_max_inflight alone only bounds task *count*, and
+    // publish_chunk_bytes alone only bounds one task's own buffer, so up to
+    // publish_max_inflight * publish_chunk_bytes could still accumulate
+    // (observed climbing toward multiple GB/instance, a real near-miss found
+    // 2026-08-29 right after the chunking fix above). Same
+    // "count AND bytes" pattern input_queue_max_messages/
+    // input_queue_max_bytes already use.
+    std::size_t publish_max_inflight_bytes = 64ULL * 1024 * 1024;
 
     // Returns `connections` verbatim if non-empty; otherwise synthesizes
     // exactly one connection (name "default", mode "js" if input_stream is

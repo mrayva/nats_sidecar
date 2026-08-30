@@ -47,6 +47,7 @@ public:
         std::size_t queue_depth = 0;
         std::size_t queue_bytes = 0;
         std::size_t publish_inflight = 0;
+        std::size_t publish_inflight_bytes = 0;
         // Wall-clock time spent inside matching_engine::search() alone (not
         // deserialize/populate), summed across every message that actually
         // reached search. match_time_count is the number of such messages -
@@ -108,6 +109,12 @@ private:
         std::atomic<uint64_t> published{0};
         std::atomic<uint64_t> publish_failures{0};
         std::atomic<std::size_t> publish_inflight{0};
+        // Sum of each in-flight task's own upfront estimated wire size (see
+        // estimate_pub_bytes() in worker_pool.cpp) - reserved before a task
+        // is spawned, released when it completes, bounding aggregate
+        // publish memory regardless of how many tasks are concurrently
+        // in flight (publish_max_inflight alone only bounds their count).
+        std::atomic<std::size_t> publish_inflight_bytes{0};
     };
 
     void worker_loop(unsigned int worker_id);
@@ -159,6 +166,7 @@ private:
     std::size_t m_publish_max_inflight;
     std::chrono::milliseconds m_publish_backpressure_timeout;
     std::size_t m_publish_chunk_bytes;
+    std::size_t m_publish_max_inflight_bytes;
 
     moodycamel::BlockingConcurrentQueue<queued_message> m_queue;
     std::vector<std::thread> m_threads;

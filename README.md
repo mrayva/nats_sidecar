@@ -170,11 +170,17 @@ input_queue_max_bytes: 67108864
 publish_max_inflight: 1024
 publish_backpressure_timeout_ms: 5000
 # Max bytes buffered before flushing a partial publish write - bounds peak
-# per-task memory to this regardless of how many subscriptions a message's
+# PER-TASK memory to this regardless of how many subscriptions a message's
 # rows collectively match (a wide-range predicate shared by many
 # subscriptions, or large columnar batches, can otherwise push one task's
 # combined buffer into the hundreds of MB without this cap).
 publish_chunk_bytes: 4194304
+# Max AGGREGATE bytes reserved across every currently in-flight publish task
+# at once - publish_max_inflight alone only bounds task *count*, and
+# publish_chunk_bytes alone only bounds one task's own buffer, so without
+# this, up to publish_max_inflight * publish_chunk_bytes could still
+# accumulate under sustained high match fan-out.
+publish_max_inflight_bytes: 67108864
 ```
 
 ### Multiple input connections

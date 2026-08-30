@@ -52,7 +52,8 @@ worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
       m_queue_max_bytes(cfg.input_queue_max_bytes),
       m_publish_max_inflight(cfg.publish_max_inflight),
       m_publish_backpressure_timeout(cfg.publish_backpressure_timeout_ms),
-      m_publish_chunk_bytes(cfg.publish_chunk_bytes)
+      m_publish_chunk_bytes(cfg.publish_chunk_bytes),
+      m_publish_max_inflight_bytes(cfg.publish_max_inflight_bytes)
 {
     if (m_thread_count == 0) m_thread_count = 1;
 }
@@ -166,6 +167,7 @@ worker_pool::stats worker_pool::get_stats() const {
         m_queued_messages.load(std::memory_order_relaxed),
         m_queued_bytes.load(std::memory_order_relaxed),
         m_publish_counters->publish_inflight.load(std::memory_order_relaxed),
+        m_publish_counters->publish_inflight_bytes.load(std::memory_order_relaxed),
         m_match_time_ns_total.load(std::memory_order_relaxed),
         m_match_time_count.load(std::memory_order_relaxed)
     };
@@ -278,16 +280,39 @@ void worker_pool::worker_loop(unsigned int worker_id) {
 
         m_matched.fetch_add(row_matches->size(), std::memory_order_relaxed);
 
+        // Upfront estimate of this message's total publish wire size (same
+        // per-frame estimate build_pub_frames() itself uses), reserved
+        // against publish_inflight_bytes BEFORE any buffer is actually
+        // built. publish_max_inflight alone only bounds the number of
+        // concurrent publish tasks - each one could still independently
+        // grow toward publish_chunk_bytes before ever checking connection
+        // backpressure, so up to publish_max_inflight * publish_chunk_bytes
+        // could accumulate with no aggregate cap (a real near-miss found
+        // 2026-08-29, right after the chunking fix: RSS climbed toward
+        // multiple GB/instance under sustained high fan-out). Reserving the
+        // estimate here, before the task is even spawned, bounds aggregate
+        // outstanding publish memory the same way input_queue_max_bytes
+        // already bounds aggregate input memory.
+        std::size_t estimated_bytes = 0;
+        for (const auto& rm : *row_matches) {
+            estimated_bytes += rm.matched_ids.size() * (rm.payload.size() + 64);
+        }
+
         const auto previous_inflight = m_publish_counters->publish_inflight.fetch_add(
             1, std::memory_order_acq_rel);
-        if (previous_inflight >= m_publish_max_inflight) {
+        const auto previous_inflight_bytes = m_publish_counters->publish_inflight_bytes.fetch_add(
+            estimated_bytes, std::memory_order_acq_rel);
+        if (previous_inflight >= m_publish_max_inflight ||
+            previous_inflight_bytes + estimated_bytes > m_publish_max_inflight_bytes) {
             m_publish_counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
+            m_publish_counters->publish_inflight_bytes.fetch_sub(
+                estimated_bytes, std::memory_order_acq_rel);
             m_publish_tasks_dropped.fetch_add(1, std::memory_order_relaxed);
-            // Backpressure at the inflight-publish-task limit: leave any
-            // js_msg unacked (do not ack, do not term) so ack_wait triggers
-            // real redelivery once there's room - this is the actual
-            // mechanism that closes the loss gap plain queue-group mode
-            // had no equivalent of.
+            // Backpressure at the inflight-publish-task/byte limit: leave
+            // any js_msg unacked (do not ack, do not term) so ack_wait
+            // triggers real redelivery once there's room - this is the
+            // actual mechanism that closes the loss gap plain queue-group
+            // mode had no equivalent of.
             qm.payload.clear();
             continue;
         }
@@ -325,6 +350,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         auto counters = m_publish_counters;
         auto backpressure_timeout = m_publish_backpressure_timeout;
         auto chunk_bytes = m_publish_chunk_bytes;
+        auto reserved_bytes = estimated_bytes;
         auto js_sub = qm.js_sub;
         auto js_msg = std::move(qm.js_msg);
 
@@ -337,6 +363,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
              counters,
              backpressure_timeout,
              chunk_bytes,
+             reserved_bytes,
              js_sub = std::move(js_sub),
              js_msg = std::move(js_msg)]() mutable -> asio::awaitable<void> {
                 bool publish_ok = false;
@@ -414,6 +441,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                     log->error("Publication task failed: {}", e.what());
                 }
                 counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
+                counters->publish_inflight_bytes.fetch_sub(reserved_bytes, std::memory_order_acq_rel);
 
                 // Ack only after a successful write (or a no-op that wasn't
                 // a failure) - a write failure leaves the message unacked,
