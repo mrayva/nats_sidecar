@@ -248,6 +248,7 @@ config load_config(const std::string& path) {
     if (auto n = root["publish_backpressure_timeout_ms"]) {
         cfg.publish_backpressure_timeout_ms = n.as<uint32_t>();
     }
+    if (auto n = root["publish_chunk_bytes"])      cfg.publish_chunk_bytes = n.as<std::size_t>();
 
     return cfg;
 }

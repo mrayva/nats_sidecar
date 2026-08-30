@@ -8,6 +8,19 @@
 
 namespace sidecar {
 
+namespace {
+void append_pub_frame(std::string& wire, const std::string& subject,
+                      std::span<const char> payload) {
+    wire += "PUB ";
+    wire += subject;
+    wire += " ";
+    wire += std::to_string(payload.size());
+    wire += "\r\n";
+    wire.append(payload.data(), payload.size());
+    wire += "\r\n";
+}
+} // namespace
+
 pub_frames build_pub_frames(const std::vector<uint64_t>& matched_ids,
                             const std::unordered_map<uint64_t, std::string>& output_subjects,
                             std::span<const char> payload) {
@@ -20,13 +33,7 @@ pub_frames build_pub_frames(const std::vector<uint64_t>& matched_ids,
     for (uint64_t sub_id : matched_ids) {
         auto subj_it = output_subjects.find(sub_id);
         if (subj_it == output_subjects.end()) continue;
-        frames.wire += "PUB ";
-        frames.wire += subj_it->second;
-        frames.wire += " ";
-        frames.wire += std::to_string(payload.size());
-        frames.wire += "\r\n";
-        frames.wire.append(payload.data(), payload.size());
-        frames.wire += "\r\n";
+        append_pub_frame(frames.wire, subj_it->second, payload);
         ++frames.count;
     }
     return frames;
@@ -44,7 +51,8 @@ worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
       m_queue_max_messages(cfg.input_queue_max_messages),
       m_queue_max_bytes(cfg.input_queue_max_bytes),
       m_publish_max_inflight(cfg.publish_max_inflight),
-      m_publish_backpressure_timeout(cfg.publish_backpressure_timeout_ms)
+      m_publish_backpressure_timeout(cfg.publish_backpressure_timeout_ms),
+      m_publish_chunk_bytes(cfg.publish_chunk_bytes)
 {
     if (m_thread_count == 0) m_thread_count = 1;
 }
@@ -316,6 +324,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         auto log = m_log;
         auto counters = m_publish_counters;
         auto backpressure_timeout = m_publish_backpressure_timeout;
+        auto chunk_bytes = m_publish_chunk_bytes;
         auto js_sub = qm.js_sub;
         auto js_msg = std::move(qm.js_msg);
 
@@ -327,25 +336,35 @@ void worker_pool::worker_loop(unsigned int worker_id) {
              log,
              counters,
              backpressure_timeout,
+             chunk_bytes,
              js_sub = std::move(js_sub),
              js_msg = std::move(js_msg)]() mutable -> asio::awaitable<void> {
                 bool publish_ok = false;
                 try {
-                    // One combined wire buffer for every row's frames -
-                    // exactly one write_raw() below regardless of how many
-                    // rows matched, preserving the existing one-write/one-
-                    // backpressure-check/one-ack-or-term-per-input-message
-                    // invariant whether this message represented 1 row
-                    // (today) or N rows (columnar).
-                    pub_frames frames;
-                    for (const auto& rm : matches_to_publish) {
-                        auto row_frames = build_pub_frames(
-                            rm.matched_ids, output_subjects,
-                            std::span<const char>(rm.payload.data(), rm.payload.size()));
-                        frames.wire += row_frames.wire;
-                        frames.count += row_frames.count;
-                    }
-                    if (!frames.wire.empty()) {
+                    // Flush in bounded-size chunks (config: publish_chunk_bytes,
+                    // default 4MB) rather than building one combined wire
+                    // buffer for every row's frames before a single
+                    // write_raw() - a real bug found 2026-08-29: each matched
+                    // subscription gets its own full copy of the row's
+                    // payload, so a batch (columnar: up to hundreds of rows)
+                    // whose rows collectively match thousands of
+                    // subscriptions (e.g. a wide-range predicate a large
+                    // fraction of subscriptions share) built an unbounded
+                    // buffer - observed at 3GB+ RSS per instance, independent
+                    // of matching engine, under exactly that workload shape.
+                    // Chunking bounds peak memory to O(chunk_bytes) regardless
+                    // of match fan-out while writing everything (no data
+                    // loss) and preserving the existing "ack only after
+                    // every write for this message succeeded" ordering -
+                    // just via several co_await write_raw() calls instead of
+                    // one when a message's fan-out is large.
+                    std::string wire;
+                    std::size_t chunk_count = 0;
+                    std::size_t total_published = 0;
+                    bool write_failed = false;
+
+                    auto flush_chunk = [&]() -> asio::awaitable<bool> {
+                        if (wire.empty()) co_return true;
                         if (conn->is_backpressure_active()) {
                             auto drain_status = co_await conn->wait_for_drain(
                                 backpressure_timeout);
@@ -353,27 +372,41 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                                 counters->publish_failures.fetch_add(1, std::memory_order_relaxed);
                                 log->warn("Output backpressure wait failed: {}",
                                           drain_status.error());
-                                counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
-                                co_return;
+                                co_return false;
                             }
                         }
                         auto write_status = co_await conn->write_raw(
-                            std::span<const char>(frames.wire.data(), frames.wire.size()));
+                            std::span<const char>(wire.data(), wire.size()));
                         if (write_status.failed()) {
                             counters->publish_failures.fetch_add(1, std::memory_order_relaxed);
                             log->warn("Failed to write matched publications: {}",
                                       write_status.error());
-                        } else {
-                            counters->published.fetch_add(frames.count,
-                                                          std::memory_order_relaxed);
-                            publish_ok = true;
+                            co_return false;
                         }
-                    } else {
-                        // Every matched id (across every row) was missing
-                        // from output_subjects (e.g. removed between search
-                        // and publish) - no frames were actually written,
-                        // but nothing failed either; the input message was
-                        // still legitimately handled.
+                        total_published += chunk_count;
+                        wire.clear();
+                        chunk_count = 0;
+                        co_return true;
+                    };
+
+                    for (const auto& rm : matches_to_publish) {
+                        std::span<const char> payload(rm.payload.data(), rm.payload.size());
+                        for (uint64_t sub_id : rm.matched_ids) {
+                            auto subj_it = output_subjects.find(sub_id);
+                            if (subj_it == output_subjects.end()) continue;
+                            append_pub_frame(wire, subj_it->second, payload);
+                            ++chunk_count;
+                            if (wire.size() >= chunk_bytes) {
+                                if (!co_await flush_chunk()) { write_failed = true; break; }
+                            }
+                        }
+                        if (write_failed) break;
+                    }
+                    if (!write_failed) {
+                        write_failed = !co_await flush_chunk();
+                    }
+                    if (!write_failed) {
+                        counters->published.fetch_add(total_published, std::memory_order_relaxed);
                         publish_ok = true;
                     }
                 } catch (const std::exception& e) {

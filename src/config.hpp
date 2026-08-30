@@ -185,6 +185,14 @@ struct config {
     std::size_t publish_max_inflight = 1024;
     uint32_t publish_backpressure_timeout_ms = 5000;
 
+    // Max bytes worker_pool accumulates before flushing a partial publish
+    // wire buffer (see worker_pool.cpp's publish coroutine) - bounds peak
+    // per-task memory to this regardless of how many subscriptions a
+    // message's rows collectively match (a real bug found 2026-08-29: an
+    // unbounded combined buffer, one full payload copy per match, hit 3GB+
+    // RSS per instance under a high-fan-out workload).
+    std::size_t publish_chunk_bytes = 4ULL * 1024 * 1024;
+
     // Returns `connections` verbatim if non-empty; otherwise synthesizes
     // exactly one connection (name "default", mode "js" if input_stream is
     // set else "core") from the legacy flat fields above, reproducing the

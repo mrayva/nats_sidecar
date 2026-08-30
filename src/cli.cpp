@@ -59,6 +59,7 @@ cxxopts::Options build_cli_options() {
         ("input-queue-max-bytes", "Maximum queued input bytes", cxxopts::value<std::size_t>())
         ("publish-max-inflight", "Maximum in-flight publication tasks", cxxopts::value<std::size_t>())
         ("publish-backpressure-timeout-ms", "NATS publish backpressure timeout", cxxopts::value<uint32_t>())
+        ("publish-chunk-bytes", "Max bytes buffered before flushing a partial publish write", cxxopts::value<std::size_t>())
         ("tls-cert", "TLS certificate path", cxxopts::value<std::string>())
         ("tls-key", "TLS key path", cxxopts::value<std::string>())
         ("tls-ca", "TLS CA certificate path", cxxopts::value<std::string>())
@@ -116,6 +117,7 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("input-queue-max-bytes")) cfg.input_queue_max_bytes = result["input-queue-max-bytes"].as<std::size_t>();
     if (result.count("publish-max-inflight")) cfg.publish_max_inflight = result["publish-max-inflight"].as<std::size_t>();
     if (result.count("publish-backpressure-timeout-ms")) cfg.publish_backpressure_timeout_ms = result["publish-backpressure-timeout-ms"].as<uint32_t>();
+    if (result.count("publish-chunk-bytes")) cfg.publish_chunk_bytes = result["publish-chunk-bytes"].as<std::size_t>();
     if (result.count("tls-cert"))             cfg.tls_cert = result["tls-cert"].as<std::string>();
     if (result.count("tls-key"))              cfg.tls_key = result["tls-key"].as<std::string>();
     if (result.count("tls-ca"))               cfg.tls_ca = result["tls-ca"].as<std::string>();
@@ -223,7 +225,7 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
     if (cfg.lease_ttl_seconds == 0 || cfg.lease_check_interval_seconds == 0 ||
         cfg.input_queue_max_messages == 0 ||
         cfg.input_queue_max_bytes == 0 || cfg.publish_max_inflight == 0 ||
-        cfg.publish_backpressure_timeout_ms == 0) {
+        cfg.publish_backpressure_timeout_ms == 0 || cfg.publish_chunk_bytes == 0) {
         return "Lease TTL and all queue/publication limits must be greater than zero";
     }
 

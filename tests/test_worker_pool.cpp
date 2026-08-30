@@ -254,6 +254,60 @@ TEST(worker_pool, publish_failure_is_counted_and_inflight_released) {
     EXPECT_EQ(stats.publish_inflight, 0u);
 }
 
+TEST(worker_pool, publish_flushes_in_bounded_chunks_when_fan_out_is_large) {
+    // Guards against a real bug found 2026-08-29: build_pub_frames() gives
+    // every matched subscription its own full copy of the row's payload, and
+    // the publish coroutine used to concatenate ALL of them into one
+    // unbounded buffer before a single write_raw() - a high-fan-out message
+    // (many subscriptions matching the same row, exactly what a wide-range
+    // predicate a large share of subscriptions share produces) built a
+    // buffer sized to (match count x payload size) with no cap, observed at
+    // 3GB+ RSS per instance under a real benchmark. publish_chunk_bytes set
+    // deliberately tiny here so a modest subscription count reliably forces
+    // multiple flushes, without needing thousands of subscriptions to prove
+    // the mechanism.
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    cfg.publish_chunk_bytes = 100;
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    constexpr int kNumSubs = 20;
+    for (int i = 0; i < kNumSubs; ++i) {
+        subscriptions.subscribe("value > " + std::to_string(i), "client-" + std::to_string(i));
+    }
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::atomic<int> write_raw_calls{0};
+    std::string all_wire;
+    conn->on_write_raw = [&](std::span<const char> data) -> asio::awaitable<nats_asio::status> {
+        write_raw_calls.fetch_add(1);
+        all_wire.append(data.data(), data.size());
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    // value=1000000 matches every one of the kNumSubs "value > i" subscriptions.
+    ASSERT_TRUE(pool.enqueue(matching_payload(1000000)));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published >= static_cast<uint64_t>(kNumSubs); },
+        std::chrono::seconds(2)));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.matched, 1u) << "one row matched (matched counts rows, not fan-out)";
+    EXPECT_EQ(stats.published, static_cast<uint64_t>(kNumSubs));
+    EXPECT_EQ(stats.publish_failures, 0u);
+    EXPECT_EQ(stats.publish_inflight, 0u);
+    EXPECT_GT(write_raw_calls.load(), 1)
+        << "a tiny publish_chunk_bytes must force multiple flushes instead of one unbounded write";
+    for (int i = 1; i <= kNumSubs; ++i) {
+        EXPECT_NE(all_wire.find("PUB output." + std::to_string(i) + " "), std::string::npos)
+            << "subscription " << i << "'s frame must appear somewhere across the chunked writes";
+    }
+}
+
 // --- Columnar batches (enqueue(..., columnar=true)) ---
 
 TEST(worker_pool, columnar_batch_matches_each_row_independently_and_writes_once) {

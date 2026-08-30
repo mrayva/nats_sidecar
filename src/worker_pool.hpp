@@ -158,6 +158,7 @@ private:
     std::size_t m_queue_max_bytes;
     std::size_t m_publish_max_inflight;
     std::chrono::milliseconds m_publish_backpressure_timeout;
+    std::size_t m_publish_chunk_bytes;
 
     moodycamel::BlockingConcurrentQueue<queued_message> m_queue;
     std::vector<std::thread> m_threads;
