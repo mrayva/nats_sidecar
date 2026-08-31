@@ -177,6 +177,15 @@ struct config {
     // Worker threads for parallel message processing (0 = hardware_concurrency)
     unsigned int worker_threads = 0;
 
+    // CPU core to pin the io_context thread (NATS I/O + publish coroutines,
+    // see main.cpp's single-threaded ioc) to, via pthread_setaffinity_np -
+    // std::nullopt (default) leaves it unpinned, floating like any other
+    // thread. Experimental knob for isolating whether worker threads
+    // preempting the io thread (rather than server-side delivery rate) is
+    // what causes it to fall behind under load - see the nats-server
+    // slow-consumer investigation this was added for.
+    std::optional<unsigned int> pin_io_core;
+
     // Bounded input queue. Newest messages are dropped when either limit is hit.
     std::size_t input_queue_max_messages = 10000;
     std::size_t input_queue_max_bytes = 64ULL * 1024 * 1024;

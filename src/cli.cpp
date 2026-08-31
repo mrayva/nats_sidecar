@@ -55,6 +55,7 @@ cxxopts::Options build_cli_options() {
         ("registry-bucket", "NATS KV subscription-id registry bucket name", cxxopts::value<std::string>())
         ("attr", "Attribute as name:type (repeatable)", cxxopts::value<std::vector<std::string>>())
         ("workers", "Worker thread count (0 = auto)", cxxopts::value<unsigned int>())
+        ("pin-io-core", "CPU core to pin the io_context thread to (unset = unpinned)", cxxopts::value<unsigned int>())
         ("input-queue-max-messages", "Maximum queued input messages", cxxopts::value<std::size_t>())
         ("input-queue-max-bytes", "Maximum queued input bytes", cxxopts::value<std::size_t>())
         ("publish-max-inflight", "Maximum in-flight publication tasks", cxxopts::value<std::size_t>())
@@ -114,6 +115,7 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("lease-check-interval")) cfg.lease_check_interval_seconds = result["lease-check-interval"].as<uint32_t>();
     if (result.count("registry-bucket"))      cfg.registry_bucket = result["registry-bucket"].as<std::string>();
     if (result.count("workers"))              cfg.worker_threads = result["workers"].as<unsigned int>();
+    if (result.count("pin-io-core"))          cfg.pin_io_core = result["pin-io-core"].as<unsigned int>();
     if (result.count("input-queue-max-messages")) cfg.input_queue_max_messages = result["input-queue-max-messages"].as<std::size_t>();
     if (result.count("input-queue-max-bytes")) cfg.input_queue_max_bytes = result["input-queue-max-bytes"].as<std::size_t>();
     if (result.count("publish-max-inflight")) cfg.publish_max_inflight = result["publish-max-inflight"].as<std::size_t>();

@@ -11,8 +11,11 @@
 #include <fmt/ranges.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <cstring>
 #include <iostream>
 #include <memory>
+#include <pthread.h>
+#include <sched.h>
 
 namespace {
 
@@ -63,9 +66,31 @@ void log_startup_banner(spdlog::logger& console, const sidecar::config& cfg) {
                  cfg.publish_max_inflight);
 }
 
+// Pins the calling thread (this process's main thread, which runs ioc.run()
+// below) to a specific CPU core, so it can't be preempted/migrated by the
+// worker_pool's own matching threads competing for the same cores. Logs and
+// continues on failure (e.g. requesting a core past the machine's own
+// count) rather than treating it as fatal - it's a performance experiment
+// knob, not a correctness requirement.
+void pin_current_thread_to_core(unsigned int core, spdlog::logger& console) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (rc != 0) {
+        console.warn("Failed to pin io_context thread to core {}: {}", core, std::strerror(rc));
+    } else {
+        console.info("Pinned io_context thread to core {}", core);
+    }
+}
+
 // Builds the NATS connection, starts the sidecar engine once connected, runs
 // the event loop, then drains publications and the connection on shutdown.
 int run_engine(const sidecar::config& cfg, std::shared_ptr<spdlog::logger> console) {
+    if (cfg.pin_io_core) {
+        pin_current_thread_to_core(*cfg.pin_io_core, *console);
+    }
+
     // Single-threaded io_context (NATS I/O + publish coroutines)
     asio::io_context ioc(1);
 
