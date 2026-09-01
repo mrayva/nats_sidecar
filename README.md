@@ -297,12 +297,21 @@ today). Like `format` itself, `output_format` is process-wide, not per-connectio
 | Arrow type | `attribute_type` | Notes |
 |---|---|---|
 | `int16` / `int32` / `int64` | `integer` | |
-| `float32` / `float64` | `float` | |
+| `float32` / `float64` / `half_float` | `float` | `half_float` (16-bit) widens losslessly into `double` - every value is exactly representable, unlike the decimal cases below |
 | `boolean` | `boolean` | |
 | `utf8` | `string` | zero-copy view into Arrow's own buffer |
 | `binary` | `string` | raw bytes reinterpreted as a string, **not** base64-tagged (unlike `pg_arrow`'s own `arrow_to_jsonb`) - `attribute_type` has no blob kind |
-| `decimal128(p,s)` | `string` | exact decimal text (`Decimal128Array::FormatValue`), not a lossy double |
+| `decimal32(p,s)` / `decimal64(p,s)` / `decimal128(p,s)` | `string` | exact decimal text (`Decimal<N>Array::FormatValue`), not a lossy double - comparisons on this attribute are lexicographic, not numeric, a known tradeoff (see below) |
+| `decimal256(p,s)` | **unsupported** | deferred - would need a genuine native decimal type in `pstree` itself (its `ValueType`/`ElementKey` have no 128/256-bit fixed-point slot), and `be-tree`'s reused parser caps every subscription literal at `int64`/`double` regardless, so full precision wouldn't reach the query side without extending that parser too |
 | `date32`, `timestamp` | **unsupported** | rejected at read time (clear error naming the column) - `attribute_type` has no timestamp kind, and silently mapping to `integer` risks a silently-wrong threshold comparison |
+
+`decimal32`/`decimal64` map to `string` rather than a scaled `integer`, deliberately: a scaled-integer
+representation would be exact for the event value, but would also silently change what a
+subscription's own literal has to look like (a raw scaled integer instead of the natural decimal
+text a human would write) - a real ergonomics/correctness footgun of its own. String keeps the
+natural decimal text on both sides, at the cost of ordering being lexicographic rather than numeric
+for `<`/`>`/`<=`/`>=` comparisons on that attribute - the same known tradeoff `decimal128` already
+had, now consistently extended to `decimal32`/`decimal64` too, not a new one.
 
 No Arrow list/struct/nested type ever appears in `pg_arrow`'s own output (rejected at the SQL
 layer), so `string_list`/`integer_list` attributes are simply unreachable via Arrow input.

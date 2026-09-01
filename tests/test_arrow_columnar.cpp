@@ -142,6 +142,53 @@ std::shared_ptr<arrow::Array> decimal128_array(
     return arr;
 }
 
+std::shared_ptr<arrow::Array> decimal32_array(
+    const std::vector<std::optional<std::string>>& values, int32_t precision, int32_t scale) {
+    auto type = arrow::decimal32(precision, scale);
+    arrow::Decimal32Builder builder(type);
+    for (auto& v : values) {
+        if (v) {
+            auto dec = arrow::Decimal32::FromString(*v);
+            EXPECT_TRUE(dec.ok());
+            EXPECT_TRUE(builder.Append(*dec).ok());
+        } else {
+            EXPECT_TRUE(builder.AppendNull().ok());
+        }
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arr;
+}
+
+std::shared_ptr<arrow::Array> decimal64_array(
+    const std::vector<std::optional<std::string>>& values, int32_t precision, int32_t scale) {
+    auto type = arrow::decimal64(precision, scale);
+    arrow::Decimal64Builder builder(type);
+    for (auto& v : values) {
+        if (v) {
+            auto dec = arrow::Decimal64::FromString(*v);
+            EXPECT_TRUE(dec.ok());
+            EXPECT_TRUE(builder.Append(*dec).ok());
+        } else {
+            EXPECT_TRUE(builder.AppendNull().ok());
+        }
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arr;
+}
+
+std::shared_ptr<arrow::Array> half_float_array(const std::vector<std::optional<double>>& values) {
+    arrow::HalfFloatBuilder builder;
+    for (auto& v : values) {
+        if (v) EXPECT_TRUE(builder.Append(arrow::util::Float16(*v).bits()).ok());
+        else EXPECT_TRUE(builder.AppendNull().ok());
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arr;
+}
+
 std::shared_ptr<arrow::Array> date32_array(const std::vector<int32_t>& values) {
     arrow::Date32Builder builder;
     for (auto v : values) EXPECT_TRUE(builder.Append(v).ok());
@@ -245,6 +292,49 @@ TEST(arrow_columnar_rows, round_trip_decimal128_as_string) {
     EXPECT_EQ(std::string(cell.asStringView()), "123.45");
 }
 
+TEST(arrow_columnar_rows, round_trip_decimal32_as_string) {
+    auto stream = build_arrow_ipc_stream({"amount"}, {decimal32_array({std::string("123.45")}, 9, 2)});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["amount"];
+    EXPECT_TRUE(cell.isString());
+    EXPECT_EQ(std::string(cell.asStringView()), "123.45");
+}
+
+TEST(arrow_columnar_rows, round_trip_decimal64_as_string) {
+    auto stream = build_arrow_ipc_stream({"amount"}, {decimal64_array({std::string("123456789.12")}, 18, 2)});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["amount"];
+    EXPECT_TRUE(cell.isString());
+    EXPECT_EQ(std::string(cell.asStringView()), "123456789.12");
+}
+
+TEST(arrow_columnar_rows, round_trip_half_float_widens_losslessly) {
+    // 3.5 and 100.0 both have exact float16 representations (few significant bits needed), so
+    // the widen-to-double round trip is exact, not merely "close" - real values a half_float
+    // Postgres/Arrow column could carry, not hand-picked to dodge rounding.
+    auto stream = build_arrow_ipc_stream({"price"}, {half_float_array({3.5, std::nullopt, 100.0})});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    std::vector<double> seen;
+    std::vector<bool> nulls;
+    for (auto& row : rows) {
+        auto cell = row["price"];
+        nulls.push_back(cell.isNull());
+        if (!cell.isNull()) {
+            EXPECT_TRUE(cell.isFloat());
+            seen.push_back(cell.asDouble());
+        }
+    }
+    ASSERT_EQ(seen.size(), 2u);
+    EXPECT_DOUBLE_EQ(seen[0], 3.5);
+    EXPECT_DOUBLE_EQ(seen[1], 100.0);
+    ASSERT_EQ(nulls.size(), 3u);
+    EXPECT_FALSE(nulls[0]);
+    EXPECT_TRUE(nulls[1]);
+    EXPECT_FALSE(nulls[2]);
+}
+
 TEST(arrow_columnar_rows, empty_batch_zero_rows) {
     auto stream = build_arrow_ipc_stream({"value"}, {int64_array({})});
     sidecar::ArrowColumnarRows rows(as_span(stream));
@@ -295,6 +385,31 @@ TEST(event_bridge_arrow, arrow_input_msgpack_output_matches_and_decodes) {
         reinterpret_cast<const uint8_t*>((*result)[1].payload.data()), (*result)[1].payload.size()));
     EXPECT_EQ(row0["value"].asInt64(), 42);
     EXPECT_EQ(row1["value"].asInt64(), 100);
+}
+
+TEST(event_bridge_arrow, arrow_input_half_float_matches_through_full_pipeline) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::float_val}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    uint64_t id = mgr.subscribe("value > 50.0", "client-1");
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
+
+    // 25.0 doesn't match, 75.0 does - both exactly representable in float16, so the
+    // widen-to-double conversion this depends on can't mask a real matching bug as a rounding
+    // coincidence.
+    auto stream = build_arrow_ipc_stream({"value"}, {half_float_array({25.0, 75.0})});
+
+    auto result = sidecar::deserialize_and_match_columnar(
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
+        nullptr, nullptr, sidecar::binary_format::msgpack);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_TRUE(contains((*result)[0].matched_ids, id));
+
+    zerialize::MsgPack::Deserializer row(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>((*result)[0].payload.data()), (*result)[0].payload.size()));
+    EXPECT_DOUBLE_EQ(row["value"].asDouble(), 75.0);
 }
 
 TEST(event_bridge_arrow, arrow_input_without_output_format_returns_nullopt) {

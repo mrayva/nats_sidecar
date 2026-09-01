@@ -33,18 +33,35 @@
 //
 // TYPE MAPPING (Arrow -> sidecar::attribute_type) and its deliberate v1 limits - see the
 // project README for the full table and rationale:
-//   int16/int32/int64 -> integer;  float32/float64 -> float;  boolean -> boolean
+//   int16/int32/int64 -> integer;  float32/float64/half_float -> float;  boolean -> boolean
 //   utf8 -> string (asStringView() views Arrow's own buffer directly, zero-copy)
 //   binary -> string, as a raw byte reinterpretation of GetView() - NOT the base64-tagged form
 //     pg_arrow's own arrow_to_jsonb() uses for this same Arrow type, since attribute_type has
 //     no blob/binary kind at all. A deliberate choice, not an oversight.
-//   decimal128 -> string, via Decimal128Array::FormatValue(i) - matches pg_arrow's own
-//     precedent of falling back unconstrained numeric to exact text rather than a lossy double.
-//     FormatValue() returns a freshly-allocated std::string (not a view into existing buffer
-//     data), so it's cached on the owning ArrowCellView instance - safe because that instance
-//     is held in a named local by every caller in this codebase (event_bridge.hpp's
+//   half_float -> float, via arrow::util::Float16::FromBits(...).ToDouble() - every float16
+//     value is exactly representable as a double (fewer exponent/mantissa bits either way), so
+//     this is a lossless widening, exactly like float32/float64 already are - no precision
+//     concern at all, unlike the decimal cases below.
+//   decimal32/decimal64/decimal128 -> string, via <DecimalNArray>::FormatValue(i) - matches
+//     pg_arrow's own precedent of falling back unconstrained numeric to exact text rather than
+//     a lossy double. FormatValue() returns a freshly-allocated std::string (not a view into
+//     existing buffer data), so it's cached on the owning ArrowCellView instance - safe because
+//     that instance is held in a named local by every caller in this codebase (event_bridge.hpp's
 //     populate_event()'s `auto value = reader[key_sv];`) for the duration of its use, not
-//     consumed as an immediately-destroyed temporary.
+//     consumed as an immediately-destroyed temporary. Deliberately NOT collapsed into `integer`
+//     via the column's own declared scale (decimal32/64 numerically WOULD fit in int64 after
+//     scaling) - that representation change would be exact for the EVENT value but would also
+//     silently change what a subscription's own literal has to look like (a raw scaled integer
+//     instead of the natural decimal text a human would write), a real ergonomics/correctness
+//     footgun of its own. String preserves the natural decimal text on both sides at the cost of
+//     LEXICOGRAPHIC (not numeric) ordering for any subscription that compares this attribute
+//     with < / > / <= / >= - a known, pre-existing tradeoff (already true for decimal128 before
+//     decimal32/64 joined it here), not new. decimal128/decimal256 gaining a genuine native
+//     numeric type (pstree's own kFloat/kInteger have no room for 128/256-bit fixed-point, so
+//     this would mean a new pstree ValueType, a new ElementKey codec, AND extending be-tree's
+//     own reused parser - it currently caps every subscription literal at int64/double via
+//     ast_compare_value_e - since that's what actually resolves the ordering footgun on the
+//     query side too) is deliberately deferred, not attempted here.
 //   date32 / timestamp -> UNSUPPORTED. Rejected at construction time (the whole batch is
 //     poisoned - propagates as a thrown exception, caught by deserialize_and_match_columnar's
 //     existing try/catch, exactly like a malformed payload in any other format). Deliberate:
@@ -61,6 +78,7 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
+#include <arrow/util/float16.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -87,9 +105,12 @@ inline bool is_supported_type(arrow::Type::type t) {
         case arrow::Type::INT64:
         case arrow::Type::FLOAT:
         case arrow::Type::DOUBLE:
+        case arrow::Type::HALF_FLOAT:
         case arrow::Type::BOOL:
         case arrow::Type::STRING:
         case arrow::Type::BINARY:
+        case arrow::Type::DECIMAL32:
+        case arrow::Type::DECIMAL64:
         case arrow::Type::DECIMAL128:
             return true;
         default:
@@ -128,11 +149,14 @@ public:
     bool isUInt() const { return false; } // pg_arrow never emits an unsigned Arrow type
     bool isFloat() const {
         if (isNull()) return false;
-        return type_ == arrow::Type::FLOAT || type_ == arrow::Type::DOUBLE;
+        return type_ == arrow::Type::FLOAT || type_ == arrow::Type::DOUBLE
+            || type_ == arrow::Type::HALF_FLOAT;
     }
     bool isString() const {
         if (isNull()) return false;
-        return type_ == arrow::Type::STRING || type_ == arrow::Type::BINARY || type_ == arrow::Type::DECIMAL128;
+        return type_ == arrow::Type::STRING || type_ == arrow::Type::BINARY
+            || type_ == arrow::Type::DECIMAL32 || type_ == arrow::Type::DECIMAL64
+            || type_ == arrow::Type::DECIMAL128;
     }
     bool isBlob()  const { return false; } // binary maps to string, not blob - see this file's own header comment
     bool isMap()   const { return false; }
@@ -158,11 +182,17 @@ public:
         switch (type_) {
             case arrow::Type::FLOAT:  return static_cast<const arrow::FloatArray&>(*array_).Value(row_);
             case arrow::Type::DOUBLE: return static_cast<const arrow::DoubleArray&>(*array_).Value(row_);
+            // Lossless: every float16 value is exactly representable as a double (fewer
+            // exponent/mantissa bits either way) - same "widen, never lose precision" rule
+            // float32/float64 already get, unlike the decimal cases below.
+            case arrow::Type::HALF_FLOAT:
+                return arrow::util::Float16::FromBits(
+                    static_cast<const arrow::HalfFloatArray&>(*array_).Value(row_)).ToDouble();
             default: arrow_detail::unsupported("asDouble");
         }
     }
     std::string asString() const { return std::string(asStringView()); }
-    // decimal128's FormatValue() returns a fresh std::string, not a view into existing buffer
+    // decimalN's FormatValue() returns a fresh std::string, not a view into existing buffer
     // data - cached here so the returned string_view stays valid for as long as this
     // ArrowCellView instance does (see this file's own header comment on why that's enough).
     std::string_view asStringView() const {
@@ -175,6 +205,16 @@ public:
                 auto v = static_cast<const arrow::BinaryArray&>(*array_).GetView(row_);
                 return std::string_view(v.data(), v.size());
             }
+            case arrow::Type::DECIMAL32:
+                if (!decimal_cache_) {
+                    decimal_cache_ = static_cast<const arrow::Decimal32Array&>(*array_).FormatValue(row_);
+                }
+                return *decimal_cache_;
+            case arrow::Type::DECIMAL64:
+                if (!decimal_cache_) {
+                    decimal_cache_ = static_cast<const arrow::Decimal64Array&>(*array_).FormatValue(row_);
+                }
+                return *decimal_cache_;
             case arrow::Type::DECIMAL128:
                 if (!decimal_cache_) {
                     decimal_cache_ = static_cast<const arrow::Decimal128Array&>(*array_).FormatValue(row_);
