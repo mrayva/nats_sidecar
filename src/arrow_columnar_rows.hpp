@@ -153,9 +153,18 @@ public:
         return type_ == arrow::Type::FLOAT || type_ == arrow::Type::DOUBLE
             || type_ == arrow::Type::HALF_FLOAT;
     }
+    // Also true for a decimal cell - NOT because decimal is a string type (isDecimal()/
+    // asDecimal() below is how populate_event's own attribute_type::decimal dispatch actually
+    // reads it, exactly), but because zerialize::write_value() (translate.hpp) walks any Reader
+    // generically via isNull/isBool/.../isString/.../isArray with no isDecimal() branch of its
+    // own - it's the shared bridge every zerialize protocol re-encodes matched rows through, and
+    // extending it with an Arrow/decimal-specific case would break its whole "protocol-agnostic"
+    // premise for one caller. Recognizing decimal here is what lets a MATCHED row containing a
+    // decimal column actually get republished to a non-arrow output_format at all - see
+    // asStringView() below for the actual formatting. Never fires for the primary matching path.
     bool isString() const {
         if (isNull()) return false;
-        return type_ == arrow::Type::STRING || type_ == arrow::Type::BINARY;
+        return type_ == arrow::Type::STRING || type_ == arrow::Type::BINARY || isDecimal();
     }
     bool isBlob()  const { return false; } // binary maps to string, not blob - see this file's own header comment
     bool isMap()   const { return false; }
@@ -210,6 +219,27 @@ public:
                 auto v = static_cast<const arrow::BinaryArray&>(*array_).GetView(row_);
                 return std::string_view(v.data(), v.size());
             }
+            // Exact decimal text (Arrow's own Decimal<N>Array::FormatValue - the identical
+            // formatter pg_arrow.cpp's own arrow_to_jsonb() uses for its DECIMAL32/64/128/256
+            // decode cases), not a lossy double - this is the write_value() fallback isString()'s
+            // own comment describes, not the primary matching path (which never calls this for a
+            // decimal-typed attribute). FormatValue() returns a temporary std::string; unlike
+            // STRING/BINARY above (which view Arrow's own already-live buffer), this needs
+            // somewhere to own that text for the std::string_view being returned - decimal_text_
+            // below, cached per cell since a single ArrowCellView may be asked for this more than
+            // once (e.g. asString() calling through asStringView()).
+            case arrow::Type::DECIMAL32:
+                decimal_text_ = static_cast<const arrow::Decimal32Array&>(*array_).FormatValue(row_);
+                return *decimal_text_;
+            case arrow::Type::DECIMAL64:
+                decimal_text_ = static_cast<const arrow::Decimal64Array&>(*array_).FormatValue(row_);
+                return *decimal_text_;
+            case arrow::Type::DECIMAL128:
+                decimal_text_ = static_cast<const arrow::Decimal128Array&>(*array_).FormatValue(row_);
+                return *decimal_text_;
+            case arrow::Type::DECIMAL256:
+                decimal_text_ = static_cast<const arrow::Decimal256Array&>(*array_).FormatValue(row_);
+                return *decimal_text_;
             default:
                 arrow_detail::unsupported("asStringView");
         }
@@ -282,6 +312,8 @@ private:
     const arrow::Array* array_ = nullptr;
     std::int64_t row_ = 0;
     arrow::Type::type type_ = arrow::Type::NA;
+    // Backing storage for asStringView()'s decimal case only - see that switch's own comment.
+    mutable std::optional<std::string> decimal_text_;
 };
 
 // The row cursor: satisfies zerialize::Reader (ValueView + operator[]). One ArrowColumnarRows

@@ -322,7 +322,13 @@ TEST(arrow_columnar_rows, round_trip_decimal128_native) {
     auto it = rows.begin();
     auto cell = (*it)["amount"];
     EXPECT_TRUE(cell.isDecimal());
-    EXPECT_FALSE(cell.isString()); // decimal no longer routes through isString()
+    // isString()/asStringView() ALSO report true/exact-text for a decimal cell now - not the
+    // primary matching path (populate_event dispatches on the attribute's declared type, always
+    // reaching isDecimal()/asDecimal() directly for a decimal attribute), but the fallback
+    // zerialize::write_value() needs to republish a MATCHED row containing a decimal column to a
+    // non-arrow output_format at all (see arrow_columnar_rows.hpp's isString() comment).
+    EXPECT_TRUE(cell.isString());
+    EXPECT_EQ(cell.asStringView(), "123.45");
     EXPECT_EQ(cell.asDecimal(2), int256_from_i64(12345));
 }
 
@@ -460,6 +466,40 @@ TEST(event_bridge_arrow, arrow_input_msgpack_output_matches_and_decodes) {
         reinterpret_cast<const uint8_t*>((*result)[1].payload.data()), (*result)[1].payload.size()));
     EXPECT_EQ(row0["value"].asInt64(), 42);
     EXPECT_EQ(row1["value"].asInt64(), 100);
+}
+
+// Regression test for a real bug found via manual end-to-end testing (not hand-picked): a
+// MATCHED Arrow row containing a decimal column, republished to a non-arrow output_format, used
+// to throw "write_value: unsupported source type" from zerialize::write_value() (translate.hpp)
+// - decimal wasn't part of that generic Reader walk (isNull/isBool/.../isString/.../isArray) at
+// all, since ArrowCellView::isDecimal()/asDecimal() are deliberately NOT part of that structural
+// concept (only the primary matching path, via populate_event's `if constexpr` gate, used them).
+// Fixed by having isString()/asStringView() also recognize a decimal cell, formatting it via
+// Arrow's own Decimal<N>Array::FormatValue() (exact text) - see arrow_columnar_rows.hpp's
+// isString() comment. Only engine: pstree accepts a decimal attribute at all (atree/betree throw
+// at schema-build time), so this exercises the pstree matching path specifically.
+TEST(event_bridge_arrow, arrow_input_decimal_matches_and_republishes_as_msgpack) {
+    std::vector<sidecar::attribute_def> defs = {{"amount", sidecar::attribute_type::decimal, std::int32_t{2}}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log(), sidecar::engine_type::pstree);
+    uint64_t id = mgr.subscribe("amount > 100.00", "client-1");
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
+
+    // Row 0 (50.25) doesn't match, row 1 (123.45) does.
+    auto stream = build_arrow_ipc_stream(
+        {"amount"}, {decimal128_array({std::string("50.25"), std::string("123.45")}, 10, 2)});
+
+    auto result = sidecar::deserialize_and_match_columnar(
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
+        nullptr, nullptr, sidecar::binary_format::msgpack);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_TRUE(contains((*result)[0].matched_ids, id));
+
+    zerialize::MsgPack::Deserializer row(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>((*result)[0].payload.data()), (*result)[0].payload.size()));
+    EXPECT_EQ(row["amount"].asStringView(), "123.45");
 }
 
 TEST(event_bridge_arrow, arrow_input_half_float_matches_through_full_pipeline) {
