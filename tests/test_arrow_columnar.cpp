@@ -13,6 +13,7 @@
 #include <arrow/ipc/api.h>
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 
 // ArrowColumnarRows must satisfy zerialize's structural Reader concept for it to plug into the
@@ -71,6 +72,50 @@ std::vector<char> build_arrow_ipc_stream_no_batch() {
 
 std::shared_ptr<arrow::Array> int64_array(const std::vector<std::optional<int64_t>>& values) {
     arrow::Int64Builder builder;
+    for (auto& v : values) {
+        if (v) EXPECT_TRUE(builder.Append(*v).ok());
+        else EXPECT_TRUE(builder.AppendNull().ok());
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arr;
+}
+
+std::shared_ptr<arrow::Array> uint8_array(const std::vector<std::optional<uint8_t>>& values) {
+    arrow::UInt8Builder builder;
+    for (auto& v : values) {
+        if (v) EXPECT_TRUE(builder.Append(*v).ok());
+        else EXPECT_TRUE(builder.AppendNull().ok());
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arr;
+}
+
+std::shared_ptr<arrow::Array> uint16_array(const std::vector<std::optional<uint16_t>>& values) {
+    arrow::UInt16Builder builder;
+    for (auto& v : values) {
+        if (v) EXPECT_TRUE(builder.Append(*v).ok());
+        else EXPECT_TRUE(builder.AppendNull().ok());
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arr;
+}
+
+std::shared_ptr<arrow::Array> uint32_array(const std::vector<std::optional<uint32_t>>& values) {
+    arrow::UInt32Builder builder;
+    for (auto& v : values) {
+        if (v) EXPECT_TRUE(builder.Append(*v).ok());
+        else EXPECT_TRUE(builder.AppendNull().ok());
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arr;
+}
+
+std::shared_ptr<arrow::Array> uint64_array(const std::vector<std::optional<uint64_t>>& values) {
+    arrow::UInt64Builder builder;
     for (auto& v : values) {
         if (v) EXPECT_TRUE(builder.Append(*v).ok());
         else EXPECT_TRUE(builder.AppendNull().ok());
@@ -391,6 +436,82 @@ TEST(arrow_columnar_rows, round_trip_decimal256_native) {
     EXPECT_EQ(cell.asDecimal(2), expected);
 }
 
+// Native uint8/16/32/64 - pg_arrow's own encoding of BIT(8)/BIT(16)/BIT(32)/BIT(64). isUInt(),
+// asUInt64() (the full-range accessor), and asInt64() (the one populate_event's
+// attribute_type::integer path actually calls) are all checked - all three widths always fit
+// int64_t losslessly.
+TEST(arrow_columnar_rows, round_trip_uint8_native) {
+    auto stream = build_arrow_ipc_stream({"flags"}, {uint8_array({129})});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["flags"];
+    EXPECT_TRUE(cell.isUInt());
+    EXPECT_EQ(cell.asUInt64(), 129u);
+    EXPECT_EQ(cell.asInt64(), 129);
+}
+
+TEST(arrow_columnar_rows, round_trip_uint16_native) {
+    auto stream = build_arrow_ipc_stream({"flags"}, {uint16_array({32768})});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["flags"];
+    EXPECT_TRUE(cell.isUInt());
+    EXPECT_EQ(cell.asUInt64(), 32768u);
+    EXPECT_EQ(cell.asInt64(), 32768);
+}
+
+TEST(arrow_columnar_rows, round_trip_uint32_native) {
+    auto stream = build_arrow_ipc_stream({"flags"}, {uint32_array({4294967295u})});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["flags"];
+    EXPECT_TRUE(cell.isUInt());
+    EXPECT_EQ(cell.asUInt64(), 4294967295u);
+    EXPECT_EQ(cell.asInt64(), 4294967295LL);
+}
+
+TEST(arrow_columnar_rows, round_trip_uint64_native) {
+    auto stream = build_arrow_ipc_stream({"flags"}, {uint64_array({42})});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["flags"];
+    EXPECT_TRUE(cell.isUInt());
+    EXPECT_EQ(cell.asUInt64(), 42u);
+    EXPECT_EQ(cell.asInt64(), 42);
+}
+
+// The exact boundary: INT64_MAX itself must round-trip through asInt64() with no throw.
+TEST(arrow_columnar_rows, uint64_boundary_value_exact) {
+    auto stream = build_arrow_ipc_stream(
+        {"flags"}, {uint64_array({static_cast<uint64_t>(std::numeric_limits<int64_t>::max())})});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["flags"];
+    EXPECT_EQ(cell.asInt64(), std::numeric_limits<int64_t>::max());
+}
+
+// One past the boundary, and the all-ones extreme - both in uint64's upper half (only reachable
+// via bit(64), since bit(8)/16/32's full range always fits int64_t). asInt64() must throw rather
+// than silently wrap negative through a plain static_cast; asUInt64() itself must NOT throw and
+// must return the exact value - the narrowing check belongs only at the asInt64() conversion
+// point, not the raw accessor (see arrow_columnar_rows.hpp's own comment on this split).
+TEST(arrow_columnar_rows, uint64_overflow_throws) {
+    uint64_t one_past = static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1;
+    uint64_t all_ones = std::numeric_limits<uint64_t>::max();
+    auto stream = build_arrow_ipc_stream({"flags"}, {uint64_array({one_past, all_ones})});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+
+    auto cell0 = (*it)["flags"];
+    EXPECT_EQ(cell0.asUInt64(), one_past);
+    EXPECT_THROW(cell0.asInt64(), std::runtime_error);
+
+    ++it;
+    auto cell1 = (*it)["flags"];
+    EXPECT_EQ(cell1.asUInt64(), all_ones);
+    EXPECT_THROW(cell1.asInt64(), std::runtime_error);
+}
+
 TEST(arrow_columnar_rows, round_trip_half_float_widens_losslessly) {
     // 3.5 and 100.0 both have exact float16 representations (few significant bits needed), so
     // the widen-to-double round trip is exact, not merely "close" - real values a half_float
@@ -500,6 +621,35 @@ TEST(event_bridge_arrow, arrow_input_decimal_matches_and_republishes_as_msgpack)
     zerialize::MsgPack::Deserializer row(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>((*result)[0].payload.data()), (*result)[0].payload.size()));
     EXPECT_EQ(row["amount"].asStringView(), "123.45");
+}
+
+// Full-pipeline regression test for the same write_value bug class the decimal test above
+// guards against: a matched row containing a uint32-backed (bit(32)) attribute, republished to a
+// non-arrow output_format, exercises zerialize::write_value()'s own isUInt()/asUInt64() branch
+// specifically - not just the matching path. No engine restriction here (unlike decimal) since
+// this rides entirely on the existing attribute_type::integer path - default engine (atree) is
+// fine.
+TEST(event_bridge_arrow, arrow_input_uint32_matches_and_republishes_as_msgpack) {
+    std::vector<sidecar::attribute_def> defs = {{"flags", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log());
+    uint64_t id = mgr.subscribe("flags > 1000", "client-1");
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
+
+    // Row 0 (500) doesn't match, row 1 (4294967295, i.e. all-ones bit(32)) does.
+    auto stream = build_arrow_ipc_stream({"flags"}, {uint32_array({500, 4294967295u})});
+
+    auto result = sidecar::deserialize_and_match_columnar(
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
+        nullptr, nullptr, sidecar::binary_format::msgpack);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_TRUE(contains((*result)[0].matched_ids, id));
+
+    zerialize::MsgPack::Deserializer row(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>((*result)[0].payload.data()), (*result)[0].payload.size()));
+    EXPECT_EQ(row["flags"].asUInt64(), 4294967295u);
 }
 
 TEST(event_bridge_arrow, arrow_input_half_float_matches_through_full_pipeline) {

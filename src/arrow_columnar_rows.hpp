@@ -59,6 +59,17 @@
 //     against a string-typed attribute are a hard PARSE-TIME REJECTION in this grammar, not a
 //     silently-wrong lexicographic one - only `=`/`!=`/`in`/`not in` were ever reachable) - kept
 //     only as historical context, not the current behavior.
+//   uint8/uint16/uint32/uint64 -> attribute_type::integer - pg_arrow's own encoding of a
+//     BIT(8)/BIT(16)/BIT(32)/BIT(64) column (the four widths that pack into a whole number of
+//     bytes with no partial-byte padding; see pg_arrow's own README for why no other BIT(n)
+//     length is emitted). Rides entirely on the existing integer path - no new attribute_type,
+//     no engine restriction, unlike decimal above. UInt8/16/32's full range always fits int64_t
+//     losslessly; UInt64's upper half (2^63 to 2^64-1) does NOT, and asInt64()'s own UINT64 case
+//     throws rather than silently wrapping negative - see that function's comment. asUInt64()
+//     itself stays a pure, non-throwing full-range accessor - required (not just structural
+//     boilerplate) so zerialize::write_value()'s own isUInt()/asUInt64() branch can republish a
+//     matched row to a non-arrow output_format, the same class of bug the decimal isString()
+//     fallback above was added to fix.
 //   date32 / timestamp -> UNSUPPORTED. Rejected at construction time (the whole batch is
 //     poisoned - propagates as a thrown exception, caught by deserialize_and_match_columnar's
 //     existing try/catch, exactly like a malformed payload in any other format). Deliberate:
@@ -82,6 +93,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -113,6 +125,10 @@ inline bool is_supported_type(arrow::Type::type t) {
         case arrow::Type::DECIMAL64:
         case arrow::Type::DECIMAL128:
         case arrow::Type::DECIMAL256:
+        case arrow::Type::UINT8:
+        case arrow::Type::UINT16:
+        case arrow::Type::UINT32:
+        case arrow::Type::UINT64:
             return true;
         default:
             return false;
@@ -147,7 +163,16 @@ public:
         if (isNull()) return false;
         return type_ == arrow::Type::INT16 || type_ == arrow::Type::INT32 || type_ == arrow::Type::INT64;
     }
-    bool isUInt() const { return false; } // pg_arrow never emits an unsigned Arrow type
+    // True for a BIT(8)/BIT(16)/BIT(32)/BIT(64)-backed column (pg_arrow's own uint8/16/32/64
+    // output - see arrow_columnar_rows.hpp's own TYPE MAPPING comment). populate_event's
+    // attribute_type::integer case already gates on `isInt() || isUInt()` and calls asInt64()
+    // unconditionally - see that function's own asInt64() UINT64 case for how a value outside
+    // int64_t's range is handled.
+    bool isUInt() const {
+        if (isNull()) return false;
+        return type_ == arrow::Type::UINT8 || type_ == arrow::Type::UINT16
+            || type_ == arrow::Type::UINT32 || type_ == arrow::Type::UINT64;
+    }
     bool isFloat() const {
         if (isNull()) return false;
         return type_ == arrow::Type::FLOAT || type_ == arrow::Type::DOUBLE
@@ -187,13 +212,48 @@ public:
             case arrow::Type::INT16: return static_cast<const arrow::Int16Array&>(*array_).Value(row_);
             case arrow::Type::INT32: return static_cast<const arrow::Int32Array&>(*array_).Value(row_);
             case arrow::Type::INT64: return static_cast<const arrow::Int64Array&>(*array_).Value(row_);
+            // UInt8/16/32's full range always fits int64_t losslessly (max uint32 is
+            // 4294967295, nowhere near INT64_MAX) - a plain widening cast, no check needed.
+            case arrow::Type::UINT8:  return static_cast<const arrow::UInt8Array&>(*array_).Value(row_);
+            case arrow::Type::UINT16: return static_cast<const arrow::UInt16Array&>(*array_).Value(row_);
+            case arrow::Type::UINT32: return static_cast<const arrow::UInt32Array&>(*array_).Value(row_);
+            // UInt64 is the one case that can't always fit: a bit(64) value in [2^63, 2^64-1]
+            // would silently wrap negative through a plain static_cast. Throw instead - same
+            // "poison this row's batch, don't silently misbehave" pattern asDecimal() already
+            // uses for a genuine Rescale() overflow (see that function's own comment).
+            case arrow::Type::UINT64: {
+                std::uint64_t v = static_cast<const arrow::UInt64Array&>(*array_).Value(row_);
+                if (v > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                    throw std::runtime_error(
+                        "ArrowColumnarRows: uint64 value " + std::to_string(v) +
+                        " does not fit in a signed 64-bit integer attribute");
+                }
+                return static_cast<std::int64_t>(v);
+            }
             default: arrow_detail::unsupported("asInt64");
         }
     }
-    [[noreturn]] std::uint8_t  asUInt8()  const { arrow_detail::unsupported("asUInt8"); }
-    [[noreturn]] std::uint16_t asUInt16() const { arrow_detail::unsupported("asUInt16"); }
-    [[noreturn]] std::uint32_t asUInt32() const { arrow_detail::unsupported("asUInt32"); }
-    [[noreturn]] std::uint64_t asUInt64() const { arrow_detail::unsupported("asUInt64"); }
+    // Narrow via asUInt64(), same pattern asInt8()/asInt16()/asInt32() already use above (via
+    // asInt64()) - never actually invoked by any real code path in this codebase (write_value()
+    // only ever calls asUInt64() directly), kept only to satisfy the structural Reader concept.
+    std::uint8_t  asUInt8()  const { return static_cast<std::uint8_t>(asUInt64()); }
+    std::uint16_t asUInt16() const { return static_cast<std::uint16_t>(asUInt64()); }
+    std::uint32_t asUInt32() const { return static_cast<std::uint32_t>(asUInt64()); }
+    // Widens from ANY of the four uint widths - not just UINT64 - because zerialize::write_value()
+    // (translate.hpp) calls this unconditionally once isUInt() is true, with no idea which of the
+    // four widths the cell actually is (mirrors asInt64() widening from INT16/32/64 above, for the
+    // identical reason). Pure and non-throwing for all four - unlike asInt64()'s UINT64 case
+    // above, this always returns the exact stored value, full 0..2^64-1 range. The narrowing/
+    // range check belongs at the point that actually narrows (asInt64()), not here.
+    std::uint64_t asUInt64() const {
+        switch (type_) {
+            case arrow::Type::UINT8:  return static_cast<const arrow::UInt8Array&>(*array_).Value(row_);
+            case arrow::Type::UINT16: return static_cast<const arrow::UInt16Array&>(*array_).Value(row_);
+            case arrow::Type::UINT32: return static_cast<const arrow::UInt32Array&>(*array_).Value(row_);
+            case arrow::Type::UINT64: return static_cast<const arrow::UInt64Array&>(*array_).Value(row_);
+            default: arrow_detail::unsupported("asUInt64");
+        }
+    }
     float  asFloat()  const { return static_cast<float>(asDouble()); }
     double asDouble() const {
         switch (type_) {

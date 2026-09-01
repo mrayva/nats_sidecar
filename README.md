@@ -297,6 +297,7 @@ today). Like `format` itself, `output_format` is process-wide, not per-connectio
 | Arrow type | `attribute_type` | Notes |
 |---|---|---|
 | `int16` / `int32` / `int64` | `integer` | |
+| `uint8` / `uint16` / `uint32` / `uint64` | `integer` | `pg_arrow`'s own encoding of `bit(8)/bit(16)/bit(32)/bit(64)` - rides entirely on the existing `integer` path, no engine restriction. `uint8/16/32`'s full range always fits `int64_t`; `uint64` values from 2^63 to 2^64-1 (only reachable via `bit(64)`) throw a clear error at match time rather than silently wrapping negative |
 | `float32` / `float64` / `half_float` | `float` | `half_float` (16-bit) widens losslessly into `double` - every value is exactly representable, unlike the decimal cases below |
 | `boolean` | `boolean` | |
 | `utf8` | `string` | zero-copy view into Arrow's own buffer |
