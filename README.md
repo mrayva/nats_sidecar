@@ -1980,6 +1980,77 @@ this project's own NYSE full-table-cycling use case actually has - pstree's real
 still being established; this fix closed the one clearly avoidable gap found so far, and a-tree/be-tree
 were already profiled here too (see below) without turning up comparably clear-cut opportunities.
 
+## Corrected fastest-full-table-push numbers, and why N=12 was never actually required
+
+**The numbers above (and every historical rows/s figure earlier in this document) understate the
+fleet's real throughput** - discovered by asking a simple question: could the same 115M-row dataset
+be pushed without Postgres's own overhead diluting the measurement? `nats_publish_from_sql.py`'s
+per-run "materialize" step (`materialize_partitioned()`) does a real `CREATE UNLOGGED TABLE ... AS
+SELECT` (a full physical copy of the whole row set into a throwaway table) + `COUNT(*)`, then drops
+it - repeated on *every single invocation*, even though the source data never changes between
+benchmark runs. Measured directly: **~28 seconds** for this exact table, on every cycle.
+
+**Fix**: `--source-table NAME` (new, added to `nats_publish_from_sql.py`) skips this entirely -
+ctid-partitions an already-built persistent table directly (one cheap `COUNT(*)`, no write, no
+drop). Build the snapshot once:
+
+```sql
+CREATE UNLOGGED TABLE nyse_bench_snapshot_price_exchange AS
+  SELECT "Trade Price" AS price, "Exchange" AS exchange FROM nyse_eqy_us_all_trade_20260102;
+```
+
+then pass `--source-table nyse_bench_snapshot_price_exchange` instead of `--sql '...'` on every
+subsequent run. Mutually exclusive with `--sql`, parallel-path only (`--workers > 1`), incompatible
+with `--limit`.
+
+**Result: not just cleaner numbers - a ~3x correction.** Same exact config as the K=1 fleet test
+above (N=12, `worker_threads: 1`, `engine: pstree`, `pub_workers=16`): the old `--sql`-based
+measurement gave ~3.06M rows/s; the clean `--source-table` measurement, three trials, gave a mean of
+**9,560,360 rows/s** - every prior throughput figure in this whole investigation was diluted by
+~25-30s of unrelated Postgres table-copy overhead per cycle, not just noisy around the right answer.
+
+**Re-swept both axes clean, and found the fleet needs half the instances this project has always
+assumed.** `pub_workers` at fixed N=12 (4/8/16/24/32/48/64): all zero-loss, but throughput plateaus
+sharply from `pub_workers=24` onward (~11.1-11.4M rows/s flat to 64) - since `dropped=0` even at 64,
+**this ceiling belongs to the publisher side, not the fleet** (see below). Re-swept N at that real
+~11.4M rows/s rate instead of the old, much lower one - and finally found the fleet's true
+threshold:
+
+| N | loss | processed rate |
+|---:|---:|---:|
+| 12 | 0.0% | 11.5M rows/s |
+| 10 | 0.0% | 10.2M rows/s |
+| 8  | 0.0% | 11.6M rows/s |
+| 6  | 0.0% | 11.5M rows/s |
+| 4  | **16.4%** | 9.1M rows/s |
+| 3  | 35.5% | 7.5M rows/s |
+| 2  | 54.9% | 5.3M rows/s |
+| 1  | 77.6% | 2.7M rows/s |
+
+Sharp threshold between N=6 (zero loss) and N=4 (real loss) - the same "sharp, not gradual" pattern
+every other threshold in this document shows. **Corrected recommendation: N=6, `worker_threads: 1`,
+`engine: pstree`, `pub_workers=24`, publishing via `--source-table`** - zero loss, ~11.4M rows/s,
+the entire 115M-row table through the fleet in under 10 seconds. N=6 is *half* the instance count
+this whole project has defaulted to since its earliest benchmarks (originally chosen to match this
+host's 12 physical cores) - the fleet was never actually tested against its own real ceiling before,
+only against artificially low publish rates.
+
+**The `pub_workers=24+` plateau is Postgres/pgnats-side, not the fleet, and it's already
+well-understood.** Isolating the publish side entirely (no sidecar fleet running) pushed the same
+`pub_workers=64` config to 13.15M rows/s - higher than with the fleet running concurrently,
+confirming the fleet and Postgres backends were themselves competing for the same 12 physical
+cores. `sudo perf record -a` (system-wide, during an isolated `pub_workers=64` run) showed 80.36%
+of the ENTIRE host's CPU in `postgres` processes and another 10.99% in `tokio-rt-worker` threads
+(pgnats's own async-nats runtime) - ~91% combined. Root cause: each Postgres backend connection runs
+its own thread-local tokio runtime (`pgnats/src/ctx.rs`); a prior fix (already in this codebase, not
+new) already cut that from ~25 default worker threads per backend down to a fixed `worker_threads(2)`
+after finding the same oversubscription problem this document's own worker_threads sweep found on
+the sidecar side (400 OS threads competing for 24 cores at 16 backends x 25 threads). At
+`pub_workers=64` even with that fix, 64 backends x 3 threads (1 main + 2 tokio) still oversubscribes
+24 logical cores - matching the plateau's own onset almost exactly at `pub_workers=24`. Not
+currently worth chasing further: the fleet only needs ~11.4M rows/s at N=6, comfortably under what
+the publisher can already deliver.
+
 ## License
 
 See LICENSE file.
