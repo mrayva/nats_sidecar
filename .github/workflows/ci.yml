@@ -47,7 +47,14 @@ jobs:
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11.6
         with:
-          vcpkgGitCommitId: 4e82e29f14eac2b3422f18f72c7524d04f19924e
+          # Must track vcpkg.json's own builtin-baseline - lukka/run-vcpkg checks out this exact
+          # commit's ports/versions database, and any dependency pinned to a version newer than
+          # what THAT commit's database contains fails with "no version database entry" at
+          # configure time (a real CI outage this pin drifting behind builtin-baseline caused -
+          # confirmed via CI history: every push since the baseline was last bumped failed the
+          # same way, "Configure" step, same root cause). Bump together with builtin-baseline,
+          # every time - never independently.
+          vcpkgGitCommitId: 194964eec5d5601aef90b456d553412f0b2b0ea5
 
       - name: Configure
         run: >-
@@ -124,7 +131,9 @@ jobs:
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11.6
         with:
-          vcpkgGitCommitId: 4e82e29f14eac2b3422f18f72c7524d04f19924e
+          # Must track vcpkg.json's own builtin-baseline - see the build-and-test job's identical
+          # pin above for why.
+          vcpkgGitCommitId: 194964eec5d5601aef90b456d553412f0b2b0ea5
 
       - name: Configure
         run: >-
