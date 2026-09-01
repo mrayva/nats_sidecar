@@ -301,17 +301,45 @@ today). Like `format` itself, `output_format` is process-wide, not per-connectio
 | `boolean` | `boolean` | |
 | `utf8` | `string` | zero-copy view into Arrow's own buffer |
 | `binary` | `string` | raw bytes reinterpreted as a string, **not** base64-tagged (unlike `pg_arrow`'s own `arrow_to_jsonb`) - `attribute_type` has no blob kind |
-| `decimal32(p,s)` / `decimal64(p,s)` / `decimal128(p,s)` | `string` | exact decimal text (`Decimal<N>Array::FormatValue`), not a lossy double - comparisons on this attribute are lexicographic, not numeric, a known tradeoff (see below) |
-| `decimal256(p,s)` | **unsupported** | deferred - would need a genuine native decimal type in `pstree` itself (its `ValueType`/`ElementKey` have no 128/256-bit fixed-point slot), and `be-tree`'s reused parser caps every subscription literal at `int64`/`double` regardless, so full precision wouldn't reach the query side without extending that parser too |
+| `decimal32(p,s)` / `decimal64(p,s)` / `decimal128(p,s)` / `decimal256(p,s)` | `decimal` | **pstree-only** - native `pstree::Int256` (four `uint64_t` limbs), see below |
 | `date32`, `timestamp` | **unsupported** | rejected at read time (clear error naming the column) - `attribute_type` has no timestamp kind, and silently mapping to `integer` risks a silently-wrong threshold comparison |
 
-`decimal32`/`decimal64` map to `string` rather than a scaled `integer`, deliberately: a scaled-integer
-representation would be exact for the event value, but would also silently change what a
-subscription's own literal has to look like (a raw scaled integer instead of the natural decimal
-text a human would write) - a real ergonomics/correctness footgun of its own. String keeps the
-natural decimal text on both sides, at the cost of ordering being lexicographic rather than numeric
-for `<`/`>`/`<=`/`>=` comparisons on that attribute - the same known tradeoff `decimal128` already
-had, now consistently extended to `decimal32`/`decimal64` too, not a new one.
+### Decimal: native support, pstree-only
+
+All four Arrow decimal widths map to `attribute_type::decimal`, backed by a real `pstree::Int256`
+(four `uint64_t` limbs, two's-complement) - not a lossy `double`, and not the earlier `string`
+stopgap this project shipped before a native type existed. `a-tree`/`be-tree` have no decimal
+representation at all and reject a `decimal`-typed attribute at schema-construction time
+(`matching_engine_error`) - this is `pstree`-only, the mirror image of `string_list`/`integer_list`
+being atree/betree-only (not pstree).
+
+**Scale is declared once per attribute, never per value**: `decimal_scale` is required in the
+attribute's own config (`decimal_scale: 2` in YAML, or a config-file-declared attribute - not
+currently settable via `--attr`). Every Arrow decimal value reaching that attribute - regardless of
+which of the four widths its own source column actually is - gets widened to `arrow::Decimal256`
+(via its own explicit widening constructors from 128/64/32) and `Rescale()`d to that ONE canonical
+scale before it ever becomes a `pstree::Value`. If two source columns feeding the same logical
+attribute declare different scales, pick one canonical scale wide enough for both.
+
+**Event values are exact; subscription literal thresholds are not, by design.** `be-tree`'s own
+reused parser (`pstree_dialect.cpp`, reused specifically because it's already-tested - see that
+file's own doc comment) has no decimal literal kind at all: a subscription's own numeric literal
+(e.g. the `100.50` in `amount > 100.50`) is parsed as an ordinary `int64`/`double`, indistinguishable
+from a real integer/float attribute's own literal, and gets *promoted* to the target attribute's
+canonical-scale `Int256` from that already-double-rounded value. This means the EVENT side is exact
+even at 76 significant digits (`decimal256`'s own ceiling), but the QUERY side is capped at
+IEEE-754 double precision (~15-17 significant digits) - the same cap every other numeric attribute
+type in this system already lives with, not a new decimal-specific regression. Getting an exact
+literal through would mean extending `be-tree`'s own lexer/grammar to carry a real decimal token -
+real, bounded, but cross-repo (the user's own diverged `be-tree` fork) and deliberately out of scope
+for now.
+
+**`in`/`not in` is not supported against a decimal attribute at all** - confirmed empirically, not
+assumed: decimal attributes are declared as an ordinary `float` in the parsing-only `be-tree`
+instance `pstree_matching_engine` uses (`build_betree_for_pstree_parsing`), and `be-tree`'s own
+semantic binding already rejects `in`/`not in` against ANY float-typed attribute in this whole
+project (`BETREE_FLOAT` never matches an integer literal list) - a real, pre-existing `be-tree`
+limitation decimal simply inherits, not something new this support introduced.
 
 No Arrow list/struct/nested type ever appears in `pg_arrow`'s own output (rejected at the SQL
 layer), so `string_list`/`integer_list` attributes are simply unreachable via Arrow input.

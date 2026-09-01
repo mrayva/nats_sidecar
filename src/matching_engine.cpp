@@ -64,6 +64,9 @@ atree::Tree build_atree(const std::vector<attribute_def>& attributes) {
             case attribute_type::string:       builder.with_string(attr.name); break;
             case attribute_type::string_list:  builder.with_string_list(attr.name); break;
             case attribute_type::integer_list: builder.with_integer_list(attr.name); break;
+            case attribute_type::decimal:
+                throw matching_engine_error(
+                    "atree does not support decimal attributes: '" + attr.name + "'");
         }
     }
     return std::move(builder).build();
@@ -90,6 +93,10 @@ public:
     }
     void with_integer_list(std::string_view name, const std::vector<int64_t>& values) override {
         m_builder.with_integer_list(name, values);
+    }
+    void with_decimal(std::string_view name, const pstree::Int256&) override {
+        throw matching_engine_error(
+            "atree does not support decimal attributes: '" + std::string(name) + "'");
     }
     void with_undefined(std::string_view name) override {
         m_builder.with_undefined(name);
@@ -158,6 +165,53 @@ be::Tree build_betree(const std::vector<attribute_def>& attributes,
                 tree.add_integer(attr.name, true, kBetreeIntMin, kBetreeIntMax);
                 break;
             case attribute_type::float_val:
+                tree.add_float(attr.name, true, kBetreeFloatMin, kBetreeFloatMax);
+                break;
+            case attribute_type::string:
+                tree.add_string(attr.name, true, kBetreeStringCount);
+                break;
+            case attribute_type::string_list:
+                tree.add_string_list(attr.name, true, kBetreeStringCount);
+                break;
+            case attribute_type::integer_list:
+                tree.add_integer_list(attr.name, true, kBetreeIntMin, kBetreeIntMax);
+                break;
+            case attribute_type::decimal:
+                throw matching_engine_error(
+                    "betree does not support decimal attributes: '" + attr.name + "'");
+        }
+        indices_out.set(attr.name, idx++);
+    }
+    return tree;
+}
+
+// pstree_matching_engine's own private be-tree instance exists PURELY to reuse be-tree's
+// already-tested parser (see pstree_dialect.hpp's own top-of-file comment) - never searched,
+// never matched against a real event. Unlike build_betree() above (which builds be-tree's REAL
+// matching schema, and correctly throws on `decimal` since be-tree has no native decimal
+// representation to match against), this variant treats a decimal-typed attribute as an
+// ordinary be-tree float for PARSING PURPOSES ONLY - accepting the same int64/double literal
+// syntax any other numeric attribute would (pstree_dialect.cpp's own literal-promotion step is
+// what turns that parsed int64/double into a canonical-scale Int256 afterward). Deliberately a
+// separate function, not build_betree() plus a bool flag - this codebase's own convention (see
+// pstree::StringInternTable's internForInsert/lookupForSearch split) is a separate,
+// purpose-named function over a flag parameter when two callers have genuinely different
+// correctness requirements for the same case, not a cosmetic split.
+be::Tree build_betree_for_pstree_parsing(const std::vector<attribute_def>& attributes,
+                                          small_attr_map<std::size_t>& indices_out)
+{
+    be::Tree tree;
+    std::size_t idx = 0;
+    for (const auto& attr : attributes) {
+        switch (attr.type) {
+            case attribute_type::boolean:
+                tree.add_boolean(attr.name, true);
+                break;
+            case attribute_type::integer:
+                tree.add_integer(attr.name, true, kBetreeIntMin, kBetreeIntMax);
+                break;
+            case attribute_type::float_val:
+            case attribute_type::decimal:
                 tree.add_float(attr.name, true, kBetreeFloatMin, kBetreeFloatMax);
                 break;
             case attribute_type::string:
@@ -254,6 +308,10 @@ public:
         std::size_t idx = index_for(name);
         m_event.set_integer_list(idx, values);
         m_touched[idx] = true;
+    }
+    void with_decimal(std::string_view name, const pstree::Int256&) override {
+        throw matching_engine_error(
+            "betree does not support decimal attributes: '" + std::string(name) + "'");
     }
     void with_undefined(std::string_view name) override {
         // Deliberately NOT marked touched, and deliberately still goes
@@ -457,12 +515,33 @@ std::vector<pstree::AttrSchema> build_pstree_schema(const std::vector<attribute_
                 // (pst_dynamic.hpp) and matching_engine.cpp's own comment above this function.
                 schema.push_back({attr.name, pstree::ValueType::kString, 0, nullptr});
                 break;
+            case attribute_type::decimal:
+                // attr.decimal_scale is guaranteed present here - required and validated in
+                // finalize_and_validate_config() (cli.cpp) whenever type == decimal.
+                schema.push_back({attr.name, pstree::ValueType::kDecimal, 0, nullptr,
+                                   *attr.decimal_scale});
+                break;
             case attribute_type::string_list:
             case attribute_type::integer_list:
                 break;
         }
     }
     return schema;
+}
+
+// Attribute name -> canonical decimal_scale, for whichever attributes are decimal-typed -
+// pstree_dialect.cpp's ast_to_pstree_dnf() needs this to promote a be-tree-parsed int64/double
+// literal into the target attribute's own canonical-scale pstree::Int256 (see that file's own
+// doc comment). Built once at construction (see pstree_matching_engine's own member below),
+// reused across every insert() call.
+decimal_scale_map make_decimal_scales(const std::vector<attribute_def>& attributes) {
+    decimal_scale_map out;
+    for (const auto& attr : attributes) {
+        if (attr.type == attribute_type::decimal && attr.decimal_scale) {
+            out[attr.name] = *attr.decimal_scale;
+        }
+    }
+    return out;
 }
 
 // No incremental population API to speak of: PSTDynamic::Event is just a
@@ -482,6 +561,9 @@ public:
     }
     void with_string(std::string_view name, std::string_view value) override {
         m_event.push_back({std::string(name), pstree::Value(std::string(value))});
+    }
+    void with_decimal(std::string_view name, const pstree::Int256& value) override {
+        m_event.push_back({std::string(name), pstree::Value(value)});
     }
     void with_string_list(std::string_view name, const std::vector<std::string>&) override {
         throw matching_engine_error(
@@ -507,8 +589,9 @@ private:
 class pstree_matching_engine : public matching_engine {
 public:
     explicit pstree_matching_engine(std::vector<attribute_def> attributes)
-        : m_parsing_tree(build_betree(attributes, m_unused_indices)),
-          m_pstd(build_pstree_schema(attributes)) {}
+        : m_parsing_tree(build_betree_for_pstree_parsing(attributes, m_unused_indices)),
+          m_pstd(build_pstree_schema(attributes)),
+          m_decimalScales(make_decimal_scales(attributes)) {}
 
     // Frees every `betree_sub*` insert() ever parsed against m_parsing_tree - see insert()'s
     // own comment for why this can't happen any earlier (a real, confirmed use-after-free found
@@ -578,7 +661,7 @@ public:
             throw matching_engine_error("pstree: invalid expression: " + expression);
         }
         m_parsed_subs.push_back(sub);
-        std::vector<pstree_clause> dnf = ast_to_pstree_dnf(sub->expr);
+        std::vector<pstree_clause> dnf = ast_to_pstree_dnf(sub->expr, m_decimalScales);
 
         bool useDirectId = (dnf.size() == 1) && ((id & kSyntheticIdBit) == 0);
 
@@ -680,6 +763,14 @@ private:
     // freeing any earlier is a real, confirmed use-after-free.
     std::vector<struct betree_sub*> m_parsed_subs;
     pstree::PSTDynamic m_pstd;
+    // Built once from the constructor's own `attributes` (make_decimal_scales) - insert()'s own
+    // ast_to_pstree_dnf() call needs this to promote a be-tree-parsed literal into the target
+    // attribute's canonical-scale pstree::Int256, see pstree_dialect.hpp's own doc comment.
+    // Declared here (not earlier) so its position matches the constructor's own initializer-list
+    // order (member init order always follows DECLARATION order, not initializer-list order -
+    // see pstree's own commit history for a real -Wreorder bug caught from exactly this
+    // mismatch previously).
+    decimal_scale_map m_decimalScales;
     std::unordered_map<uint64_t, uint64_t> m_clause_to_sub;
     uint64_t m_next_clause_id = 1;
     // Scratch set for search()'s dedup pass - see its own comment. `mutable` because search()

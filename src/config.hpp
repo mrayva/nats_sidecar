@@ -7,19 +7,30 @@
 
 namespace sidecar {
 
-// Matches atree::AttributeType
+// Matches atree::AttributeType, plus `decimal` - pstree-only (native DECIMAL32/64/128/256
+// support backed by pstree::Int256, see matching_engine.hpp's event_sink::with_decimal and
+// pstree/pst_dynamic.hpp's ValueType::kDecimal); a-tree/be-tree have no native decimal
+// representation and reject it, the same lazy-per-expression pattern already used for
+// pstree rejecting string_list/integer_list, not new startup-time validation.
 enum class attribute_type {
     boolean,
     integer,
     float_val,
     string,
     string_list,
-    integer_list
+    integer_list,
+    decimal
 };
 
 struct attribute_def {
     std::string name;
     attribute_type type;
+    // Required (validated in finalize_and_validate_config) when type == decimal, rejected if
+    // set for any other type. The ONE canonical scale every value reaching this attribute -
+    // event or subscription literal - gets rescaled to before it becomes a pstree::Value; see
+    // pstree/pst_dynamic.hpp's AttrSchema::decimalScale for why this lives once per attribute
+    // rather than once per value.
+    std::optional<std::int32_t> decimal_scale;
 };
 
 // Supported binary serialization formats. `arrow` is read-only: valid as a

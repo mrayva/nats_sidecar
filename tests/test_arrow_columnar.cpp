@@ -178,6 +178,24 @@ std::shared_ptr<arrow::Array> decimal64_array(
     return arr;
 }
 
+std::shared_ptr<arrow::Array> decimal256_array(
+    const std::vector<std::optional<std::string>>& values, int32_t precision, int32_t scale) {
+    auto type = arrow::decimal256(precision, scale);
+    arrow::Decimal256Builder builder(type);
+    for (auto& v : values) {
+        if (v) {
+            auto dec = arrow::Decimal256::FromString(*v);
+            EXPECT_TRUE(dec.ok());
+            EXPECT_TRUE(builder.Append(*dec).ok());
+        } else {
+            EXPECT_TRUE(builder.AppendNull().ok());
+        }
+    }
+    std::shared_ptr<arrow::Array> arr;
+    EXPECT_TRUE(builder.Finish(&arr).ok());
+    return arr;
+}
+
 std::shared_ptr<arrow::Array> half_float_array(const std::vector<std::optional<double>>& values) {
     arrow::HalfFloatBuilder builder;
     for (auto& v : values) {
@@ -283,31 +301,88 @@ TEST(arrow_columnar_rows, round_trip_binary_as_string) {
     EXPECT_EQ(std::string(cell.asStringView()), raw);
 }
 
-TEST(arrow_columnar_rows, round_trip_decimal128_as_string) {
+namespace {
+pstree::Int256 int256_from_i64(std::int64_t v) {
+    pstree::Int256 r;
+    std::uint64_t bits = static_cast<std::uint64_t>(v);
+    std::uint64_t fill = (v < 0) ? ~std::uint64_t{0} : std::uint64_t{0};
+    r.limb = {bits, fill, fill, fill};
+    return r;
+}
+} // namespace
+
+// Native decimal path (superseded the earlier same-session string mapping - see
+// arrow_columnar_rows.hpp's own header comment for why: ordering comparisons against a
+// string-typed attribute are a hard parse-time rejection in this grammar, not a merely-
+// lexicographic one, so decimal32/64/128 moved onto the same native Int256 path decimal256
+// needed anyway). asDecimal(targetScale) at the SAME scale as the column (no rescale needed).
+TEST(arrow_columnar_rows, round_trip_decimal128_native) {
     auto stream = build_arrow_ipc_stream({"amount"}, {decimal128_array({std::string("123.45")}, 10, 2)});
     sidecar::ArrowColumnarRows rows(as_span(stream));
     auto it = rows.begin();
     auto cell = (*it)["amount"];
-    EXPECT_TRUE(cell.isString());
-    EXPECT_EQ(std::string(cell.asStringView()), "123.45");
+    EXPECT_TRUE(cell.isDecimal());
+    EXPECT_FALSE(cell.isString()); // decimal no longer routes through isString()
+    EXPECT_EQ(cell.asDecimal(2), int256_from_i64(12345));
 }
 
-TEST(arrow_columnar_rows, round_trip_decimal32_as_string) {
+TEST(arrow_columnar_rows, round_trip_decimal32_native) {
     auto stream = build_arrow_ipc_stream({"amount"}, {decimal32_array({std::string("123.45")}, 9, 2)});
     sidecar::ArrowColumnarRows rows(as_span(stream));
     auto it = rows.begin();
     auto cell = (*it)["amount"];
-    EXPECT_TRUE(cell.isString());
-    EXPECT_EQ(std::string(cell.asStringView()), "123.45");
+    EXPECT_TRUE(cell.isDecimal());
+    EXPECT_EQ(cell.asDecimal(2), int256_from_i64(12345));
 }
 
-TEST(arrow_columnar_rows, round_trip_decimal64_as_string) {
+TEST(arrow_columnar_rows, round_trip_decimal64_native) {
     auto stream = build_arrow_ipc_stream({"amount"}, {decimal64_array({std::string("123456789.12")}, 18, 2)});
     sidecar::ArrowColumnarRows rows(as_span(stream));
     auto it = rows.begin();
     auto cell = (*it)["amount"];
-    EXPECT_TRUE(cell.isString());
-    EXPECT_EQ(std::string(cell.asStringView()), "123456789.12");
+    EXPECT_TRUE(cell.isDecimal());
+    EXPECT_EQ(cell.asDecimal(2), int256_from_i64(12345678912LL));
+}
+
+// Rescale exercised for real: column declares scale 2, we ask for scale 4 (x100) - this is the
+// one place arrow::BasicDecimal256::Rescale() actually gets called in these tests, not just the
+// "already at the target scale, no-op" path the tests above all take.
+TEST(arrow_columnar_rows, decimal_rescale_to_wider_scale) {
+    auto stream = build_arrow_ipc_stream({"amount"}, {decimal128_array({std::string("123.45")}, 10, 2)});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["amount"];
+    EXPECT_EQ(cell.asDecimal(4), int256_from_i64(1234500));
+}
+
+// Negative values through the full widen+rescale pipeline - a real risk spot given Int256's own
+// two's-complement sign-extension on widening (BasicDecimal256's own explicit constructors from
+// 32/64/128 - confirmed against the installed Arrow headers before relying on them).
+TEST(arrow_columnar_rows, decimal_negative_value_native) {
+    auto stream = build_arrow_ipc_stream({"amount"}, {decimal128_array({std::string("-42.10")}, 10, 2)});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["amount"];
+    EXPECT_EQ(cell.asDecimal(2), int256_from_i64(-4210));
+}
+
+// DECIMAL256 specifically - the one width that never had ANY nats_sidecar support before this
+// change (not even the earlier string mapping - see arrow_columnar_rows.hpp's is_supported_type,
+// which explicitly rejected it). Used directly here (no widening needed, unlike 32/64/128) to
+// confirm the DECIMAL256 case of asDecimal()'s own switch, not just its widening constructors.
+TEST(arrow_columnar_rows, round_trip_decimal256_native) {
+    auto stream = build_arrow_ipc_stream({"amount"}, {decimal256_array({std::string("999999999999999999999.99")}, 50, 2)});
+    sidecar::ArrowColumnarRows rows(as_span(stream));
+    auto it = rows.begin();
+    auto cell = (*it)["amount"];
+    EXPECT_TRUE(cell.isDecimal());
+    // 999999999999999999999.99 * 100 = 99999999999999999999999 - larger than int64_t can hold,
+    // so this genuinely exercises the >64-bit range only DECIMAL256 (not 32/64/128) can reach.
+    auto raw = arrow::Decimal256::FromString("99999999999999999999999");
+    ASSERT_TRUE(raw.ok());
+    pstree::Int256 expected;
+    expected.limb = raw->little_endian_array();
+    EXPECT_EQ(cell.asDecimal(2), expected);
 }
 
 TEST(arrow_columnar_rows, round_trip_half_float_widens_losslessly) {

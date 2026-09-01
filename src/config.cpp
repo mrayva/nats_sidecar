@@ -30,6 +30,7 @@ std::optional<attribute_type> parse_attribute_type(const std::string& s) {
     if (s == "string" || s == "str")       return attribute_type::string;
     if (s == "string_list")                return attribute_type::string_list;
     if (s == "integer_list" || s == "int_list") return attribute_type::integer_list;
+    if (s == "decimal")                    return attribute_type::decimal;
     return std::nullopt;
 }
 
@@ -228,6 +229,7 @@ config load_config(const std::string& path) {
             auto type = parse_attribute_type(item["type"].as<std::string>());
             if (!type) throw std::runtime_error("config: invalid attribute type: " + item["type"].as<std::string>());
             def.type = *type;
+            if (auto scale = item["decimal_scale"]) def.decimal_scale = scale.as<std::int32_t>();
             cfg.attributes.push_back(std::move(def));
         }
     } else {

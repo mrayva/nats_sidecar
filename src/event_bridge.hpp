@@ -29,16 +29,31 @@ namespace sidecar {
 // looks this up once per (row, attribute) pair).
 struct attribute_schema {
     string_view_lookup_map<attribute_type> types;
+    // Meaningful only for attribute_type::decimal entries - the one canonical scale (see
+    // pstree/pst_dynamic.hpp's AttrSchema::decimalScale) every value reaching that attribute
+    // gets rescaled to, event or subscription literal alike. Kept as its own lookup rather than
+    // folded into `types` since every other attribute_type has no equivalent per-attribute
+    // config to carry.
+    string_view_lookup_map<std::int32_t> decimalScales;
 
     explicit attribute_schema(const std::vector<attribute_def>& defs) {
         for (const auto& d : defs) {
             types[d.name] = d.type;
+            if (d.type == attribute_type::decimal && d.decimal_scale) {
+                decimalScales[d.name] = *d.decimal_scale;
+            }
         }
     }
 
     std::optional<attribute_type> lookup(std::string_view name) const {
         auto it = types.find(name);
         if (it != types.end()) return it->second;
+        return std::nullopt;
+    }
+
+    std::optional<std::int32_t> decimalScaleFor(std::string_view name) const {
+        auto it = decimalScales.find(name);
+        if (it != decimalScales.end()) return it->second;
         return std::nullopt;
     }
 };
@@ -101,6 +116,28 @@ bool populate_event(
                 case attribute_type::string:
                     if (value.isString()) {
                         builder.with_string(key_sv, value.asStringView());
+                    } else {
+                        builder.with_undefined(key_sv);
+                    }
+                    break;
+
+                case attribute_type::decimal:
+                    // Only ArrowColumnarRows's own cell view has isDecimal()/asDecimal() - no
+                    // other Reader (every pg_zerialize-backed format) has a native decimal
+                    // concept at all (see arrow_columnar_rows.hpp's own header comment). This
+                    // populate_event() template is instantiated once per Reader type, so the
+                    // `if constexpr` guard is load-bearing, not decorative: without it, this
+                    // switch case would fail to COMPILE for every non-Arrow Reader, not just
+                    // fail at runtime - same idiom zerialize's own translate.hpp already uses
+                    // for raw_copy_safe()/mapEntries()/elements(), confirmed before relying on
+                    // it here too.
+                    if constexpr (requires (std::int32_t s) { value.isDecimal(); value.asDecimal(s); }) {
+                        auto scale = schema.decimalScaleFor(key_sv);
+                        if (scale && value.isDecimal()) {
+                            builder.with_decimal(key_sv, value.asDecimal(*scale));
+                        } else {
+                            builder.with_undefined(key_sv);
+                        }
                     } else {
                         builder.with_undefined(key_sv);
                     }

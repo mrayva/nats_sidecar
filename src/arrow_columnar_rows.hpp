@@ -42,26 +42,23 @@
 //     value is exactly representable as a double (fewer exponent/mantissa bits either way), so
 //     this is a lossless widening, exactly like float32/float64 already are - no precision
 //     concern at all, unlike the decimal cases below.
-//   decimal32/decimal64/decimal128 -> string, via <DecimalNArray>::FormatValue(i) - matches
-//     pg_arrow's own precedent of falling back unconstrained numeric to exact text rather than
-//     a lossy double. FormatValue() returns a freshly-allocated std::string (not a view into
-//     existing buffer data), so it's cached on the owning ArrowCellView instance - safe because
-//     that instance is held in a named local by every caller in this codebase (event_bridge.hpp's
-//     populate_event()'s `auto value = reader[key_sv];`) for the duration of its use, not
-//     consumed as an immediately-destroyed temporary. Deliberately NOT collapsed into `integer`
-//     via the column's own declared scale (decimal32/64 numerically WOULD fit in int64 after
-//     scaling) - that representation change would be exact for the EVENT value but would also
-//     silently change what a subscription's own literal has to look like (a raw scaled integer
-//     instead of the natural decimal text a human would write), a real ergonomics/correctness
-//     footgun of its own. String preserves the natural decimal text on both sides at the cost of
-//     LEXICOGRAPHIC (not numeric) ordering for any subscription that compares this attribute
-//     with < / > / <= / >= - a known, pre-existing tradeoff (already true for decimal128 before
-//     decimal32/64 joined it here), not new. decimal128/decimal256 gaining a genuine native
-//     numeric type (pstree's own kFloat/kInteger have no room for 128/256-bit fixed-point, so
-//     this would mean a new pstree ValueType, a new ElementKey codec, AND extending be-tree's
-//     own reused parser - it currently caps every subscription literal at int64/double via
-//     ast_compare_value_e - since that's what actually resolves the ordering footgun on the
-//     query side too) is deliberately deferred, not attempted here.
+//   decimal32/decimal64/decimal128/decimal256 -> attribute_type::decimal, pstree-only (a-tree/
+//     be-tree throw - see matching_engine.hpp's event_sink::with_decimal). All four widths
+//     widen to arrow::Decimal256 (BasicDecimal256's own explicit widening constructors from
+//     128/64/32, confirmed against the installed Arrow headers before relying on them) and
+//     Rescale() to this attribute's own canonical decimal_scale (attribute_schema, event_bridge.
+//     hpp) - the ONE scale every value reaching this dimension is rescaled to, event or literal
+//     alike (see pstree/pst_dynamic.hpp's AttrSchema::decimalScale for why scale lives once per
+//     attribute, never per value). The resulting Int256 (pstree/int256.hpp, four uint64_t limbs,
+//     no scale/precision tag) is exact for the event side; the query/literal side stays capped
+//     at IEEE-754 double precision regardless (be-tree's own reused parser has no decimal
+//     literal kind at all - ast_compare_value_e is int64/double only - so a subscription's own
+//     threshold is already approximated before nats_sidecar ever sees it, the same as every
+//     other numeric attribute type already accepts). This superseded an earlier same-session
+//     stopgap that mapped decimal32/64/128 to `string` (exact text, but ordering comparisons
+//     against a string-typed attribute are a hard PARSE-TIME REJECTION in this grammar, not a
+//     silently-wrong lexicographic one - only `=`/`!=`/`in`/`not in` were ever reachable) - kept
+//     only as historical context, not the current behavior.
 //   date32 / timestamp -> UNSUPPORTED. Rejected at construction time (the whole batch is
 //     poisoned - propagates as a thrown exception, caught by deserialize_and_match_columnar's
 //     existing try/catch, exactly like a malformed payload in any other format). Deliberate:
@@ -78,8 +75,11 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
+#include <arrow/util/decimal.h>
 #include <arrow/util/float16.h>
+#include <pstree/int256.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -112,6 +112,7 @@ inline bool is_supported_type(arrow::Type::type t) {
         case arrow::Type::DECIMAL32:
         case arrow::Type::DECIMAL64:
         case arrow::Type::DECIMAL128:
+        case arrow::Type::DECIMAL256:
             return true;
         default:
             return false;
@@ -154,13 +155,20 @@ public:
     }
     bool isString() const {
         if (isNull()) return false;
-        return type_ == arrow::Type::STRING || type_ == arrow::Type::BINARY
-            || type_ == arrow::Type::DECIMAL32 || type_ == arrow::Type::DECIMAL64
-            || type_ == arrow::Type::DECIMAL128;
+        return type_ == arrow::Type::STRING || type_ == arrow::Type::BINARY;
     }
     bool isBlob()  const { return false; } // binary maps to string, not blob - see this file's own header comment
     bool isMap()   const { return false; }
     bool isArray() const { return false; }
+    // Not part of zerialize::ValueView's own structural concept (no other protocol has a native
+    // decimal kind - see this file's own header comment) - event_bridge.hpp's populate_event()
+    // gates its call to this and asDecimal() behind `if constexpr (requires {...})`, so every
+    // other Reader type simply never instantiates either.
+    bool isDecimal() const {
+        if (isNull()) return false;
+        return type_ == arrow::Type::DECIMAL32 || type_ == arrow::Type::DECIMAL64
+            || type_ == arrow::Type::DECIMAL128 || type_ == arrow::Type::DECIMAL256;
+    }
 
     std::int8_t  asInt8()  const { return static_cast<std::int8_t>(asInt64()); }
     std::int16_t asInt16() const { return static_cast<std::int16_t>(asInt64()); }
@@ -192,9 +200,6 @@ public:
         }
     }
     std::string asString() const { return std::string(asStringView()); }
-    // decimalN's FormatValue() returns a fresh std::string, not a view into existing buffer
-    // data - cached here so the returned string_view stays valid for as long as this
-    // ArrowCellView instance does (see this file's own header comment on why that's enough).
     std::string_view asStringView() const {
         switch (type_) {
             case arrow::Type::STRING: {
@@ -205,26 +210,58 @@ public:
                 auto v = static_cast<const arrow::BinaryArray&>(*array_).GetView(row_);
                 return std::string_view(v.data(), v.size());
             }
-            case arrow::Type::DECIMAL32:
-                if (!decimal_cache_) {
-                    decimal_cache_ = static_cast<const arrow::Decimal32Array&>(*array_).FormatValue(row_);
-                }
-                return *decimal_cache_;
-            case arrow::Type::DECIMAL64:
-                if (!decimal_cache_) {
-                    decimal_cache_ = static_cast<const arrow::Decimal64Array&>(*array_).FormatValue(row_);
-                }
-                return *decimal_cache_;
-            case arrow::Type::DECIMAL128:
-                if (!decimal_cache_) {
-                    decimal_cache_ = static_cast<const arrow::Decimal128Array&>(*array_).FormatValue(row_);
-                }
-                return *decimal_cache_;
             default:
                 arrow_detail::unsupported("asStringView");
         }
     }
     bool asBool() const { return static_cast<const arrow::BooleanArray&>(*array_).Value(row_); }
+
+    // Reads this cell's raw decimal bytes (whichever of DECIMAL32/64/128/256 the column actually
+    // is), widens to arrow::Decimal256 via its own explicit widening constructors from
+    // 128/64/32 (confirmed against the installed Arrow headers before relying on them), and
+    // Rescale()s from the COLUMN's own declared scale to `targetScale` (this attribute's one
+    // canonical decimal_scale - see this file's own header comment). Throws on a genuine
+    // out-of-range rescale (a value that doesn't fit once rescaled), matching pg_arrow's own
+    // decimalN_from_numeric() error-handling convention for the identical situation on the
+    // publish side. Returns a bare pstree::Int256 - no scale/precision travels with it, by
+    // design (AttrSchema::decimalScale's own comment explains why).
+    pstree::Int256 asDecimal(std::int32_t targetScale) const {
+        int32_t columnScale = static_cast<const arrow::DecimalType&>(*array_->type()).scale();
+        arrow::Decimal256 wide;
+        switch (type_) {
+            case arrow::Type::DECIMAL32:
+                wide = arrow::Decimal256(arrow::Decimal32(
+                    static_cast<const arrow::Decimal32Array&>(*array_).Value(row_)));
+                break;
+            case arrow::Type::DECIMAL64:
+                wide = arrow::Decimal256(arrow::Decimal64(
+                    static_cast<const arrow::Decimal64Array&>(*array_).Value(row_)));
+                break;
+            case arrow::Type::DECIMAL128:
+                wide = arrow::Decimal256(arrow::Decimal128(
+                    static_cast<const arrow::Decimal128Array&>(*array_).Value(row_)));
+                break;
+            case arrow::Type::DECIMAL256:
+                wide = arrow::Decimal256(
+                    static_cast<const arrow::Decimal256Array&>(*array_).Value(row_));
+                break;
+            default:
+                arrow_detail::unsupported("asDecimal");
+        }
+        if (columnScale != targetScale) {
+            auto rescaled = wide.Rescale(columnScale, targetScale);
+            if (!rescaled.ok()) {
+                throw std::runtime_error(
+                    "ArrowColumnarRows: decimal value does not fit after rescaling from "
+                    "column scale " + std::to_string(columnScale) + " to attribute scale " +
+                    std::to_string(targetScale) + ": " + rescaled.status().ToString());
+            }
+            wide = rescaled.ValueOrDie();
+        }
+        pstree::Int256 out;
+        out.limb = wide.little_endian_array();
+        return out;
+    }
 
     [[noreturn]] std::span<const std::string_view> mapKeys() const { arrow_detail::unsupported("mapKeys"); }
     bool contains(std::string_view) const { return false; }
@@ -245,7 +282,6 @@ private:
     const arrow::Array* array_ = nullptr;
     std::int64_t row_ = 0;
     arrow::Type::type type_ = arrow::Type::NA;
-    mutable std::optional<std::string> decimal_cache_;
 };
 
 // The row cursor: satisfies zerialize::Reader (ValueView + operator[]). One ArrowColumnarRows

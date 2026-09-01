@@ -8,6 +8,8 @@
 #include <ast.h>
 #include <value.h>
 
+#include <cmath>
+#include <limits>
 #include <string>
 
 namespace sidecar {
@@ -72,26 +74,59 @@ dnf_result always(bool value) {
     return out;
 }
 
-dnf_result to_dnf(const struct ast_node* node, bool negate);
+dnf_result to_dnf(const struct ast_node* node, bool negate, const decimal_scale_map& decimalScales);
 
-dnf_result to_dnf_bool_expr(const struct ast_bool_expr& b, bool negate) {
+// be-tree's own grammar/lexer has no decimal literal kind at all (num_comp_value/eq_value are
+// int64/double/string only - confirmed directly against parser.y/ast.h before designing this,
+// see pstree_dialect.hpp's own doc comment on ast_to_pstree_dnf) - a literal compared against a
+// decimal-typed attribute arrives here as an ordinary already-double-rounded AST value, exactly
+// like any other numeric attribute's own literal. This promotes it into the target attribute's
+// canonical-scale pstree::Int256 - scaling by 10^scale and rounding to the nearest integer is
+// where the query side's own precision cap actually bites (the literal was already rounded to a
+// double by be-tree's lexer before this function ever runs; this step doesn't lose anything
+// further beyond that, but it doesn't recover it either - see the project plan's own "Design
+// decision 2" for why that's accepted, not chased). Throws if the scaled magnitude doesn't fit
+// in int64_t - a narrower, real limitation on top of the double cap (a modest-looking literal
+// with a very high canonical scale can overflow after scaling, well before double's own ~15-17
+// significant-digit limit would otherwise bite) - rejected loudly rather than silently
+// truncated, matching pg_arrow's own Rescale()-overflow error-handling convention on the
+// publish side.
+pstree::Int256 promote_literal_to_decimal(double numericValue, std::int32_t scale, const std::string& attrName) {
+    double scaled = numericValue * std::pow(10.0, scale);
+    double rounded = std::round(scaled);
+    if (!std::isfinite(rounded) ||
+        rounded > static_cast<double>(std::numeric_limits<std::int64_t>::max()) ||
+        rounded < static_cast<double>(std::numeric_limits<std::int64_t>::min())) {
+        throw matching_engine_error(
+            "pstree: decimal literal for attribute '" + attrName + "' does not fit after "
+            "scaling to this attribute's own decimal_scale (" + std::to_string(scale) + ")");
+    }
+    std::int64_t iv = static_cast<std::int64_t>(rounded);
+    pstree::Int256 out;
+    std::uint64_t bits = static_cast<std::uint64_t>(iv);
+    std::uint64_t fill = (iv < 0) ? ~std::uint64_t{0} : std::uint64_t{0};
+    out.limb = {bits, fill, fill, fill};
+    return out;
+}
+
+dnf_result to_dnf_bool_expr(const struct ast_bool_expr& b, bool negate, const decimal_scale_map& decimalScales) {
     switch (b.op) {
         case AST_BOOL_AND: {
-            auto lhs = to_dnf(b.binary.lhs, negate);
-            auto rhs = to_dnf(b.binary.rhs, negate);
+            auto lhs = to_dnf(b.binary.lhs, negate, decimalScales);
+            auto rhs = to_dnf(b.binary.rhs, negate, decimalScales);
             // De Morgan: NOT(A and B) = NOT(A) or NOT(B) - OR'd, not cross-multiplied.
             return negate ? union_of(std::move(lhs), std::move(rhs))
                           : cross_product(lhs, rhs);
         }
         case AST_BOOL_OR: {
-            auto lhs = to_dnf(b.binary.lhs, negate);
-            auto rhs = to_dnf(b.binary.rhs, negate);
+            auto lhs = to_dnf(b.binary.lhs, negate, decimalScales);
+            auto rhs = to_dnf(b.binary.rhs, negate, decimalScales);
             // De Morgan: NOT(A or B) = NOT(A) and NOT(B) - cross-multiplied, not OR'd.
             return negate ? cross_product(lhs, rhs)
                           : union_of(std::move(lhs), std::move(rhs));
         }
         case AST_BOOL_NOT:
-            return to_dnf(b.unary.expr, !negate);
+            return to_dnf(b.unary.expr, !negate, decimalScales);
         case AST_BOOL_VARIABLE: {
             // A bare boolean identifier ("flag") means "flag = true"; negated, "flag =
             // false" - both directly representable as kEq, no need for kNe here.
@@ -104,7 +139,7 @@ dnf_result to_dnf_bool_expr(const struct ast_bool_expr& b, bool negate) {
     throw matching_engine_error("pstree: unreachable ast_bool_e");
 }
 
-dnf_result to_dnf_compare_expr(const struct ast_compare_expr& c, bool negate) {
+dnf_result to_dnf_compare_expr(const struct ast_compare_expr& c, bool negate, const decimal_scale_map& decimalScales) {
     pstree::CmpOp op;
     switch (c.op) {
         // De Morgan on ordering: NOT(x<v)=x>=v, NOT(x<=v)=x>v, NOT(x>v)=x<=v, NOT(x>=v)=x<v.
@@ -114,14 +149,21 @@ dnf_result to_dnf_compare_expr(const struct ast_compare_expr& c, bool negate) {
         case AST_COMPARE_GE: op = negate ? pstree::CmpOp::kLt : pstree::CmpOp::kGe; break;
         default: throw matching_engine_error("pstree: unreachable ast_compare_e");
     }
-    pstree::Value val = (c.value.value_type == AST_COMPARE_VALUE_INTEGER)
-        ? pstree::Value(c.value.integer_value)
-        : pstree::Value(c.value.float_value);
+    double numeric = (c.value.value_type == AST_COMPARE_VALUE_INTEGER)
+        ? static_cast<double>(c.value.integer_value) : c.value.float_value;
+    pstree::Value val;
+    if (auto it = decimalScales.find(c.attr_var.attr); it != decimalScales.end()) {
+        val = pstree::Value(promote_literal_to_decimal(numeric, it->second, c.attr_var.attr));
+    } else {
+        val = (c.value.value_type == AST_COMPARE_VALUE_INTEGER)
+            ? pstree::Value(c.value.integer_value)
+            : pstree::Value(c.value.float_value);
+    }
     pstree::SubPredicate pred{c.attr_var.attr, op, {val}};
     return single_predicate(std::move(pred));
 }
 
-dnf_result to_dnf_equality_expr(const struct ast_equality_expr& e, bool negate) {
+dnf_result to_dnf_equality_expr(const struct ast_equality_expr& e, bool negate, const decimal_scale_map& decimalScales) {
     if (e.value.value_type == AST_EQUALITY_VALUE_INTEGER_ENUM) {
         throw matching_engine_error("pstree: integer-enum equality values are not supported");
     }
@@ -129,17 +171,24 @@ dnf_result to_dnf_equality_expr(const struct ast_equality_expr& e, bool negate) 
     if (e.op == AST_EQUALITY_EQ) op = negate ? pstree::CmpOp::kNe : pstree::CmpOp::kEq;
     else op = negate ? pstree::CmpOp::kEq : pstree::CmpOp::kNe;
     pstree::Value val;
-    switch (e.value.value_type) {
-        case AST_EQUALITY_VALUE_INTEGER: val = pstree::Value(e.value.integer_value); break;
-        case AST_EQUALITY_VALUE_FLOAT: val = pstree::Value(e.value.float_value); break;
-        case AST_EQUALITY_VALUE_STRING: val = pstree::Value(std::string(e.value.string_value.string)); break;
-        default: throw matching_engine_error("pstree: unreachable ast_equality_value_e");
+    if (auto it = decimalScales.find(e.attr_var.attr);
+        it != decimalScales.end() && e.value.value_type != AST_EQUALITY_VALUE_STRING) {
+        double numeric = (e.value.value_type == AST_EQUALITY_VALUE_INTEGER)
+            ? static_cast<double>(e.value.integer_value) : e.value.float_value;
+        val = pstree::Value(promote_literal_to_decimal(numeric, it->second, e.attr_var.attr));
+    } else {
+        switch (e.value.value_type) {
+            case AST_EQUALITY_VALUE_INTEGER: val = pstree::Value(e.value.integer_value); break;
+            case AST_EQUALITY_VALUE_FLOAT: val = pstree::Value(e.value.float_value); break;
+            case AST_EQUALITY_VALUE_STRING: val = pstree::Value(std::string(e.value.string_value.string)); break;
+            default: throw matching_engine_error("pstree: unreachable ast_equality_value_e");
+        }
     }
     pstree::SubPredicate pred{e.attr_var.attr, op, {val}};
     return single_predicate(std::move(pred));
 }
 
-dnf_result to_dnf_set_expr(const struct ast_set_expr& s, bool negate) {
+dnf_result to_dnf_set_expr(const struct ast_set_expr& s, bool negate, const decimal_scale_map&) {
     if (s.left_value.value_type != AST_SET_LEFT_VALUE_VARIABLE) {
         throw matching_engine_error("pstree: 'in'/'not in' with a literal (not an attribute) on the left is not supported");
     }
@@ -147,6 +196,17 @@ dnf_result to_dnf_set_expr(const struct ast_set_expr& s, bool negate) {
     pstree::CmpOp op = (is_in != negate) ? pstree::CmpOp::kElemOf : pstree::CmpOp::kNotElemOf;
     std::vector<pstree::Value> vals;
     switch (s.right_value.value_type) {
+        // No decimal-promotion branch here, unlike to_dnf_compare_expr/to_dnf_equality_expr -
+        // confirmed EMPIRICALLY (not assumed) that "in"/"not in" against a decimal-typed
+        // attribute already fails to PARSE, before this function ever runs: decimal attributes
+        // are declared via add_float in the parsing-only be-tree schema
+        // (build_betree_for_pstree_parsing), and be-tree's own semantic binding requires an
+        // exact match between a variable's declared type and "in"'s literal-list type -
+        // BETREE_FLOAT never matches an integer list, for ANY float-typed attribute, not just
+        // decimal ones (verified directly: even a plain pre-existing float_val attribute like
+        // "trade_price in (10, 20)" is already rejected the same way in this project, with no
+        // decimal involved at all). `decimalScales` is accepted here only to keep this
+        // function's signature uniform with its siblings in the to_dnf_* family, unused.
         case AST_SET_RIGHT_VALUE_INTEGER_LIST: {
             const auto* list = s.right_value.integer_list_value;
             vals.reserve(list->count);
@@ -176,12 +236,12 @@ dnf_result to_dnf_is_null_expr(const struct ast_is_null_expr& n, bool negate) {
     return single_predicate(std::move(pred));
 }
 
-dnf_result to_dnf(const struct ast_node* node, bool negate) {
+dnf_result to_dnf(const struct ast_node* node, bool negate, const decimal_scale_map& decimalScales) {
     switch (node->type) {
-        case AST_TYPE_BOOL_EXPR: return to_dnf_bool_expr(node->bool_expr, negate);
-        case AST_TYPE_COMPARE_EXPR: return to_dnf_compare_expr(node->compare_expr, negate);
-        case AST_TYPE_EQUALITY_EXPR: return to_dnf_equality_expr(node->equality_expr, negate);
-        case AST_TYPE_SET_EXPR: return to_dnf_set_expr(node->set_expr, negate);
+        case AST_TYPE_BOOL_EXPR: return to_dnf_bool_expr(node->bool_expr, negate, decimalScales);
+        case AST_TYPE_COMPARE_EXPR: return to_dnf_compare_expr(node->compare_expr, negate, decimalScales);
+        case AST_TYPE_EQUALITY_EXPR: return to_dnf_equality_expr(node->equality_expr, negate, decimalScales);
+        case AST_TYPE_SET_EXPR: return to_dnf_set_expr(node->set_expr, negate, decimalScales);
         case AST_TYPE_LIST_EXPR:
             throw matching_engine_error("pstree: list-attribute operators (one of/none of/all of) are not supported");
         case AST_TYPE_SPECIAL_EXPR:
@@ -193,8 +253,9 @@ dnf_result to_dnf(const struct ast_node* node, bool negate) {
 
 } // namespace
 
-std::vector<pstree_clause> ast_to_pstree_dnf(const struct ast_node* node) {
-    dnf_result result = to_dnf(node, false);
+std::vector<pstree_clause> ast_to_pstree_dnf(const struct ast_node* node,
+                                              const decimal_scale_map& decimalScales) {
+    dnf_result result = to_dnf(node, false, decimalScales);
     return std::move(result.clauses);
 }
 

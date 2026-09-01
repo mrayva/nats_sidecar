@@ -307,6 +307,91 @@ TEST(matching_engine, pstree_and_or_not_combinators_and_reuse) {
     EXPECT_TRUE(contains(r2, 3));
 }
 
+namespace {
+std::vector<sidecar::attribute_def> decimal_attributes() {
+    // decimal_scale=2 (e.g. cents) - kept SEPARATE from trade_attributes() above rather than
+    // added to it: build_atree()/build_betree() (matching_engine.cpp) throw the moment schema
+    // CONSTRUCTION sees a decimal-typed attribute at all, not just when one is referenced by an
+    // expression - adding it to the shared helper would break every existing
+    // matching_engine_test (atree/betree) parameterized case before any test body even runs.
+    return {{"amount", sidecar::attribute_type::decimal, std::int32_t{2}}};
+}
+
+pstree::Int256 int256_from_i64(std::int64_t v) {
+    pstree::Int256 r;
+    std::uint64_t bits = static_cast<std::uint64_t>(v);
+    std::uint64_t fill = (v < 0) ? ~std::uint64_t{0} : std::uint64_t{0};
+    r.limb = {bits, fill, fill, fill};
+    return r;
+}
+} // namespace
+
+// End-to-end test of pstree_dialect.cpp's own literal-promotion step (the last piece of the
+// native decimal support added this session that hadn't been exercised by anything yet): a real
+// subscription EXPRESSION TEXT ("amount > 100.50") parsed by be-tree's own reused parser
+// (be-tree has no decimal literal kind at all - the "100.50" arrives as an ordinary AST double),
+// promoted to a canonical-scale Int256 by ast_to_pstree_dnf(), matched against a real event
+// built via event_sink::with_decimal(). Covers ordering (>, <=) and equality, not just the
+// pstree-internal predicate-level coverage pstree's own test suite already has.
+TEST(matching_engine, pstree_decimal_ordering_and_equality_end_to_end) {
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, decimal_attributes());
+    engine->insert(1, "amount > 100.50");
+    engine->insert(2, "amount = 42.00");
+    engine->insert(3, "amount <= 10.00");
+
+    auto match_amount = [&](std::int64_t scaledValue) {
+        auto sink = engine->make_event();
+        sink->with_decimal("amount", int256_from_i64(scaledValue));
+        return engine->search(*sink);
+    };
+
+    auto r1 = match_amount(15025); // 150.25 > 100.50
+    EXPECT_TRUE(contains(r1, 1));
+    EXPECT_FALSE(contains(r1, 2));
+    EXPECT_FALSE(contains(r1, 3));
+
+    auto r2 = match_amount(4200); // 42.00 == 42.00
+    EXPECT_FALSE(contains(r2, 1));
+    EXPECT_TRUE(contains(r2, 2));
+    EXPECT_FALSE(contains(r2, 3));
+
+    auto r3 = match_amount(500); // 5.00 <= 10.00
+    EXPECT_FALSE(contains(r3, 1));
+    EXPECT_FALSE(contains(r3, 2));
+    EXPECT_TRUE(contains(r3, 3));
+
+    // The literal promotion boundary itself: exactly 100.50 should NOT satisfy the strict `>`.
+    auto rBoundary = match_amount(10050);
+    EXPECT_FALSE(contains(rBoundary, 1))
+        << "amount > 100.50 should not match amount == 100.50 exactly (strict inequality)";
+}
+
+TEST(matching_engine, pstree_decimal_elem_of_not_supported) {
+    // Confirmed empirically (not assumed) that this is a PRE-EXISTING be-tree limitation, not
+    // decimal-specific: even an ordinary float_val attribute already rejects "in"/"not in" in
+    // this whole project (be-tree's own semantic binding requires the declared variable type
+    // and the literal-list type to match exactly - BETREE_FLOAT never matches an integer list,
+    // regardless of attribute name). Decimal attributes are declared via add_float in the
+    // parsing-only be-tree schema (build_betree_for_pstree_parsing), so they inherit this exact
+    // restriction automatically - "in"/"not in" against a decimal attribute fails to PARSE
+    // (a clean matching_engine_error from betree_make_sub returning nullptr), never reaching
+    // ast_to_pstree_dnf's own to_dnf_set_expr at all.
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, decimal_attributes());
+    EXPECT_THROW(engine->insert(1, "amount in (7, 9, 11)"), sidecar::matching_engine_error);
+}
+
+TEST(matching_engine, atree_rejects_decimal_attribute_at_schema_build) {
+    EXPECT_THROW(
+        sidecar::build_matching_engine(sidecar::engine_type::atree, decimal_attributes()),
+        sidecar::matching_engine_error);
+}
+
+TEST(matching_engine, betree_rejects_decimal_attribute_at_schema_build) {
+    EXPECT_THROW(
+        sidecar::build_matching_engine(sidecar::engine_type::betree, decimal_attributes()),
+        sidecar::matching_engine_error);
+}
+
 TEST(matching_engine, atree_accepts_is_not_empty) {
     // a-tree has a real IsNotEmpty token; only be-tree lacks the rule.
     auto engine = sidecar::build_matching_engine(sidecar::engine_type::atree, trade_attributes());

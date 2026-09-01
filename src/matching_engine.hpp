@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include <pstree/int256.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -98,6 +99,11 @@ public:
     virtual void with_string(std::string_view name, std::string_view value) = 0;
     virtual void with_string_list(std::string_view name, const std::vector<std::string>& values) = 0;
     virtual void with_integer_list(std::string_view name, const std::vector<int64_t>& values) = 0;
+    // Native DECIMAL32/64/128/256 support - pstree-only, see config.hpp's own attribute_type
+    // comment. `value` must already be rescaled to this attribute's own canonical
+    // decimal_scale by the caller (event_bridge.hpp's populate_event, or pstree_dialect.cpp's
+    // literal promotion) - this call never rescales.
+    virtual void with_decimal(std::string_view name, const pstree::Int256& value) = 0;
     virtual void with_undefined(std::string_view name) = 0;
 };
 

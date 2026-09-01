@@ -226,6 +226,25 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
     if (cfg.attributes.empty()) {
         return "At least one attribute is required (via config file or --attr)";
     }
+    // decimal_scale is required (config.hpp's own attribute_type comment) whenever type ==
+    // decimal - the ONE canonical scale every value reaching this attribute gets rescaled to
+    // (see pstree/pst_dynamic.hpp's AttrSchema::decimalScale) - and meaningless, so rejected,
+    // for every other type. Engine compatibility (decimal is pstree-only) is deliberately NOT
+    // validated here - matching_engine.cpp's own build_atree()/build_betree() already reject it
+    // lazily, at engine-construction time, the same pattern this project already uses for the
+    // REVERSE restriction (string_list/integer_list rejected for pstree, not validated here
+    // either) - not a startup-time check for consistency with that existing precedent.
+    for (const auto& attr : cfg.attributes) {
+        if (attr.type == attribute_type::decimal && !attr.decimal_scale) {
+            return fmt::format(
+                "attribute '{}': decimal_scale is required for type 'decimal' "
+                "(not currently settable via --attr - use a config file)", attr.name);
+        }
+        if (attr.type != attribute_type::decimal && attr.decimal_scale) {
+            return fmt::format(
+                "attribute '{}': decimal_scale is only meaningful for type 'decimal'", attr.name);
+        }
+    }
     if (cfg.lease_ttl_seconds == 0 || cfg.lease_check_interval_seconds == 0 ||
         cfg.input_queue_max_messages == 0 ||
         cfg.input_queue_max_bytes == 0 || cfg.publish_max_inflight == 0 ||
