@@ -2570,6 +2570,51 @@ shrinking is not yet explained. The raw wall-clock/throughput numbers above are 
 averaging question either way and are what to trust directly - noted honestly as a real, open
 question, not smoothed over, matching this whole investigation's own standing practice.
 
+## A "hot symbol" that wasn't a real win: `to_string` at extreme fan-out, verified and reverted
+
+Re-profiling `sidecar_pipeline_bench` at `s`=1 (K=8000, near-total overlap - `published` shows
+average fan-out is actually ~986 matched subscriptions/row here, not the full 8000 initially
+assumed) surfaced `std::to_string(unsigned long)` as a standalone hot symbol (11.5-17.4% self-time
+across two profiling runs) - traced to two call sites: `subscription_manager::output_subject()`
+rebuilding `output_prefix + "." + to_string(id)` on every call (deduped per-batch, not per-row, but
+still up to K times per batch), and `worker_pool.cpp`'s `append_pub_frame()` recomputing
+`to_string(payload.size())` on *every* matched subscription for a row even though the payload (and
+its size) is identical across all of them.
+
+Both looked like unambiguous wins: cache `output_subject`'s result once at subscribe()/restore()
+time instead of rebuilding it per call, and hoist `to_string(payload.size())` out of the
+per-subscription loop into a once-per-row local. Both were implemented, and both passed the full
+`sidecar_test` suite (plain/ASan+UBSan/ThreadSanitizer) with the existing exact-wire-output tests
+unchanged. A follow-up `perf` profile confirmed `to_string` disappeared entirely from the hot list.
+
+**But the throughput measurement told a different story.** A first interleaved A/B/A/B wall-clock
+comparison (3 pairs) showed a consistent ~5-6% *regression*, not a win. Isolating each change
+separately (stashing one source file at a time to build BEFORE/FIX1-ONLY/FIX2-ONLY/BOTH binaries)
+and a follow-up wall-clock re-test came back murkier - inconsistent, sometimes near-parity - so the
+call was settled with `perf stat -e cycles:u` (a hardware counter, immune to the sampling/dwarf-skid
+concerns and much less sensitive to this shared host's own scheduling noise than wall-clock): 5
+strictly-interleaved BEFORE/AFTER pairs, same command, same inputs. AFTER used *more* total cycles
+than BEFORE in **5 out of 5** pairs (+0.36% to +1.37%, mean ~+0.9%) - small, but completely
+one-sided. Instruction count *did* drop as expected (confirming the redundant computation really
+was eliminated), but IPC dropped too (2.87 vs. a tight 2.98-3.02 for BEFORE, 3-for-3 no overlap) -
+consistent with trading a cheap, register/stack-only computation (both `to_string` calls only ever
+needed inputs already resident: `m_output_prefix`/`id`, or `payload.size()`) for an extra random
+memory access into `subscription_info` (a fairly large struct - `expression` string +
+`unordered_set<string> lease_holders` + the new cached field - sitting in a scattered
+`unordered_map` node, likely cache-cold for any given subscription id at K=8000). The eliminated
+"waste" was real but apparently cheap enough (short-string-optimized, register-bound) that removing
+it didn't pay for the cache-miss cost of fetching it from a colder cache line instead.
+
+**Reverted both changes** (`subscription_manager.cpp`/`.hpp`, `worker_pool.cpp`) rather than ship an
+"optimization" that measured as a net-neutral-to-slightly-negative change. Kept one harmless,
+genuinely useful byproduct: `sidecar_pipeline_bench` now also prints `published` (total pub frames
+written), which is what revealed the real average fan-out at `s`=1 in the first place and remains
+useful for any future investigation at this end of the sweep. This is the same "verify before
+trusting a perf-profile hypothesis" discipline this document has needed more than once already
+(the `avg_match_us` sampling-bias removal, the retracted-then-corrected real-vs-fake publish
+finding) - a hot symbol in a sampling profile is a lead, not a proof, and the fix it suggests still
+has to earn its keep against a real, repeated, low-noise measurement before shipping.
+
 ## License
 
 See LICENSE file.

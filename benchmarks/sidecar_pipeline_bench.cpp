@@ -343,9 +343,9 @@ int main(int argc, char** argv) {
               / double(stats.match_time_count)
         : 0.0;
 
-    std::printf("\nenqueued=%zu (of %zu batches) processed=%llu matched=%llu\n",
+    std::printf("\nenqueued=%zu (of %zu batches) processed=%llu matched=%llu published=%llu\n",
                enqueued, total_batches, (unsigned long long)stats.processed,
-               (unsigned long long)stats.matched);
+               (unsigned long long)stats.matched, (unsigned long long)stats.published);
     std::printf("wall_clock=%.3fs  true_rows_per_sec=%.1f  avg_fanout_us=%.3f  avg_match_us=%.3f\n",
                seconds, rows_per_sec, avg_fanout_us, avg_match_us);
 
