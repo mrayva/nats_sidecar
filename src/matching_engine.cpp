@@ -717,10 +717,25 @@ public:
             // time: confirmed via `perf record`/`perf annotate` on matching_engine_bench at
             // K=20,000 - 66.8% of ALL search-phase self-time was in this function's own compare-
             // and-branch loop, not in PSTDynamic::matchEvent (7.1%) or anywhere else in pstree.
-            // m_seen_scratch is a member (not a local) reused across calls, cleared here, to
-            // avoid a fresh heap allocation on every event - the same reuse pattern already used
-            // elsewhere in this codebase for other per-row hot paths.
-            m_seen_scratch.clear();
+            //
+            // `seen` MUST be thread_local, not a member of this object (an earlier version made
+            // it a plain `mutable` member, m_seen_scratch - a real, confirmed data race: search()
+            // is const and called concurrently by every worker thread against the SAME engine
+            // instance under only a shared_lock (subscription_manager::acquire_tree() - readers
+            // are never serialized against each other, only against writers), so two threads
+            // mutating one std::unordered_set at once corrupted its internal buckets and
+            // segfaulted - reproduced with worker_threads>1 plus any OR'd/multi-clause
+            // subscription (the only shape that reaches this insert() call at all; single-clause
+            // subscriptions take the direct-id `continue` below and never touch this set). This
+            // is the exact class of race pstree's own PSTDynamic::matchEvent() already documents
+            // avoiding for the identical reason (see its own doc comment, and pstree commit
+            // c7704e9's SubPredicate fix) - that lesson just hadn't reached this wrapper's own
+            // scratch-buffer optimization, added independently and earlier. `static thread_local`
+            // keeps the original point of being a member at all (avoid a fresh heap allocation
+            // every event - the buckets persist across calls on the same thread) without ever
+            // sharing the set across threads.
+            static thread_local std::unordered_set<uint64_t> seen;
+            seen.clear();
             result.reserve(clauseMatches.size());
             for (auto clauseId : clauseMatches) {
                 if ((clauseId & kSyntheticIdBit) == 0) {
@@ -734,7 +749,7 @@ public:
                 }
                 auto it = m_clause_to_sub.find(clauseId);
                 uint64_t subId = (it != m_clause_to_sub.end()) ? it->second : clauseId;
-                if (m_seen_scratch.insert(subId).second) {
+                if (seen.insert(subId).second) {
                     result.push_back(subId);
                 }
             }
@@ -773,10 +788,9 @@ private:
     decimal_scale_map m_decimalScales;
     std::unordered_map<uint64_t, uint64_t> m_clause_to_sub;
     uint64_t m_next_clause_id = 1;
-    // Scratch set for search()'s dedup pass - see its own comment. `mutable` because search()
-    // is const (the same const-but-reuses-scratch-state pattern as pstree_event_sink's own
-    // reuses_events()==true contract).
-    mutable std::unordered_set<uint64_t> m_seen_scratch;
+    // The dedup scratch set used to live here as a `mutable` member - moved to a function-local
+    // `static thread_local` inside search() itself, see that function's own comment for why
+    // (a real, confirmed data race under concurrent worker threads).
 };
 
 } // namespace

@@ -1,6 +1,8 @@
 #include "matching_engine.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -396,4 +398,66 @@ TEST(matching_engine, atree_accepts_is_not_empty) {
     // a-tree has a real IsNotEmpty token; only be-tree lacks the rule.
     auto engine = sidecar::build_matching_engine(sidecar::engine_type::atree, trade_attributes());
     EXPECT_NO_THROW(engine->insert(1, "tags is not empty"));
+}
+
+// Regression test for a real, confirmed data race: pstree_matching_engine::search()'s dedup
+// scratch set used to be a plain `mutable` member (m_seen_scratch), shared by every concurrent
+// caller of the same engine instance - worker_pool's own worker threads all call search()
+// concurrently against one shared engine (subscription_manager::acquire_tree() hands out a
+// shared_lock, never serializing readers against each other), so two threads both mutating one
+// std::unordered_set at once corrupted its buckets and segfaulted. Only OR'd (multi-clause)
+// subscriptions ever reach that dedup path at all (single-clause subscriptions take insert()'s
+// own direct-id fast path, bypassing it) - which is exactly why every earlier single-clause-only
+// test/benchmark in this project's history never caught this. Fixed by making the scratch set a
+// function-local `static thread_local` instead of a member - see search()'s own comment
+// (matching_engine.cpp) for the full story. This test's real purpose is to run under
+// ThreadSanitizer (ctest under build-sanitizer/SIDECAR_SANITIZER=thread) - it may not reliably
+// reproduce the crash on a plain, uninstrumented build even without the fix.
+//
+// Deliberately does NOT reuse trade_attributes()/match()/trade_event above: those set a
+// `tags: string_list` attribute unconditionally on every event, which pstree rejects outright
+// (a real, pre-existing, unrelated restriction - "pstree does not support list-valued
+// attributes") - confirmed directly while debugging this test (an early version threw that
+// exception from every thread simultaneously, an uncaught-exception storm that looked exactly
+// like a crash but had nothing to do with the race being tested). This test's own schema omits
+// list attributes entirely so only the race fix itself is under test.
+TEST(matching_engine, pstree_concurrent_search_with_or_subscriptions_does_not_race) {
+    std::vector<sidecar::attribute_def> attrs = {
+        {"trade_price",  sidecar::attribute_type::float_val},
+        {"trade_volume", sidecar::attribute_type::integer},
+        {"symbol",       sidecar::attribute_type::string},
+    };
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    // A mix of single-clause (AND-only) and OR'd (multi-clause) subscriptions - the OR'd ones
+    // are what actually exercise the now-fixed dedup path.
+    engine->insert(1, "trade_price > 100.0");
+    engine->insert(2, "trade_price > 50.0 and trade_volume > 100");
+    engine->insert(3, "trade_price > 200.0 or trade_volume > 900");
+    engine->insert(4, "symbol = \"AAPL\" or trade_price < 10.0");
+    engine->insert(5, "trade_price > 150.0 or symbol = \"MSFT\" or trade_volume > 700");
+
+    auto search_one = [&engine](double price, int64_t volume, std::string_view symbol) {
+        auto sink = engine->make_event();
+        sink->with_float("trade_price", price);
+        sink->with_integer("trade_volume", volume);
+        sink->with_string("symbol", symbol);
+        return engine->search(*sink);
+    };
+
+    constexpr int kThreads = 8;
+    constexpr int kIterationsPerThread = 2000;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&search_one, t]() {
+            for (int i = 0; i < kIterationsPerThread; ++i) {
+                search_one(static_cast<double>((t * 37 + i) % 300), (t * 53 + i) % 1000,
+                           (i % 2 == 0) ? "AAPL" : "MSFT");
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    // Reaching here without crashing/hanging under TSan is the actual assertion; also confirm
+    // ordinary matching still works correctly afterward.
+    EXPECT_TRUE(contains(search_one(250.0, 50, "AAPL"), 1));
 }
