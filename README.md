@@ -2264,6 +2264,49 @@ Neither fix regressed anything: full sanitizer suites (plain, ASan+UBSan, Thread
 green on both repos throughout, and pstree's own randomized differential stress-test oracle
 confirmed byte-identical match results before and after each change.
 
+**A more realistic subscription shape closes most of the gap on its own.** The 100%-degenerate
+shape above assumes near-total overlap (many independent wide-range thresholds, log-uniform over
+the full value domain - deliberately pathological, not representative). Re-tested instead with each
+subscription's own selectivity constrained to a realistic 1%-5% of the dataset (`price > X`
+thresholds drawn from the REAL price distribution's 95th-99th percentile via
+`gen_price_threshold_subs_realistic.py`, K~5400 after the subscription registry's own identical-
+expression dedup - see `subscription_manager::subscribe()` - collapsed some of the 8000 requested
+thresholds down): `avg_match_us` dropped to **0.578µs**, and true sustained throughput rose to
+roughly **5,400-8,200 rows/s** across trials (see the multi-trial table below) - closing the gap to
+a relaxed 1M rows/s bar from ~1,600x down to roughly ~125-185x.
+
+**Phase 5 - eliminate `search()`'s own redundant copy for the common (no-OR) case**
+(nats_sidecar@a3abbe2): a live `perf record -a -g` profile of the realistic-selectivity trial found
+the picture had shifted again now that matching-tree cost itself was cheap - `nats-server`'s own CPU
+share (26.65% of total system time, upstream message routing/GC, out of this repo's control) became
+a first-order cost, and **`sidecar::pstree_matching_engine::search()` itself (18.27%) started
+costing MORE than `PSTDynamic::matchEvent()` (14.86%)** - the opposite of every earlier profile in
+this investigation. `search()`'s own translate/dedup loop (`src/matching_engine.cpp`) was building a
+second `result` vector that, for any workload with zero OR'd/multi-clause subscriptions (true of
+every shape tested throughout this whole investigation), ends up byte-for-byte identical to
+`matchEvent()`'s own already-correct return value - a provably redundant full copy over the entire
+match set. Fixed by tracking (a monotonic `m_hasSyntheticClauses` flag, set once any subscription
+ever needs clause-id translation) whether that copy can ever be necessary, and skipping it entirely
+when it can't.
+
+**Honestly, this fix's real-world impact was not measurable above this host's own run-to-run
+noise.** Four PRE-fix trials of the identical realistic-selectivity benchmark (run back-to-back,
+same binary, same config) already spanned 5,441-8,199 rows/s on their own (mean ~7,171) - a ~51%
+spread from nothing but ordinary variance on this shared host. Two POST-fix trials measured
+6,264-7,286 rows/s (mean ~6,775) - entirely within the pre-fix range, not distinguishably better
+*or* worse. The fix is real and provably correct (verified: full `sidecar_test` suite green under
+plain/ASan+UBSan/ThreadSanitizer, two new targeted tests confirming byte-identical results with and
+without the fast path, `search()`'s own isolated cost genuinely eliminated per the profiler) - but
+its actual contribution to end-to-end throughput here is smaller than this benchmark's own noise
+floor can resolve, not a confirmed win. This is the same honest category of result this
+investigation has already hit more than once elsewhere (see pstree's own project history) - reported
+as such rather than oversold.
+
+**What's left, if this is worth continuing:** `nats-server`'s own 26.65% CPU share is now
+comparable in size to the sidecar's own remaining matching-tree cost (37.82%) - genuinely
+out-of-repo (upstream NATS server internals: subject-routing `Sublist.match`, protocol parsing, Go
+GC), but real. No further work has been scoped past this point without new direction.
+
 ## License
 
 See LICENSE file.
