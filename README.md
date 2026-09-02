@@ -2448,14 +2448,49 @@ real NATS write I/O for the output side can be measured without reintroducing th
 publisher/Postgres confound this benchmark exists to remove - plain PUB/`write_raw`, no JetStream
 consumer or KV bucket, nothing to clean up server-side. **First single-pair comparison (K=3000,
 `s`=20) looked like a real ~6% cost for genuine NATS socket writes (`fake` ~1,893,393 rows/s vs.
-`real` ~1,779,639 rows/s) - re-checked with 3 repeats each and retracted**: `fake` alone spans
-1,469,960-1,912,476 rows/s run-to-run (mean ~1,734,598), `real` spans 1,633,205-1,877,342 (mean
-~1,735,979) - the two distributions overlap almost completely and the means are effectively
-identical (`real` even marginally higher in this sample). The original "6%" was noise from a single
-unrepeated pair, not a real effect - **no detectable throughput cost from real NATS-core publish
-at this workload**, at least not one this benchmark's own run-to-run variance (~9-10%, see the
-selectivity-sweep repeats above) can resolve. Caught only because the claim was checked against
-repeats before being trusted, the same discipline this investigation has applied throughout.
+`real` ~1,779,639 rows/s) - re-checked with 3 repeats each and retracted at that specific point**:
+`fake` alone spans 1,469,960-1,912,476 rows/s run-to-run (mean ~1,734,598), `real` spans
+1,633,205-1,877,342 (mean ~1,735,979) - at `s`=20-32 the two distributions overlap almost
+completely and the means are effectively identical. The original "6%" was noise from a single
+unrepeated pair at that one point, not a real effect there.
+
+**But a full `s`=2^t (t=0..16) sweep of `fake` vs. `real` (same K=8000, 2-3 repeats each, arrow
+input) shows the real-vs-fake gap is highly `s`-dependent, and at several points it is very real
+and large - not noise:**
+
+| t | `s` | matched | `fake` avg rows/s | `real` avg rows/s | real/fake |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 230,500 | 144,310 | 97,960 | 68% |
+| 1 | 2 | 120,846 | 299,855 | 285,723 | 95% |
+| 2 | 4 | 60,404 | 798,197 | 590,217 | 74% |
+| 3 | 8 | 30,190 | 1,232,517 | 1,149,382 | 93% |
+| 4 | 16 | 15,049 | 1,621,928 | 1,531,258 | 94% |
+| 5 | 32 | 7,427 | 1,222,064 | 1,221,057 | 100% |
+| 6 | 64 | 3,732 | 884,394 | 942,099 | 107% |
+| 7 | 128 | 1,855 | 1,069,999 | 347,805 | **33%** |
+| 8 | 256 | 954 | 1,316,629 | 438,226 | **33%** |
+| 9 | 512 | 463 | 1,735,088 | 632,545 | **36%** |
+| 10 | 1,024 | 228 | 3,057,081 | 2,134,340 | 70% |
+| 11 | 2,048 | 109 | 5,282,050 | 2,102,119 | **40%** |
+| 12 | 4,096 | 54 | 8,162,243 | 5,231,927 | 64% |
+| 13 | 8,192 | 34 | 11,270,265 | 9,304,979 | 83% |
+| 14 | 16,384 | 17 | 14,594,185 | 13,128,719 | 90% |
+| 15 | 32,768 | 10 | 15,469,209 | 14,898,715 | 96% |
+| 16 | 65,536 | 6 | 17,188,037 | 14,900,652 | 87% |
+
+**`s`=128-512 in particular drops to real-publish throughput just 33-36% of the fake-connection
+number - confirmed 3x independently (not the earlier single-pair mistake).** `avg_fanout_us` at
+these points is itself 2-3x higher under `real` than `fake` (e.g. `s`=128: 1,017µs real vs. 368µs
+fake) - genuine NATS-server-side cost (protocol parsing, subject routing, Go GC - see this
+document's own earlier `perf` breakdown of `nats-server`'s share) leaking back into the sidecar's
+own timed fan-out-resolution window, likely via connection backpressure (`wait_for_drain()`) once
+enough PUB frames are in flight. Why the effect is small at `s`=20-64 and `s`=8,192+ but large in
+the `s`=128-2,048 band specifically is not yet understood - this may be the same unexplained
+mechanism behind the `fake`-only sweep's own `s`=16-128 dip (both regions overlap), or a separate
+effect; not chased further here. The honest correction to the earlier retraction: "no detectable
+cost from real NATS-core publish" was true *at the specific point tested* (`s`=20), not a general
+finding - the fuller sweep shows the real cost is real, large, and `s`-dependent.
+
 Arrow-input throughput at the default shape (K=3000, `s`=100,000) came in close to msgpack's own
 number (~18.4M vs. ~17.7M rows/s) - both comfortably in the same "nowhere near the bottleneck"
 territory.
