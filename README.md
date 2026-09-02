@@ -2411,6 +2411,33 @@ isolation, whose contribution to *this specific benchmark's* end-to-end number i
 different bottleneck at the fast end. Not chased further - the mechanism (real, targeted, verified)
 is sound regardless of whether this particular publisher setup can expose it end to end.
 
+**Confirmed directly: the publisher, not the sidecar, was the ~15,352 rows/s ceiling.**
+`sidecar_pipeline_bench` (`benchmarks/sidecar_pipeline_bench.cpp`, gated behind
+`SIDECAR_BUILD_BENCHMARKS`) drives the exact same production pipeline
+(`deserialize_and_match_columnar` -> `populate_event` -> `matching_engine::search()` -> fan-out
+resolution, via real `worker_pool::enqueue()`) with zero NATS I/O, zero Postgres, and no external
+publisher process - real columnar msgpack payloads built in-process, a synthetic uniform `price`
+distribution with an exact analytic threshold per target selectivity `s` (no percentile queries
+needed), `io_context::run()` on its own dedicated thread (not a sleep-based poll loop, which would
+impose its own artificial ceiling). Result, at the same K~3000-8000 / `s`=20-100000 shapes this
+whole investigation has used throughout:
+
+| K | `s` | matched (of 230,500 rows) | `avg_fanout_us` | true rows/s |
+|---:|---:|---:|---:|---:|
+| 3000 | 100,000 | 6 | 262.27µs | 17,041,032 |
+| 3000 | 20 | 12,056 | 25.17µs | 1,158,126 |
+| 8000 | 1,000 | 230 | 1,437.94µs | 1,795,402 |
+
+**1.1-17 million rows/s, two to three orders of magnitude above the combined system's
+publisher-bound ~15,352 rows/s** - decisive, direct confirmation that the sidecar itself was never
+the bottleneck in any real-fleet trial this investigation ran at these K/`s` shapes; the external
+publisher (`pub_workers=24`) was. This resolves the open question from the `mp_skip` fix's own
+verification section and gives a clean, reusable, publish-independent ceiling to measure any future
+sidecar-side fix against, instead of a real-fleet trial that can silently be measuring the
+publisher's own speed instead (the same "obvious rate metric can lie to you" trap this document's
+own "true sustained rate" methodology exists to catch - this benchmark sidesteps it by construction,
+having no publisher to be limited by at all).
+
 ## License
 
 See LICENSE file.
