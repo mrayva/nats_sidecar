@@ -164,6 +164,11 @@ struct config {
     std::string subscribe_subject = "sidecar.subscribe";
     std::string unsubscribe_subject = "sidecar.unsubscribe";
 
+    // On-demand stats query (request/reply) - complements the periodic
+    // stats_interval_seconds log line with an ask-anytime alternative. Reply
+    // is the same JSON build_stats_json() produces for "stats_json:".
+    std::string stats_request_subject = "sidecar.stats";
+
     // Soft-state leases via NATS KV
     std::string lease_bucket = "sidecar-leases";
     uint32_t lease_ttl_seconds = 3600;

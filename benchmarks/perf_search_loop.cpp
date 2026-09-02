@@ -28,6 +28,7 @@
 // between them here.
 #include "matching_engine.hpp"
 #include "config.hpp"
+#include "match_timing.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -152,7 +153,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "searching for %ds...\n", seconds);
     uint64_t iterations = 0;
     uint64_t total_matches = 0;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    auto loop_start = std::chrono::steady_clock::now();
+    auto deadline = loop_start + std::chrono::seconds(seconds);
     std::size_t row_idx = 0;
     while (std::chrono::steady_clock::now() < deadline) {
         auto& row = rows[row_idx];
@@ -166,16 +168,33 @@ int main(int argc, char** argv) {
         event->with_integer("trade_volume", row.trade_volume);
         event->with_float("trade_price", row.trade_price);
         event->with_float("narrow_metric", row.narrow_metric);
+        const uint64_t c0 = read_cycles();
         auto matched = tree->search(*event);
+        record_match_cycles(read_cycles() - c0);
         total_matches += matched.size();
         row_idx = (row_idx + 1) % rows.size();
         ++iterations;
     }
+    auto search_end = std::chrono::steady_clock::now();
 
     std::fprintf(stderr, "%s: %llu search() calls in %ds (%.0f/s), %llu total matches (%.1f avg/call)\n",
                  engine_name.c_str(), static_cast<unsigned long long>(iterations), seconds,
                  static_cast<double>(iterations) / seconds,
                  static_cast<unsigned long long>(total_matches),
                  static_cast<double>(total_matches) / iterations);
+
+    // Ground-truth cross-check for match_timing.hpp's RDTSC-based avg_match_us: this loop's own
+    // wall-clock time / iteration count is an independent, non-sampled measurement of average
+    // search() cost (no perf/dwarf sampling skid to second-guess) - see match_timing.hpp's own
+    // comment for why this replaced the old clock_gettime + 1-in-8-sampling design.
+    auto [match_cycles, match_count] = drain_match_timing();
+    double wall_avg_us =
+        std::chrono::duration<double, std::micro>(search_end - loop_start).count()
+        / static_cast<double>(iterations);
+    double rdtsc_avg_us = match_count > 0
+        ? (double(match_cycles) / cycles_per_microsecond()) / double(match_count)
+        : 0.0;
+    std::fprintf(stderr, "ground truth: wall_clock_avg_us=%.4f  rdtsc_avg_us=%.4f  ratio=%.3f\n",
+                 wall_avg_us, rdtsc_avg_us, rdtsc_avg_us / wall_avg_us);
     return 0;
 }

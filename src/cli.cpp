@@ -49,6 +49,7 @@ cxxopts::Options build_cli_options() {
                                   cxxopts::value<std::string>())
         ("subscribe-subject", "Subscription request subject", cxxopts::value<std::string>())
         ("unsubscribe-subject", "Unsubscription request subject", cxxopts::value<std::string>())
+        ("stats-request-subject", "On-demand stats request subject", cxxopts::value<std::string>())
         ("lease-bucket", "NATS KV lease bucket name", cxxopts::value<std::string>())
         ("lease-ttl", "Lease TTL in seconds", cxxopts::value<uint32_t>())
         ("lease-check-interval", "Lease reconciliation interval in seconds", cxxopts::value<uint32_t>())
@@ -111,6 +112,7 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("consumer-ack-wait"))         cfg.consumer_ack_wait_seconds = result["consumer-ack-wait"].as<uint32_t>();
     if (result.count("subscribe-subject"))    cfg.subscribe_subject = result["subscribe-subject"].as<std::string>();
     if (result.count("unsubscribe-subject"))  cfg.unsubscribe_subject = result["unsubscribe-subject"].as<std::string>();
+    if (result.count("stats-request-subject")) cfg.stats_request_subject = result["stats-request-subject"].as<std::string>();
     if (result.count("lease-bucket"))         cfg.lease_bucket = result["lease-bucket"].as<std::string>();
     if (result.count("lease-ttl"))            cfg.lease_ttl_seconds = result["lease-ttl"].as<uint32_t>();
     if (result.count("lease-check-interval")) cfg.lease_check_interval_seconds = result["lease-check-interval"].as<uint32_t>();

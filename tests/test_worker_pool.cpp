@@ -112,7 +112,7 @@ TEST(worker_pool, build_stats_json_field_names_and_values_match_the_text_log_lin
     ws.publish_inflight = 7;
 
     auto text = sidecar::build_stats_json(/*received=*/123, ws, /*subscriptions=*/8,
-                                           /*avg_fanout_us=*/1.25);
+                                           /*avg_fanout_us=*/1.25, /*avg_match_us=*/0.5);
     auto j = nlohmann::json::parse(text);
 
     EXPECT_EQ(j.at("received").get<uint64_t>(), 123u);
@@ -128,6 +128,7 @@ TEST(worker_pool, build_stats_json_field_names_and_values_match_the_text_log_lin
     EXPECT_EQ(j.at("queue_bytes").get<std::size_t>(), 6000u);
     EXPECT_EQ(j.at("publish_inflight").get<std::size_t>(), 7u);
     EXPECT_DOUBLE_EQ(j.at("avg_fanout_us").get<double>(), 1.25);
+    EXPECT_DOUBLE_EQ(j.at("avg_match_us").get<double>(), 0.5);
 }
 
 TEST(worker_pool, rejects_payload_larger_than_byte_limit) {

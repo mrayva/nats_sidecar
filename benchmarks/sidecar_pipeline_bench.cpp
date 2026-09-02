@@ -338,12 +338,16 @@ int main(int argc, char** argv) {
     double avg_fanout_us = stats.fanout_time_count > 0
         ? (double(stats.fanout_time_ns_total) / double(stats.fanout_time_count)) / 1000.0
         : 0.0;
+    double avg_match_us = stats.match_time_count > 0
+        ? (double(stats.match_time_cycles_total) / sidecar::cycles_per_microsecond())
+              / double(stats.match_time_count)
+        : 0.0;
 
     std::printf("\nenqueued=%zu (of %zu batches) processed=%llu matched=%llu\n",
                enqueued, total_batches, (unsigned long long)stats.processed,
                (unsigned long long)stats.matched);
-    std::printf("wall_clock=%.3fs  true_rows_per_sec=%.1f  avg_fanout_us=%.3f\n",
-               seconds, rows_per_sec, avg_fanout_us);
+    std::printf("wall_clock=%.3fs  true_rows_per_sec=%.1f  avg_fanout_us=%.3f  avg_match_us=%.3f\n",
+               seconds, rows_per_sec, avg_fanout_us, avg_match_us);
 
     pool.stop();
     work_guard.reset();

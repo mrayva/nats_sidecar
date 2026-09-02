@@ -117,7 +117,7 @@ single spdlog-formatted line, e.g.:
 ```
 stats: received=230276 processed=230276 matched=5514544 published=5514544 match_failures=0
 publish_failures=0 input_dropped=0 publish_tasks_dropped=0 subscriptions=1 queue_depth=0
-queue_bytes=0 publish_inflight=0 avg_fanout_us=0.05
+queue_bytes=0 publish_inflight=0 avg_fanout_us=0.05 avg_match_us=0.58
 ```
 
 Set `stats_format: json` (or `--stats-format json`) to instead emit the same fields as a single
@@ -125,7 +125,7 @@ JSON object, under a `stats_json:` prefix (never `stats:`, so it can't collide w
 already `grep`-ing for the text line):
 
 ```
-stats_json: {"avg_fanout_us":0.05,"input_dropped":0,"match_failures":0,
+stats_json: {"avg_fanout_us":0.05,"avg_match_us":0.58,"input_dropped":0,"match_failures":0,
 "matched":5514544,"processed":230276,"publish_failures":0,"publish_inflight":0,
 "publish_tasks_dropped":0,"published":5514544,"queue_bytes":0,"queue_depth":0,
 "received":230276,"subscriptions":1}
@@ -137,6 +137,12 @@ stats_json: {"avg_fanout_us":0.05,"input_dropped":0,"match_failures":0,
 external tooling can parse a real object instead of regex-scraping the text line, the way every
 benchmark script under `nyse-matrix/` in this project's own history has had to.
 
+Besides the periodic log line, the same JSON is available on demand: publish an empty NATS
+request to `stats_request_subject` (default `sidecar.stats`, configurable the same way as
+`subscribe_subject`/`unsubscribe_subject`) and the reply is exactly what `stats_json:` would have
+logged at that instant - useful for polling stats from an external tool without scraping logs or
+waiting for the next `stats_interval_seconds` tick.
+
 `avg_fanout_us` is wall-clock time resolving output subjects and estimating publish size for a row
 that matched (`worker_pool.cpp`, between `matching_engine::search()` returning and the publish
 coroutine being handed off) - only rows that actually reach the publish coroutine count, and
@@ -145,11 +151,35 @@ deliberately *not* the coroutine itself (frame serialization is real CPU, but it
 I/O wait time in one number). Deserialize/populate (before matching), matching itself, and the
 actual NATS write (after fan-out resolution) all stay unmeasured by this stat.
 
-A previous `avg_match_us` (timing `matching_engine::search()` alone) was removed: a real `perf`
-profile found its 1-in-8-row sampling estimate ~100-140x off from ground truth, and the sampling's
-own `clock_gettime` calls cost ~7.6% of real CPU even at that reduced rate - both ineffective and
-non-trivially expensive, so it was cut rather than kept disabled. **`perf` is the trusted way to
-measure matching cost** - see the "K-scaling investigation" section below.
+`avg_match_us` times `matching_engine::search()` alone, one row at a time. A previous version of
+this stat was removed: a real `perf` profile found its `clock_gettime` + 1-in-8-row sampling design
+~100-140x off from ground truth, with the sampling's own `clock_gettime` calls costing ~7.6% of
+real CPU even at that reduced rate - both inaccurate and expensive, so it was cut rather than kept
+disabled (`perf` was the trusted way to measure matching cost in the meantime). It's back
+(`src/match_timing.hpp`), rebuilt on an RDTSC cycle-counter read instead of `clock_gettime`, cheap
+enough to time *every* row rather than sample: a thread_local pair of counters accumulates cycles
+around each `tree.search()` call and worker_pool.cpp drains them once per
+`deserialize_and_match*()` call (no per-call output parameter threaded through those functions -
+`worker_loop()` runs each worker on one fixed thread, so accumulate-then-drain-on-that-same-thread
+is safe). Cycles are converted to microseconds only at report time, via a cycles-per-microsecond
+ratio calibrated once at process startup (RDTSC delta vs. `steady_clock` delta over a 20ms
+busy-wait).
+
+**Accuracy verification** (this exact concern is why the old stat was removed, so it wasn't
+trusted without checking): a full-pipeline cross-check via `perf`-sampling
+`sidecar_pipeline_bench` initially showed a confusing ~2.6x gap between the reported `avg_match_us`
+and a perf-derived estimate - traced to sampling/attribution noise from profiling a deeply
+recursive call path (`PSTDynamic::matchEvent`) mixed with unrelated fan-out work in the same
+process, not a flaw in the timing mechanism. A cleaner, non-sampled ground truth settled it:
+`benchmarks/perf_search_loop.cpp` (extended to report this) calls `search()` in a tight loop for a
+fixed wall-clock duration with nothing else running, so wall-clock-time-elapsed / iteration-count
+is an independent, sampling-free average with no `perf`/dwarf skid to second-guess. Across 4 runs,
+the RDTSC-based `avg_match_us` matched that ground truth to within 0.6-0.7% (ratio 0.993-0.994) -
+see its own `ground truth: wall_clock_avg_us=... rdtsc_avg_us=... ratio=...` output line.
+**Overhead** was checked the same way the old stat's ~7.6% cost was found: a `perf` profile at a
+high-match-rate config never showed `match_message()`'s own self-time (which is where the two
+`read_cycles()` calls live) high enough to appear even in the top 25 hottest symbols - consistent
+with RDTSC's few-cycles-per-call cost and nowhere near the old design's overhead.
 
 ## Configuration
 

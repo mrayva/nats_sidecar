@@ -127,6 +127,32 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
     m_unsubscribe_sub = std::move(unsub_ctrl);
     m_log->info("Listening for unsubscribe requests on '{}'", m_cfg.unsubscribe_subject);
 
+    // Subscribe to on-demand stats-request subject (request/reply)
+    auto [stats_ctrl, stats_ctrl_status] = co_await m_conn->subscribe(
+        m_cfg.stats_request_subject,
+        [this](auto subject, auto reply_to, auto payload) -> asio::awaitable<void> {
+            std::string subject_copy(subject);
+            std::optional<std::string> reply_copy;
+            if (reply_to) reply_copy = std::string(*reply_to);
+            std::vector<char> payload_copy(payload.begin(), payload.end());
+            asio::co_spawn(
+                m_ioc,
+                on_stats_request(std::move(subject_copy), std::move(reply_copy),
+                                 std::move(payload_copy)),
+                asio::detached);
+            co_return;
+        }
+    );
+
+    if (stats_ctrl_status.failed()) {
+        m_log->error("Failed to subscribe to stats-request subject '{}': {}",
+                    m_cfg.stats_request_subject, stats_ctrl_status.error());
+        m_ioc.stop();
+        co_return;
+    }
+    m_stats_request_sub = std::move(stats_ctrl);
+    m_log->info("Listening for stats requests on '{}'", m_cfg.stats_request_subject);
+
     // Start stats reporting
     m_stats_timer = std::make_unique<asio::steady_timer>(m_ioc);
     asio::co_spawn(m_ioc, stats_loop(), asio::detached);
@@ -566,6 +592,9 @@ asio::awaitable<void> sidecar_engine::stats_loop() {
         double avg_fanout_us = ws.fanout_time_count > 0
             ? (double(ws.fanout_time_ns_total) / double(ws.fanout_time_count)) / 1000.0
             : 0.0;
+        double avg_match_us = ws.match_time_count > 0
+            ? (double(ws.match_time_cycles_total) / cycles_per_microsecond()) / double(ws.match_time_count)
+            : 0.0;
 
         // "text" is the default, unchanged behavior; "json"/"both" additionally (or only) emit
         // build_stats_json() under a distinct "stats_json:" prefix - never "stats:" - so it can
@@ -576,7 +605,8 @@ asio::awaitable<void> sidecar_engine::stats_loop() {
             m_log->info("stats: received={} processed={} matched={} published={} "
                         "match_failures={} publish_failures={} input_dropped={} "
                         "publish_tasks_dropped={} subscriptions={} queue_depth={} "
-                        "queue_bytes={} publish_inflight={} avg_fanout_us={:.2f}",
+                        "queue_bytes={} publish_inflight={} avg_fanout_us={:.2f} "
+                        "avg_match_us={:.2f}",
                        m_messages_received.load(),
                        ws.processed,
                        ws.matched,
@@ -589,12 +619,48 @@ asio::awaitable<void> sidecar_engine::stats_loop() {
                        ws.queue_depth,
                        ws.queue_bytes,
                        ws.publish_inflight,
-                       avg_fanout_us);
+                       avg_fanout_us,
+                       avg_match_us);
         }
         if (m_cfg.stats_format == "json" || m_cfg.stats_format == "both") {
             m_log->info("stats_json: {}", build_stats_json(
-                m_messages_received.load(), ws, m_sub_mgr.active_count(), avg_fanout_us));
+                m_messages_received.load(), ws, m_sub_mgr.active_count(),
+                avg_fanout_us, avg_match_us));
         }
+    }
+}
+
+std::string sidecar_engine::current_stats_json() const {
+    auto ws = m_worker_pool ? m_worker_pool->get_stats() : worker_pool::stats{};
+    double avg_fanout_us = ws.fanout_time_count > 0
+        ? (double(ws.fanout_time_ns_total) / double(ws.fanout_time_count)) / 1000.0
+        : 0.0;
+    double avg_match_us = ws.match_time_count > 0
+        ? (double(ws.match_time_cycles_total) / cycles_per_microsecond()) / double(ws.match_time_count)
+        : 0.0;
+    return build_stats_json(
+        m_messages_received.load(), ws, m_sub_mgr.active_count(),
+        avg_fanout_us, avg_match_us);
+}
+
+asio::awaitable<void> sidecar_engine::on_stats_request(
+    std::string /*subject*/,
+    std::optional<std::string> reply_to,
+    std::vector<char> /*payload*/)
+{
+    if (!reply_to) {
+        m_log->warn("Stats request without reply_to - ignoring");
+        co_return;
+    }
+
+    std::string reply_str = current_stats_json();
+    auto s = co_await m_conn->publish(
+        *reply_to,
+        std::span<const char>(reply_str.data(), reply_str.size()),
+        std::nullopt);
+
+    if (s.failed()) {
+        m_log->error("Failed to reply to stats request: {}", s.error());
     }
 }
 

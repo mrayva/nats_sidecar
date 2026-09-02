@@ -211,6 +211,7 @@ config load_config(const std::string& path) {
     // Subscription subjects
     if (auto n = root["subscribe_subject"])   cfg.subscribe_subject   = n.as<std::string>();
     if (auto n = root["unsubscribe_subject"]) cfg.unsubscribe_subject = n.as<std::string>();
+    if (auto n = root["stats_request_subject"]) cfg.stats_request_subject = n.as<std::string>();
 
     // Leases
     if (auto n = root["lease_bucket"])                 cfg.lease_bucket = n.as<std::string>();

@@ -2,6 +2,7 @@
 
 #include "arrow_columnar_rows.hpp"
 #include "config.hpp"
+#include "match_timing.hpp"
 #include "matching_engine.hpp"
 #include <chrono>
 #include <limits>
@@ -201,9 +202,13 @@ std::optional<std::vector<uint64_t>> match_message(
         return std::nullopt;
     }
 
+    const std::uint64_t cycles_start = read_cycles();
     try {
-        return tree.search(event);
+        auto result = tree.search(event);
+        record_match_cycles(read_cycles() - cycles_start);
+        return result;
     } catch (const std::exception& e) {
+        record_match_cycles(read_cycles() - cycles_start);
         if (log) log->warn("event_bridge: matching engine search failed: {}", e.what());
         return std::nullopt;
     }

@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "event_bridge.hpp"
+#include "match_timing.hpp"
 #include "subscription_manager.hpp"
 #include "subscription_registry.hpp"
 #include "lease_manager.hpp"
@@ -104,6 +105,19 @@ private:
     // Periodic stats logging
     asio::awaitable<void> stats_loop();
 
+    // Shared by stats_loop() and on_stats_request() so both report the exact
+    // same fields/derivation (avg_fanout_us/avg_match_us included) rather
+    // than duplicating the computation.
+    std::string current_stats_json() const;
+
+    // Callback: on-demand stats request (request/reply pattern, mirroring
+    // on_subscribe_request/on_unsubscribe_request above). No request body is
+    // expected - replies immediately with current_stats_json().
+    asio::awaitable<void> on_stats_request(
+        std::string subject,
+        std::optional<std::string> reply_to,
+        std::vector<char> payload);
+
     asio::io_context& m_ioc;
     config m_cfg;
     std::shared_ptr<spdlog::logger> m_log;
@@ -115,6 +129,7 @@ private:
     std::vector<nats_asio::ijs_subscription_sptr> m_input_js_subs;
     nats_asio::isubscription_sptr m_subscribe_sub;
     nats_asio::isubscription_sptr m_unsubscribe_sub;
+    nats_asio::isubscription_sptr m_stats_request_sub;
     subscription_manager m_sub_mgr;
     attribute_schema m_schema;
     std::unique_ptr<lease_manager> m_lease_mgr;

@@ -57,16 +57,21 @@ public:
         // methodology already avoids elsewhere). Only rows that actually reach the publish
         // coroutine count - a row dropped by the publish_max_inflight backpressure check never
         // really got fanned out, so it isn't counted here. fanout_time_count is the number of
-        // such rows, not messages - a columnar batch's rows are counted individually. (A
-        // previous, similarly-scoped avg_match_us/match_time_* pair - timing
-        // matching_engine::search() alone - was removed: a real `perf` profile found it both
-        // wildly inaccurate (its 1-in-8 timing-sample estimate was ~100-140x off from ground
-        // truth) and non-trivially expensive on its own (~7.6% CPU just for the clock_gettime
-        // calls). `perf` is the trusted way to measure matching cost now, not a built-in
-        // per-row timer - this fanout timer stays only because it isn't sampled and hasn't
-        // shown the same problem.)
+        // such rows, not messages - a columnar batch's rows are counted individually.
         uint64_t fanout_time_ns_total = 0;
         uint64_t fanout_time_count = 0;
+
+        // matching_engine::search() time alone, one row at a time - see match_timing.hpp.
+        // A previous, similarly-scoped avg_match_us/match_time_ns_total pair was removed: a real
+        // `perf` profile found its clock_gettime + 1-in-8-row sampling design both wildly
+        // inaccurate (its timing-sample estimate was ~100-140x off from ground truth) and
+        // non-trivially expensive on its own (~7.6% CPU just for the clock_gettime calls). This
+        // pair replaces it with an RDTSC-based cycle count, accumulated for *every* row (no
+        // sampling) via match_timing.hpp's thread_local counters, drained once per
+        // deserialize_and_match/deserialize_and_match_columnar() call - see worker_loop().
+        // Converted to microseconds only at stats-report time via cycles_per_microsecond().
+        uint64_t match_time_cycles_total = 0;
+        uint64_t match_time_count = 0;
     };
 
     worker_pool(asio::io_context& ioc, const config& cfg,
@@ -196,6 +201,8 @@ private:
     std::atomic<uint64_t> m_publish_tasks_dropped{0};
     std::atomic<uint64_t> m_fanout_time_ns_total{0};
     std::atomic<uint64_t> m_fanout_time_count{0};
+    std::atomic<uint64_t> m_match_time_cycles_total{0};
+    std::atomic<uint64_t> m_match_time_count{0};
 };
 
 // Machine-readable mirror of sidecar_engine::stats_loop()'s own "stats: ..." text log line, same
@@ -204,6 +211,7 @@ private:
 // config::stats_format is "json" or "both" (see stats_loop()), under a distinct "stats_json:"
 // log prefix so it can never collide with a "stats:"-matching grep.
 std::string build_stats_json(uint64_t received, const worker_pool::stats& ws,
-                              std::size_t subscriptions, double avg_fanout_us);
+                              std::size_t subscriptions, double avg_fanout_us,
+                              double avg_match_us);
 
 } // namespace sidecar
