@@ -2460,33 +2460,50 @@ Arrow-input throughput at the default shape (K=3000, `s`=100,000) came in close 
 number (~18.4M vs. ~17.7M rows/s) - both comfortably in the same "nowhere near the bottleneck"
 territory.
 
-**The selectivity sweep, redone with the publish-independent harness.** The original K-scaling
-investigation's own selectivity sweep (`s`=20 to `s`=100,000, above) ran on the combined real-fleet
-system - actual K varied 768-3553 due to run-to-run subscription dedup, and throughput was
-confounded by the publisher-bound ~15,352 rows/s ceiling this whole section exists to explain away.
-Redone with `sidecar_pipeline_bench` at a fixed requested K=8000 (arrow input, fake publish, 2-3
-repeats per point - this harness has far less run-to-run noise than the real-fleet trials did, being
-fully in-process with no external I/O to jitter):
+**The selectivity sweep, redone with the publish-independent harness, extended down to `s`=1.**
+The original K-scaling investigation's own selectivity sweep (`s`=20 to `s`=100,000) ran on the
+combined real-fleet system - actual K varied 768-3553 due to run-to-run subscription dedup, and
+throughput was confounded by the publisher-bound ~15,352 rows/s ceiling this whole section exists
+to explain away. Redone with `sidecar_pipeline_bench` at a fixed requested K=8000 (arrow input,
+fake publish, 2 repeats per point), swept as `s`=2^t for t=0..16 - the full range from `s`=1
+(every subscription matches essentially every row) to `s`=65,536:
 
-| `s` | K (actual) | matched (of 230,500) | avg rows/s | range across repeats |
-|---:|---:|---:|---:|---:|
-| 20 | 8000 | 12,056 | 1,494,717 | 1,431,823 - 1,557,611 |
-| 100 | 8000 | 2,383 | 1,028,374 | 976,644 - 1,073,016 |
-| 1,000 | 7,997 | 230 | 2,716,497 | 2,702,605 - 2,730,389 |
-| 10,000 | 7,970 | 28 | 11,743,608 | 11,738,992 - 11,748,224 |
-| 100,000 | 7,696 | 6 | 16,682,748 | 15,845,219 - 17,520,277 |
+| t | `s` | K (actual) | matched (of 230,500) | avg rows/s | range across repeats |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 8000 | 230,500 | 144,310 | 142,474 - 146,146 |
+| 1 | 2 | 8000 | 120,846 | 299,855 | 288,729 - 310,982 |
+| 2 | 4 | 8000 | 60,404 | 798,197 | 767,161 - 829,234 |
+| 3 | 8 | 8000 | 30,190 | 1,232,517 | 1,116,125 - 1,348,908 |
+| 4 | 16 | 8000 | 15,049 | 1,621,928 | 1,556,252 - 1,687,603 |
+| 5 | 32 | 8000 | 7,427 | 1,222,064 | 1,151,601 - 1,292,527 |
+| 6 | 64 | 8000 | 3,732 | 884,394 | 865,269 - 903,519 |
+| 7 | 128 | 8000 | 1,855 | 1,069,999 | 1,036,140 - 1,103,857 |
+| 8 | 256 | 7,998 | 954 | 1,316,629 | 1,290,911 - 1,342,348 |
+| 9 | 512 | 7,998 | 463 | 1,735,088 | 1,645,878 - 1,824,299 |
+| 10 | 1,024 | 7,994 | 228 | 3,057,081 | 3,057,006 - 3,057,155 |
+| 11 | 2,048 | 7,991 | 109 | 5,282,050 | 5,033,438 - 5,530,662 |
+| 12 | 4,096 | 7,986 | 54 | 8,162,243 | 8,020,803 - 8,303,684 |
+| 13 | 8,192 | 7,965 | 34 | 11,270,265 | 10,607,270 - 11,933,261 |
+| 14 | 16,384 | 7,953 | 17 | 14,594,185 | 14,448,430 - 14,739,941 |
+| 15 | 32,768 | 7,894 | 10 | 15,469,209 | 15,109,615 - 15,828,802 |
+| 16 | 65,536 | 7,783 | 6 | 17,188,037 | 16,946,760 - 17,429,314 |
 
-Broadly monotonic (fewer matches -> higher throughput) with one real, reproducible exception:
-**`s`=100 is slower than both `s`=20 and `s`=1,000 - confirmed across 3 repeats (976,644-1,073,016
-rows/s, a tight cluster, not noise)**, despite matching *fewer* rows than `s`=20. The likely
-mechanism (not fully confirmed): `avg_fanout_us` is a *per-matching-row* average, but the
-`output_subjects`-resolution work it times runs once per *batch* (worker_pool.cpp) - a batch with
-few matching rows (`s`=100: ~5.2 matching rows/batch of 500) divides whatever fixed per-batch
-overhead exists across fewer rows than a batch with many (`s`=20: ~26 matching rows/batch),
-inflating the per-row average without necessarily meaning more real work happened. The raw
-wall-clock/throughput numbers above are unaffected by this and are the ones to trust directly -
-noted honestly here, not smoothed over, matching this whole investigation's own standing practice
-for real-but-unexplained results.
+**A real, reproducible dip, not just a single anomalous point.** Throughput climbs monotonically
+from `s`=1 to `s`=16 (144K -> 1.62M rows/s, exactly as intuition predicts - fewer matches, less
+fan-out work, more throughput), then genuinely **dips** from `s`=16 down through `s`=64 (1.62M ->
+1.22M -> 884K rows/s - each point's own repeat range is tight and non-overlapping with its
+neighbors, so this is a real valley, not noise), before resuming a monotonic climb all the way to
+`s`=65,536. The original 5-point sweep's own isolated `s`=100 dip (previous version of this
+section) was this same valley, just under-sampled - the full 17-point sweep shows its actual
+shape: a real trough spanning roughly `s`=16-128, not one anomalous value. The likely mechanism
+(not fully confirmed): `avg_fanout_us` is a *per-matching-row* average, but the
+`output_subjects`-resolution work it times runs once per *batch* (`worker_pool.cpp`) - a batch with
+few matching rows divides whatever fixed per-batch overhead exists across fewer rows than a batch
+with many, inflating the per-row average without necessarily meaning more real work happened; why
+this specific effect would produce a *valley* rather than a monotonic trend as matches/batch keeps
+shrinking is not yet explained. The raw wall-clock/throughput numbers above are unaffected by this
+averaging question either way and are what to trust directly - noted honestly as a real, open
+question, not smoothed over, matching this whole investigation's own standing practice.
 
 ## License
 
