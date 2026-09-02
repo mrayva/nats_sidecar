@@ -567,23 +567,34 @@ asio::awaitable<void> sidecar_engine::stats_loop() {
             ? (double(ws.match_time_ns_total) / double(ws.match_time_count)) / 1000.0
             : 0.0;
 
-        m_log->info("stats: received={} processed={} matched={} published={} "
-                    "match_failures={} publish_failures={} input_dropped={} "
-                    "publish_tasks_dropped={} subscriptions={} queue_depth={} "
-                    "queue_bytes={} publish_inflight={} avg_match_us={:.2f}",
-                   m_messages_received.load(),
-                   ws.processed,
-                   ws.matched,
-                   ws.published,
-                   ws.match_failures,
-                   ws.publish_failures,
-                   ws.input_dropped,
-                   ws.publish_tasks_dropped,
-                   m_sub_mgr.active_count(),
-                   ws.queue_depth,
-                   ws.queue_bytes,
-                   ws.publish_inflight,
-                   avg_match_us);
+        // "text" is the default, unchanged behavior; "json"/"both" additionally (or only) emit
+        // build_stats_json() under a distinct "stats_json:" prefix - never "stats:" - so it can
+        // never collide with a "stats:"-matching grep, matching set_log_level()'s own silent-
+        // fallback-to-default convention for an unrecognized value (main.cpp) rather than
+        // throwing on a typo.
+        if (m_cfg.stats_format != "json") {
+            m_log->info("stats: received={} processed={} matched={} published={} "
+                        "match_failures={} publish_failures={} input_dropped={} "
+                        "publish_tasks_dropped={} subscriptions={} queue_depth={} "
+                        "queue_bytes={} publish_inflight={} avg_match_us={:.2f}",
+                       m_messages_received.load(),
+                       ws.processed,
+                       ws.matched,
+                       ws.published,
+                       ws.match_failures,
+                       ws.publish_failures,
+                       ws.input_dropped,
+                       ws.publish_tasks_dropped,
+                       m_sub_mgr.active_count(),
+                       ws.queue_depth,
+                       ws.queue_bytes,
+                       ws.publish_inflight,
+                       avg_match_us);
+        }
+        if (m_cfg.stats_format == "json" || m_cfg.stats_format == "both") {
+            m_log->info("stats_json: {}", build_stats_json(
+                m_messages_received.load(), ws, m_sub_mgr.active_count(), avg_match_us));
+        }
     }
 }
 

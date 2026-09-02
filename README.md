@@ -103,10 +103,38 @@ the legacy single-connection config shape - they're rejected if the config file 
 | `--tls-key PATH` | TLS key path |
 | `--tls-ca PATH` | TLS CA certificate path |
 | `--stats-interval SECS` | Stats log interval in seconds |
+| `--stats-format FORMAT` | Stats log format: `text` (default), `json`, or `both` - see "Stats output" below |
 | `--log-level LEVEL` | Log level (`debug`, `info`, `warn`, `error`) |
 | `--generate-schema PATH` | Infer attributes from a sample binary file and print YAML |
 | `-v, --verbose` | Enable debug logging (shorthand for `--log-level debug`) |
 | `-h, --help` | Print help |
+
+### Stats output
+
+By default (`stats_format: text`), the periodic stats line every `stats_interval_seconds` is a
+single spdlog-formatted line, e.g.:
+
+```
+stats: received=230276 processed=230276 matched=5514544 published=5514544 match_failures=0
+publish_failures=0 input_dropped=0 publish_tasks_dropped=0 subscriptions=1 queue_depth=0
+queue_bytes=0 publish_inflight=0 avg_match_us=0.16
+```
+
+Set `stats_format: json` (or `--stats-format json`) to instead emit the same fields as a single
+JSON object, under a `stats_json:` prefix (never `stats:`, so it can't collide with any tooling
+already `grep`-ing for the text line):
+
+```
+stats_json: {"avg_match_us":0.16,"input_dropped":0,"match_failures":0,"matched":5514544,
+"processed":230276,"publish_failures":0,"publish_inflight":0,"publish_tasks_dropped":0,
+"published":5514544,"queue_bytes":0,"queue_depth":0,"received":230276,"subscriptions":1}
+```
+
+`stats_format: both` emits both lines every interval. An unrecognized value silently falls back to
+`text`, matching `log_level`'s own convention for an unrecognized level (main.cpp's
+`set_log_level()`) rather than rejecting the config at startup. This exists specifically so
+external tooling can parse a real object instead of regex-scraping the text line, the way every
+benchmark script under `nyse-matrix/` in this project's own history has had to.
 
 ## Configuration
 

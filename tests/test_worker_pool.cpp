@@ -3,6 +3,7 @@
 #include "asio_test_helpers.hpp"
 #include <asio/io_context.hpp>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/sinks/null_sink.h>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/dynamic.hpp>
@@ -95,6 +96,37 @@ TEST(worker_pool, build_pub_frames_empty_when_no_ids_match) {
 
     EXPECT_EQ(frames.count, 0u);
     EXPECT_TRUE(frames.wire.empty());
+}
+
+TEST(worker_pool, build_stats_json_field_names_and_values_match_the_text_log_line) {
+    sidecar::worker_pool::stats ws;
+    ws.processed = 100;
+    ws.matched = 42;
+    ws.published = 40;
+    ws.match_failures = 1;
+    ws.publish_failures = 2;
+    ws.input_dropped = 3;
+    ws.publish_tasks_dropped = 4;
+    ws.queue_depth = 5;
+    ws.queue_bytes = 6000;
+    ws.publish_inflight = 7;
+
+    auto text = sidecar::build_stats_json(/*received=*/123, ws, /*subscriptions=*/8, /*avg_match_us=*/9.5);
+    auto j = nlohmann::json::parse(text);
+
+    EXPECT_EQ(j.at("received").get<uint64_t>(), 123u);
+    EXPECT_EQ(j.at("processed").get<uint64_t>(), 100u);
+    EXPECT_EQ(j.at("matched").get<uint64_t>(), 42u);
+    EXPECT_EQ(j.at("published").get<uint64_t>(), 40u);
+    EXPECT_EQ(j.at("match_failures").get<uint64_t>(), 1u);
+    EXPECT_EQ(j.at("publish_failures").get<uint64_t>(), 2u);
+    EXPECT_EQ(j.at("input_dropped").get<uint64_t>(), 3u);
+    EXPECT_EQ(j.at("publish_tasks_dropped").get<uint64_t>(), 4u);
+    EXPECT_EQ(j.at("subscriptions").get<std::size_t>(), 8u);
+    EXPECT_EQ(j.at("queue_depth").get<std::size_t>(), 5u);
+    EXPECT_EQ(j.at("queue_bytes").get<std::size_t>(), 6000u);
+    EXPECT_EQ(j.at("publish_inflight").get<std::size_t>(), 7u);
+    EXPECT_DOUBLE_EQ(j.at("avg_match_us").get<double>(), 9.5);
 }
 
 TEST(worker_pool, rejects_payload_larger_than_byte_limit) {

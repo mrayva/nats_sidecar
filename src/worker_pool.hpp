@@ -185,4 +185,12 @@ private:
     std::atomic<uint64_t> m_match_time_count{0};
 };
 
+// Machine-readable mirror of sidecar_engine::stats_loop()'s own "stats: ..." text log line, same
+// field names, same values - exposed as a free function (like build_pub_frames above) so its
+// exact output is directly testable without capturing spdlog output. Only emitted when
+// config::stats_format is "json" or "both" (see stats_loop()), under a distinct "stats_json:"
+// log prefix so it can never collide with a "stats:"-matching grep.
+std::string build_stats_json(uint64_t received, const worker_pool::stats& ws,
+                              std::size_t subscriptions, double avg_match_us);
+
 } // namespace sidecar

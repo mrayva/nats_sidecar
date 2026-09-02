@@ -184,6 +184,10 @@ struct config {
     // Operational
     int stats_interval_seconds = 10;
     std::string log_level = "info";
+    // "text" (default, unchanged) | "json" | "both" - see sidecar_engine::stats_loop() and
+    // build_stats_json() (worker_pool.hpp). The JSON line uses a distinct "stats_json:" prefix
+    // (never "stats:") so it can't collide with any existing `grep 'stats:'`-based tooling.
+    std::string stats_format = "text";
 
     // Worker threads for parallel message processing (0 = hardware_concurrency)
     unsigned int worker_threads = 0;

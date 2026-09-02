@@ -67,6 +67,7 @@ cxxopts::Options build_cli_options() {
         ("tls-ca", "TLS CA certificate path", cxxopts::value<std::string>())
         ("stats-interval", "Stats log interval in seconds", cxxopts::value<int>())
         ("log-level", "Log level (debug|info|warn|error)", cxxopts::value<std::string>())
+        ("stats-format", "Stats log format (text|json|both)", cxxopts::value<std::string>())
         ("generate-schema", "Infer attributes from a sample binary file", cxxopts::value<std::string>())
         ("v,verbose", "Enable debug logging")
         ("h,help", "Print help");
@@ -127,6 +128,7 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("tls-ca"))               cfg.tls_ca = result["tls-ca"].as<std::string>();
     if (result.count("stats-interval"))       cfg.stats_interval_seconds = result["stats-interval"].as<int>();
     if (result.count("log-level"))            cfg.log_level = result["log-level"].as<std::string>();
+    if (result.count("stats-format"))         cfg.stats_format = result["stats-format"].as<std::string>();
     if (result.count("verbose"))              cfg.log_level = "debug";
 
     if (result.count("format")) {

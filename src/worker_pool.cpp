@@ -4,6 +4,7 @@
 #include <asio/redirect_error.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
+#include <nlohmann/json.hpp>
 #include <chrono>
 
 namespace sidecar {
@@ -37,6 +38,26 @@ pub_frames build_pub_frames(const std::vector<uint64_t>& matched_ids,
         ++frames.count;
     }
     return frames;
+}
+
+std::string build_stats_json(uint64_t received, const worker_pool::stats& ws,
+                              std::size_t subscriptions, double avg_match_us) {
+    nlohmann::json j = {
+        {"received", received},
+        {"processed", ws.processed},
+        {"matched", ws.matched},
+        {"published", ws.published},
+        {"match_failures", ws.match_failures},
+        {"publish_failures", ws.publish_failures},
+        {"input_dropped", ws.input_dropped},
+        {"publish_tasks_dropped", ws.publish_tasks_dropped},
+        {"subscriptions", subscriptions},
+        {"queue_depth", ws.queue_depth},
+        {"queue_bytes", ws.queue_bytes},
+        {"publish_inflight", ws.publish_inflight},
+        {"avg_match_us", avg_match_us}
+    };
+    return j.dump();
 }
 
 worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
