@@ -260,43 +260,6 @@ TEST(event_bridge_matching, matches_end_to_end_with_betree_engine) {
     EXPECT_TRUE(result2->empty());
 }
 
-TEST(event_bridge_matching, search_time_out_populated_when_search_runs) {
-    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
-    sidecar::attribute_schema schema(defs);
-    sidecar::subscription_manager mgr(defs, "test.output", make_log());
-    mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.acquire_tree();
-    ASSERT_TRUE(snap);
-
-    auto buf = zerialize::serialize<zerialize::MsgPack>(zerialize::dyn::map({{"value", 42}}));
-    std::optional<std::chrono::nanoseconds> search_time;
-    auto result = sidecar::deserialize_and_match(
-        *snap, schema, sidecar::binary_format::msgpack, as_char_span(buf),
-        make_log(), &search_time);
-    ASSERT_TRUE(result.has_value());
-    ASSERT_TRUE(search_time.has_value());
-    EXPECT_GT(search_time->count(), 0);
-}
-
-TEST(event_bridge_matching, search_time_out_left_unset_when_search_never_runs) {
-    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
-    sidecar::attribute_schema schema(defs);
-    sidecar::subscription_manager mgr(defs, "test.output", make_log());
-    mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.acquire_tree();
-    ASSERT_TRUE(snap);
-
-    // 0xc1 is reserved/invalid in MessagePack - deserialization fails before
-    // matching_engine::search() is ever reached.
-    std::vector<char> garbage{static_cast<char>(0xc1)};
-    std::optional<std::chrono::nanoseconds> search_time;
-    auto result = sidecar::deserialize_and_match(
-        *snap, schema, sidecar::binary_format::msgpack,
-        std::span<const char>(garbage.data(), garbage.size()), make_log(), &search_time);
-    EXPECT_FALSE(result.has_value());
-    EXPECT_FALSE(search_time.has_value());
-}
-
 // --- Columnar batch matching (deserialize_and_match_columnar) ---
 // BSON is intentionally not included here - columnar batching is rejected
 // for format=bson at config-validation time (see test_cli.cpp/
@@ -309,13 +272,10 @@ template <typename Protocol>
 std::optional<std::vector<sidecar::row_match>> match_columnar_with(
     const sidecar::matching_engine& tree, const sidecar::attribute_schema& schema,
     sidecar::binary_format format, const zerialize::dyn::Value& payload,
-    std::shared_ptr<spdlog::logger> log,
-    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr,
-    std::size_t* rows_searched_out = nullptr) {
+    std::shared_ptr<spdlog::logger> log) {
     auto buf = zerialize::serialize<Protocol>(payload);
     return sidecar::deserialize_and_match_columnar(
-        tree, schema, format, as_char_span(buf), std::move(log),
-        search_time_out, rows_searched_out);
+        tree, schema, format, as_char_span(buf), std::move(log));
 }
 
 template <typename Protocol>
@@ -460,23 +420,6 @@ TEST(event_bridge_columnar, null_composite_row_produces_all_undefined_event) {
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_TRUE(contains((*result)[0].matched_ids, id));
-}
-
-TEST(event_bridge_columnar, rows_searched_out_reflects_batch_row_count) {
-    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
-    sidecar::attribute_schema schema(defs);
-    sidecar::subscription_manager mgr(defs, "test.output", make_log());
-    mgr.subscribe("value > 10", "client-1");
-    auto snap = mgr.acquire_tree();
-    ASSERT_TRUE(snap);
-
-    auto payload = zerialize::dyn::map({{"value", zerialize::dyn::array({1, 2, 3, 4, 5})}});
-    std::size_t rows_searched = 0;
-    auto result = match_columnar_with<zerialize::MsgPack>(
-        *snap, schema, sidecar::binary_format::msgpack, payload, make_log(),
-        nullptr, &rows_searched);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(rows_searched, 5u);
 }
 
 TEST(event_bridge_matching, unrecognized_binary_returns_nullopt) {

@@ -48,12 +48,6 @@ public:
         std::size_t queue_bytes = 0;
         std::size_t publish_inflight = 0;
         std::size_t publish_inflight_bytes = 0;
-        // Wall-clock time spent inside matching_engine::search() alone (not
-        // deserialize/populate), summed across every message that actually
-        // reached search. match_time_count is the number of such messages -
-        // divide to get an average; both are 0 if none have run yet.
-        uint64_t match_time_ns_total = 0;
-        uint64_t match_time_count = 0;
         // Wall-clock time spent resolving output_subjects and estimating publish size for a
         // matched row (worker_pool.cpp, between search() returning and the publish coroutine
         // being handed to asio::co_spawn()) - NOT the async publish coroutine itself (frame
@@ -63,7 +57,14 @@ public:
         // methodology already avoids elsewhere). Only rows that actually reach the publish
         // coroutine count - a row dropped by the publish_max_inflight backpressure check never
         // really got fanned out, so it isn't counted here. fanout_time_count is the number of
-        // such rows (not messages - see match_time_count's own columnar-batch precedent).
+        // such rows, not messages - a columnar batch's rows are counted individually. (A
+        // previous, similarly-scoped avg_match_us/match_time_* pair - timing
+        // matching_engine::search() alone - was removed: a real `perf` profile found it both
+        // wildly inaccurate (its 1-in-8 timing-sample estimate was ~100-140x off from ground
+        // truth) and non-trivially expensive on its own (~7.6% CPU just for the clock_gettime
+        // calls). `perf` is the trusted way to measure matching cost now, not a built-in
+        // per-row timer - this fanout timer stays only because it isn't sampled and hasn't
+        // shown the same problem.)
         uint64_t fanout_time_ns_total = 0;
         uint64_t fanout_time_count = 0;
     };
@@ -193,8 +194,6 @@ private:
     std::atomic<uint64_t> m_match_failures{0};
     std::atomic<uint64_t> m_input_dropped{0};
     std::atomic<uint64_t> m_publish_tasks_dropped{0};
-    std::atomic<uint64_t> m_match_time_ns_total{0};
-    std::atomic<uint64_t> m_match_time_count{0};
     std::atomic<uint64_t> m_fanout_time_ns_total{0};
     std::atomic<uint64_t> m_fanout_time_count{0};
 };
@@ -205,7 +204,6 @@ private:
 // config::stats_format is "json" or "both" (see stats_loop()), under a distinct "stats_json:"
 // log prefix so it can never collide with a "stats:"-matching grep.
 std::string build_stats_json(uint64_t received, const worker_pool::stats& ws,
-                              std::size_t subscriptions, double avg_match_us,
-                              double avg_fanout_us);
+                              std::size_t subscriptions, double avg_fanout_us);
 
 } // namespace sidecar

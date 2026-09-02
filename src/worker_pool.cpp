@@ -41,8 +41,7 @@ pub_frames build_pub_frames(const std::vector<uint64_t>& matched_ids,
 }
 
 std::string build_stats_json(uint64_t received, const worker_pool::stats& ws,
-                              std::size_t subscriptions, double avg_match_us,
-                              double avg_fanout_us) {
+                              std::size_t subscriptions, double avg_fanout_us) {
     nlohmann::json j = {
         {"received", received},
         {"processed", ws.processed},
@@ -56,7 +55,6 @@ std::string build_stats_json(uint64_t received, const worker_pool::stats& ws,
         {"queue_depth", ws.queue_depth},
         {"queue_bytes", ws.queue_bytes},
         {"publish_inflight", ws.publish_inflight},
-        {"avg_match_us", avg_match_us},
         {"avg_fanout_us", avg_fanout_us}
     };
     return j.dump();
@@ -191,8 +189,6 @@ worker_pool::stats worker_pool::get_stats() const {
         m_queued_bytes.load(std::memory_order_relaxed),
         m_publish_counters->publish_inflight.load(std::memory_order_relaxed),
         m_publish_counters->publish_inflight_bytes.load(std::memory_order_relaxed),
-        m_match_time_ns_total.load(std::memory_order_relaxed),
-        m_match_time_count.load(std::memory_order_relaxed),
         m_fanout_time_ns_total.load(std::memory_order_relaxed),
         m_fanout_time_count.load(std::memory_order_relaxed)
     };
@@ -236,8 +232,6 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         // (stats, malformed/empty/matched branches, the publish coroutine)
         // is one shared code path for both, differing only in how many
         // entries row_matches holds.
-        std::optional<std::chrono::nanoseconds> search_time;
-        std::size_t rows_searched = 1;
         std::optional<std::vector<row_match>> row_matches;
 
         {
@@ -259,11 +253,10 @@ void worker_pool::worker_loop(unsigned int worker_id) {
 
             if (qm.columnar) {
                 row_matches = deserialize_and_match_columnar(
-                    *tree_guard, m_schema, m_format, payload_span, m_log,
-                    &search_time, &rows_searched, m_output_format);
+                    *tree_guard, m_schema, m_format, payload_span, m_log, m_output_format);
             } else {
                 auto matches = deserialize_and_match(
-                    *tree_guard, m_schema, m_format, payload_span, m_log, &search_time);
+                    *tree_guard, m_schema, m_format, payload_span, m_log);
                 if (matches) {
                     row_matches.emplace();
                     if (!matches->empty()) {
@@ -271,12 +264,6 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                     }
                 }
             }
-        }
-
-        if (search_time) {
-            m_match_time_ns_total.fetch_add(
-                static_cast<uint64_t>(search_time->count()), std::memory_order_relaxed);
-            m_match_time_count.fetch_add(rows_searched, std::memory_order_relaxed);
         }
 
         m_processed.fetch_add(1, std::memory_order_relaxed);

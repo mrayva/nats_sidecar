@@ -117,7 +117,7 @@ single spdlog-formatted line, e.g.:
 ```
 stats: received=230276 processed=230276 matched=5514544 published=5514544 match_failures=0
 publish_failures=0 input_dropped=0 publish_tasks_dropped=0 subscriptions=1 queue_depth=0
-queue_bytes=0 publish_inflight=0 avg_match_us=0.16 avg_fanout_us=0.05
+queue_bytes=0 publish_inflight=0 avg_fanout_us=0.05
 ```
 
 Set `stats_format: json` (or `--stats-format json`) to instead emit the same fields as a single
@@ -125,7 +125,7 @@ JSON object, under a `stats_json:` prefix (never `stats:`, so it can't collide w
 already `grep`-ing for the text line):
 
 ```
-stats_json: {"avg_fanout_us":0.05,"avg_match_us":0.16,"input_dropped":0,"match_failures":0,
+stats_json: {"avg_fanout_us":0.05,"input_dropped":0,"match_failures":0,
 "matched":5514544,"processed":230276,"publish_failures":0,"publish_inflight":0,
 "publish_tasks_dropped":0,"published":5514544,"queue_bytes":0,"queue_depth":0,
 "received":230276,"subscriptions":1}
@@ -137,17 +137,19 @@ stats_json: {"avg_fanout_us":0.05,"avg_match_us":0.16,"input_dropped":0,"match_f
 external tooling can parse a real object instead of regex-scraping the text line, the way every
 benchmark script under `nyse-matrix/` in this project's own history has had to.
 
-`avg_match_us` and `avg_fanout_us` time two distinct, non-overlapping phases of the per-row
-pipeline, added at different points in this project's history specifically to make matching cost
-separable from fan-out cost rather than lumped into one end-to-end number: `avg_match_us` is
-wall-clock time inside `matching_engine::search()` alone (every row searched, matching or not);
 `avg_fanout_us` is wall-clock time resolving output subjects and estimating publish size for a row
-that matched (`worker_pool.cpp`, between `search()` returning and the publish coroutine being
-handed off) - only rows that actually reach the publish coroutine count, and deliberately *not*
-the coroutine itself (frame serialization is real CPU, but it's interleaved with
+that matched (`worker_pool.cpp`, between `matching_engine::search()` returning and the publish
+coroutine being handed off) - only rows that actually reach the publish coroutine count, and
+deliberately *not* the coroutine itself (frame serialization is real CPU, but it's interleaved with
 `co_await write_raw()`/backpressure waits - timing the whole thing would mix real work with network
-I/O wait time in one number). Neither includes deserialize/populate (before matching) or the actual
-NATS write (after fan-out resolution) - both stay unmeasured today.
+I/O wait time in one number). Deserialize/populate (before matching), matching itself, and the
+actual NATS write (after fan-out resolution) all stay unmeasured by this stat.
+
+A previous `avg_match_us` (timing `matching_engine::search()` alone) was removed: a real `perf`
+profile found its 1-in-8-row sampling estimate ~100-140x off from ground truth, and the sampling's
+own `clock_gettime` calls cost ~7.6% of real CPU even at that reduced rate - both ineffective and
+non-trivially expensive, so it was cut rather than kept disabled. **`perf` is the trusted way to
+measure matching cost** - see the "K-scaling investigation" section below.
 
 ## Configuration
 
@@ -2347,7 +2349,7 @@ from the real price distribution via narrow percentile bands (`gen_price_thresho
 768-3553 across trials - a real confound worth a cleaner re-run if this gets revisited, not
 controlled for here.)
 
-| target `s` | K (actual) | matches/event | `avg_match_us` | `avg_fanout_us` | throughput (rows/s) |
+| target `s` | K (actual) | matches/event | `avg_match_us`* | `avg_fanout_us` | throughput (rows/s) |
 |---:|---:|---:|---:|---:|---:|
 | 20 | 3553 | 25.2 | 0.39µs | 22.38µs | 8,179 (not fully drained) |
 | 100 | 768 | 5.24 | 0.13µs | 4.43µs | 11,514 |
@@ -2355,23 +2357,32 @@ controlled for here.)
 | 10,000 | 2958 | 0.052 | 0.10µs | 28.22µs | 11,510 |
 | 100,000 | 3088 | 0.0052 | 0.10µs | 39.51µs | 11,513 |
 
-**The honest, decisive answer: no selectivity in this range gets anywhere close to 1M rows/s -
-and throughput stops improving past `s`≈100 at all.** From `s`=100 onward, throughput plateaus at
-~11,500-15,000 rows/s regardless of how much further selectivity increases (even at `s`=100,000,
-where only 0.5% of events match *anything*). The per-event budget (`3 worker_threads / throughput`)
-stays essentially flat at ~195-260µs across every one of these trials - and matching (~0.1µs) plus
-fan-out-resolution (paid on well under 1% of rows once `s` is large) account for **under 0.1% of
-that budget**. Over 99.9% of real per-event cost is coming from somewhere this investigation has
-never measured: deserialize/populate (before matching) and/or the actual async publish/NATS-write
-path and/or system-level queue/scheduling overhead - paid on *every* row regardless of whether it
-matches anything, which is exactly why it doesn't shrink as selectivity increases further.
+*`avg_match_us` has since been removed (see "Stats output" above) - kept in this historical table
+for the record, but do not trust its absolute value: a direct `perf` profile of this same regime
+found it ~100-140x too low (see the correction below).
 
-**This reframes the original question.** Subscription selectivity was never the lever that gets
-this pipeline to 1M rows/s once `s` is already past roughly 100 - a fixed per-event floor
-elsewhere in the pipeline is. Closing that gap would mean instrumenting and optimizing the
-deserialize/populate/publish-write/queue-mechanics path this investigation has consistently
-excluded from scope so far, not tuning subscription shape any further. Not pursued past this point
-without new direction.
+**Throughput plateaus at ~11,500-15,000 rows/s from `s`≈100 onward and never gets anywhere close
+to 1M rows/s** - even at `s`=100,000, where only 0.5% of events match *anything*, throughput is no
+better than at `s`=100. That finding is solid, confirmed by direct wall-clock measurement, not
+dependent on `avg_match_us`/`avg_fanout_us` at all.
+
+**What's *not* solid: the original claim here that matching+fan-out together explained "under 0.1%"
+of the ~195-260µs per-event budget.** A follow-up `perf record`/`perf report` profile of this exact
+regime found `PSTDynamic::matchEvent`+`PSTree::matchPoint`+`encodeValue`+`search()` together
+consuming **~19% of real CPU cycles** - not negligible, contradicting the `avg_match_us`-based
+estimate above by roughly 100-140x. That discrepancy is *why* `avg_match_us` was removed (see
+"Stats output"): its 1-in-8-row timing sample was both inaccurate and, on its own, a real ~7.6% CPU
+cost. The honest breakdown of that ~195-260µs floor, per direct `perf` measurement: ~50% deserialize/
+decode (`zerialize::mp_skip`, string construction, `populate_event`, `match_columnar_batch`), ~19%
+matching, the remainder split across allocation, hashing, and (before this fix) the timing
+instrumentation itself.
+
+**This still reframes the original question, just with the real numbers.** Subscription
+selectivity stops being the lever past `s`≈100 - but deserialize/decode cost, not an unmeasured
+mystery floor, is the largest real remaining contributor (~50%), with matching a real second
+(~19%), not the "under 0.1%" this section originally claimed. Closing the gap to 1M rows/s would
+mean optimizing the deserialize/populate path first, matching cost second - both real, `perf`-
+measured targets now, not unmeasured territory. Not pursued past this point without new direction.
 
 ## License
 

@@ -571,12 +571,10 @@ TEST(event_bridge_arrow, arrow_input_msgpack_output_matches_and_decodes) {
     // zerialize-format columnar test in test_event_bridge.cpp.
     auto stream = build_arrow_ipc_stream({"value"}, {int64_array({5, 42, 100})});
 
-    std::size_t rows_searched = 0;
     auto result = sidecar::deserialize_and_match_columnar(
         *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
-        nullptr, &rows_searched, sidecar::binary_format::msgpack);
+        sidecar::binary_format::msgpack);
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(rows_searched, 3u);
     ASSERT_EQ(result->size(), 2u);
     EXPECT_TRUE(contains((*result)[0].matched_ids, id));
     EXPECT_TRUE(contains((*result)[1].matched_ids, id));
@@ -613,7 +611,7 @@ TEST(event_bridge_arrow, arrow_input_decimal_matches_and_republishes_as_msgpack)
 
     auto result = sidecar::deserialize_and_match_columnar(
         *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
-        nullptr, nullptr, sidecar::binary_format::msgpack);
+        sidecar::binary_format::msgpack);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_TRUE(contains((*result)[0].matched_ids, id));
@@ -642,7 +640,7 @@ TEST(event_bridge_arrow, arrow_input_uint32_matches_and_republishes_as_msgpack) 
 
     auto result = sidecar::deserialize_and_match_columnar(
         *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
-        nullptr, nullptr, sidecar::binary_format::msgpack);
+        sidecar::binary_format::msgpack);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_TRUE(contains((*result)[0].matched_ids, id));
@@ -667,7 +665,7 @@ TEST(event_bridge_arrow, arrow_input_half_float_matches_through_full_pipeline) {
 
     auto result = sidecar::deserialize_and_match_columnar(
         *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
-        nullptr, nullptr, sidecar::binary_format::msgpack);
+        sidecar::binary_format::msgpack);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_TRUE(contains((*result)[0].matched_ids, id));
@@ -704,7 +702,7 @@ TEST(event_bridge_arrow, arrow_as_output_format_returns_nullopt) {
     auto stream = build_arrow_ipc_stream({"value"}, {int64_array({42})});
     auto result = sidecar::deserialize_and_match_columnar(
         *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
-        nullptr, nullptr, sidecar::binary_format::arrow);
+        sidecar::binary_format::arrow);
     EXPECT_FALSE(result.has_value());
 }
 
@@ -719,7 +717,7 @@ TEST(event_bridge_arrow, arrow_input_with_date32_column_returns_nullopt) {
     auto stream = build_arrow_ipc_stream({"day"}, {date32_array({0, 1})});
     auto result = sidecar::deserialize_and_match_columnar(
         *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
-        nullptr, nullptr, sidecar::binary_format::msgpack);
+        sidecar::binary_format::msgpack);
     EXPECT_FALSE(result.has_value());
 }
 

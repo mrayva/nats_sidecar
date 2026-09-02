@@ -7,8 +7,7 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,
-    const std::shared_ptr<spdlog::logger>& log,
-    std::optional<std::chrono::nanoseconds>* search_time_out)
+    const std::shared_ptr<spdlog::logger>& log)
 {
     try {
         auto bytes = std::span<const uint8_t>(
@@ -17,31 +16,31 @@ std::optional<std::vector<uint64_t>> deserialize_and_match(
         switch (format) {
             case binary_format::msgpack: {
                 zerialize::MsgPack::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log, search_time_out);
+                return match_message(tree, schema, reader, log);
             }
             case binary_format::cbor: {
                 zerialize::CBOR::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log, search_time_out);
+                return match_message(tree, schema, reader, log);
             }
             case binary_format::flexbuffers: {
                 zerialize::Flex::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log, search_time_out);
+                return match_message(tree, schema, reader, log);
             }
             case binary_format::zera: {
                 zerialize::Zera::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log, search_time_out);
+                return match_message(tree, schema, reader, log);
             }
             case binary_format::ion: {
                 zerialize::Ion::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log, search_time_out);
+                return match_message(tree, schema, reader, log);
             }
             case binary_format::bson: {
                 zerialize::Bson::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log, search_time_out);
+                return match_message(tree, schema, reader, log);
             }
             case binary_format::beve: {
                 zerialize::Beve::Deserializer reader(bytes);
-                return match_message(tree, schema, reader, log, search_time_out);
+                return match_message(tree, schema, reader, log);
             }
             case binary_format::arrow:
                 // Arrow has no row-mode reader at all (it's inherently columnar - see
@@ -76,29 +75,9 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     const matching_engine& tree,
     const attribute_schema& schema,
     Rows& rows,
-    const std::shared_ptr<spdlog::logger>& log,
-    std::optional<std::chrono::nanoseconds>* search_time_out,
-    std::size_t* rows_searched_out)
+    const std::shared_ptr<spdlog::logger>& log)
 {
-    const std::size_t n = rows.size();
-    if (rows_searched_out) *rows_searched_out = n;
-
     std::vector<row_match> result;
-    std::chrono::nanoseconds total_search_time{0};
-    bool any_search_time = false;
-
-    // Timing every row's tree.search() call (std::chrono::steady_clock::now(),
-    // twice per row) is itself real, measurable overhead on this workload -
-    // confirmed via perf, ~4% of total CPU - because individual searches run
-    // well under a microsecond here, so the act of timing competes with the
-    // thing being timed. Sample instead: only request timing for 1 in
-    // kSearchTimeSampleStride rows, then scale the summed sample up by that
-    // stride below to estimate the batch's total - worker_pool's avg_match_us
-    // (computed from this against the batch's *true*, un-sampled row count,
-    // via rows_searched_out) becomes a statistical estimate rather than an
-    // exact average, a standard and worthwhile trade here given how large a
-    // fraction of the measured quantity the measurement itself was.
-    constexpr std::size_t kSearchTimeSampleStride = 8;
 
     // One event_sink for the whole batch, reused across every row instead
     // of a fresh one per row, when the engine safely supports it
@@ -113,16 +92,9 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     std::unique_ptr<event_sink> reused_event = reuse_event ? tree.make_event() : nullptr;
 
     auto process_row = [&](std::size_t i, auto&& row) -> bool {
-        std::optional<std::chrono::nanoseconds> row_search_time;
-        const bool sample_timing = search_time_out && (i % kSearchTimeSampleStride == 0);
-        auto* timing_out = sample_timing ? &row_search_time : nullptr;
         auto matches = reuse_event
-            ? match_message(tree, schema, row, *reused_event, log, timing_out)
-            : match_message(tree, schema, row, log, timing_out);
-        if (row_search_time) {
-            total_search_time += *row_search_time;
-            any_search_time = true;
-        }
+            ? match_message(tree, schema, row, *reused_event, log)
+            : match_message(tree, schema, row, log);
         if (!matches) {
             // One row's match failed outright (not just "no match") - treat
             // the whole batch as poisoned, matching deserialize_and_match's
@@ -146,9 +118,6 @@ std::optional<std::vector<row_match>> match_columnar_batch(
     }
     if (!ok) return std::nullopt;
 
-    if (search_time_out && any_search_time) {
-        *search_time_out = total_search_time * kSearchTimeSampleStride;
-    }
     return result;
 }
 
@@ -163,29 +132,27 @@ std::optional<std::vector<row_match>> dispatch_columnar_output(
     const attribute_schema& schema,
     Rows& rows,
     binary_format out_fmt,
-    const std::shared_ptr<spdlog::logger>& log,
-    std::optional<std::chrono::nanoseconds>* search_time_out,
-    std::size_t* rows_searched_out)
+    const std::shared_ptr<spdlog::logger>& log)
 {
     switch (out_fmt) {
         case binary_format::msgpack:
-            return match_columnar_batch<zerialize::MsgPack>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            return match_columnar_batch<zerialize::MsgPack>(tree, schema, rows, log);
         case binary_format::cbor:
-            return match_columnar_batch<zerialize::CBOR>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            return match_columnar_batch<zerialize::CBOR>(tree, schema, rows, log);
         case binary_format::flexbuffers:
-            return match_columnar_batch<zerialize::Flex>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            return match_columnar_batch<zerialize::Flex>(tree, schema, rows, log);
         case binary_format::zera:
-            return match_columnar_batch<zerialize::Zera>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            return match_columnar_batch<zerialize::Zera>(tree, schema, rows, log);
         case binary_format::ion:
-            return match_columnar_batch<zerialize::Ion>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            return match_columnar_batch<zerialize::Ion>(tree, schema, rows, log);
         case binary_format::beve:
-            return match_columnar_batch<zerialize::Beve>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            return match_columnar_batch<zerialize::Beve>(tree, schema, rows, log);
         case binary_format::bson:
             // Valid as an OUTPUT format even for a columnar connection, unlike bson as an
             // INPUT format (rejected below): serialize_row() only ever encodes one row (a
             // document), never the batch's own root-level array, so BSON's root-array
             // limitation (see the input-side rejection's own comment) never applies here.
-            return match_columnar_batch<zerialize::Bson>(tree, schema, rows, log, search_time_out, rows_searched_out);
+            return match_columnar_batch<zerialize::Bson>(tree, schema, rows, log);
         case binary_format::arrow:
             if (log) log->error("event_bridge: output_format=arrow is not supported (Arrow is read-only)");
             return std::nullopt;
@@ -201,8 +168,6 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     binary_format format,
     std::span<const char> payload,
     const std::shared_ptr<spdlog::logger>& log,
-    std::optional<std::chrono::nanoseconds>* search_time_out,
-    std::size_t* rows_searched_out,
     std::optional<binary_format> output_format)
 {
     try {
@@ -214,7 +179,6 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
         // (enforced by finalize_and_validate_config()).
         if (format == binary_format::arrow) {
             ArrowColumnarRows rows(payload);
-            if (rows_searched_out) *rows_searched_out = rows.size();
             if (!output_format) {
                 // finalize_and_validate_config() (cli.cpp) requires output_format to be set
                 // whenever format=arrow (Arrow has no single-row encoder of its own) -
@@ -222,7 +186,7 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
                 if (log) log->error("event_bridge: format=arrow requires output_format to be set");
                 return std::nullopt;
             }
-            return dispatch_columnar_output(tree, schema, rows, *output_format, log, search_time_out, rows_searched_out);
+            return dispatch_columnar_output(tree, schema, rows, *output_format, log);
         }
 
         auto bytes = std::span<const uint8_t>(
@@ -244,38 +208,32 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
             case binary_format::msgpack: {
                 zerialize::MsgPack::Deserializer reader(bytes);
                 auto rows = zerialize::columnar_rows(reader);
-                if (rows_searched_out) *rows_searched_out = rows.size();
-                return match_columnar_batch<zerialize::MsgPack>(tree, schema, rows, log, search_time_out, rows_searched_out);
+                return match_columnar_batch<zerialize::MsgPack>(tree, schema, rows, log);
             }
             case binary_format::cbor: {
                 zerialize::CBOR::Deserializer reader(bytes);
                 auto rows = zerialize::columnar_rows(reader);
-                if (rows_searched_out) *rows_searched_out = rows.size();
-                return match_columnar_batch<zerialize::CBOR>(tree, schema, rows, log, search_time_out, rows_searched_out);
+                return match_columnar_batch<zerialize::CBOR>(tree, schema, rows, log);
             }
             case binary_format::flexbuffers: {
                 zerialize::Flex::Deserializer reader(bytes);
                 auto rows = zerialize::columnar_rows(reader);
-                if (rows_searched_out) *rows_searched_out = rows.size();
-                return match_columnar_batch<zerialize::Flex>(tree, schema, rows, log, search_time_out, rows_searched_out);
+                return match_columnar_batch<zerialize::Flex>(tree, schema, rows, log);
             }
             case binary_format::zera: {
                 zerialize::Zera::Deserializer reader(bytes);
                 auto rows = zerialize::columnar_rows(reader);
-                if (rows_searched_out) *rows_searched_out = rows.size();
-                return match_columnar_batch<zerialize::Zera>(tree, schema, rows, log, search_time_out, rows_searched_out);
+                return match_columnar_batch<zerialize::Zera>(tree, schema, rows, log);
             }
             case binary_format::ion: {
                 zerialize::Ion::Deserializer reader(bytes);
                 auto rows = zerialize::columnar_rows(reader);
-                if (rows_searched_out) *rows_searched_out = rows.size();
-                return match_columnar_batch<zerialize::Ion>(tree, schema, rows, log, search_time_out, rows_searched_out);
+                return match_columnar_batch<zerialize::Ion>(tree, schema, rows, log);
             }
             case binary_format::beve: {
                 zerialize::Beve::Deserializer reader(bytes);
                 auto rows = zerialize::columnar_rows(reader);
-                if (rows_searched_out) *rows_searched_out = rows.size();
-                return match_columnar_batch<zerialize::Beve>(tree, schema, rows, log, search_time_out, rows_searched_out);
+                return match_columnar_batch<zerialize::Beve>(tree, schema, rows, log);
             }
             case binary_format::bson:
                 // Rejected at config-validation time (finalize_and_validate_config) -

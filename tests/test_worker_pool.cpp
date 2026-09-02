@@ -112,7 +112,7 @@ TEST(worker_pool, build_stats_json_field_names_and_values_match_the_text_log_lin
     ws.publish_inflight = 7;
 
     auto text = sidecar::build_stats_json(/*received=*/123, ws, /*subscriptions=*/8,
-                                           /*avg_match_us=*/9.5, /*avg_fanout_us=*/1.25);
+                                           /*avg_fanout_us=*/1.25);
     auto j = nlohmann::json::parse(text);
 
     EXPECT_EQ(j.at("received").get<uint64_t>(), 123u);
@@ -127,7 +127,6 @@ TEST(worker_pool, build_stats_json_field_names_and_values_match_the_text_log_lin
     EXPECT_EQ(j.at("queue_depth").get<std::size_t>(), 5u);
     EXPECT_EQ(j.at("queue_bytes").get<std::size_t>(), 6000u);
     EXPECT_EQ(j.at("publish_inflight").get<std::size_t>(), 7u);
-    EXPECT_DOUBLE_EQ(j.at("avg_match_us").get<double>(), 9.5);
     EXPECT_DOUBLE_EQ(j.at("avg_fanout_us").get<double>(), 1.25);
 }
 
@@ -168,12 +167,9 @@ TEST(worker_pool, stop_drains_every_accepted_input) {
     EXPECT_EQ(stats.processed, accepted);
     EXPECT_EQ(stats.queue_depth, 0u);
     EXPECT_EQ(stats.queue_bytes, 0u);
-    // Invalid MessagePack fails deserialization before matching_engine::search()
-    // is ever reached, so none of these should count towards match timing.
-    EXPECT_EQ(stats.match_time_count, 0u);
 }
 
-TEST(worker_pool, tracks_match_time_when_search_runs) {
+TEST(worker_pool, does_not_track_fanout_time_when_message_does_not_match) {
     asio::io_context ioc(1);
     auto cfg = worker_config();
     sidecar::attribute_schema schema(cfg.attributes);
@@ -182,8 +178,8 @@ TEST(worker_pool, tracks_match_time_when_search_runs) {
     sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
 
     pool.start();
-    // value=5 does not satisfy "value > 10" - search runs (and is timed) but
-    // nothing matches, so no publish path (and no connection) is needed.
+    // value=5 does not satisfy "value > 10" - search runs but nothing matches, so the row
+    // never reaches fan-out resolution at all (no publish path, no connection needed).
     EXPECT_TRUE(pool.enqueue(matching_payload(5)));
     EXPECT_TRUE(sidecar_test::drive_until(
         ioc, [&] { return pool.get_stats().processed > 0; }, std::chrono::seconds(2)));
@@ -191,10 +187,7 @@ TEST(worker_pool, tracks_match_time_when_search_runs) {
 
     auto stats = pool.get_stats();
     EXPECT_EQ(stats.matched, 0u);
-    EXPECT_EQ(stats.match_time_count, 1u);
-    EXPECT_GT(stats.match_time_ns_total, 0u);
-    EXPECT_EQ(stats.fanout_time_count, 0u)
-        << "nothing matched, so the row never reached fan-out resolution at all";
+    EXPECT_EQ(stats.fanout_time_count, 0u);
     EXPECT_EQ(stats.fanout_time_ns_total, 0u);
 }
 
@@ -238,7 +231,7 @@ TEST(worker_pool, columnar_fanout_time_count_reflects_matching_row_count_not_tot
 
     sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
     pool.start();
-    // 3 rows searched (match_time_count), only 2 (42, 100) match and reach fan-out resolution.
+    // 3 rows searched, only 2 (42, 100) match and reach fan-out resolution.
     ASSERT_TRUE(pool.enqueue(columnar_payload({5, 42, 100}), /*columnar=*/true));
 
     ASSERT_TRUE(drive_until(
@@ -247,7 +240,6 @@ TEST(worker_pool, columnar_fanout_time_count_reflects_matching_row_count_not_tot
 
     auto stats = pool.get_stats();
     EXPECT_EQ(stats.processed, 1u) << "one input message, regardless of row count";
-    EXPECT_EQ(stats.match_time_count, 3u) << "all 3 rows were searched";
     EXPECT_EQ(stats.fanout_time_count, 2u)
         << "avg_fanout_us must reflect the 2 rows that actually matched and reached fan-out "
            "resolution, not the 3 searched rows or the 1 input message";
@@ -542,27 +534,6 @@ TEST(worker_pool, columnar_batch_malformed_shape_is_termed_like_a_poison_message
 
     EXPECT_EQ(js_sub->termed_stream_seqs, (std::vector<uint64_t>{21}));
     EXPECT_TRUE(js_sub->acked_stream_seqs.empty());
-}
-
-TEST(worker_pool, columnar_match_time_count_reflects_real_row_count_not_message_count) {
-    asio::io_context ioc(1);
-    auto cfg = worker_config();
-    sidecar::attribute_schema schema(cfg.attributes);
-    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
-    subscriptions.subscribe("value > 10", "client-1");
-    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
-
-    pool.start();
-    ASSERT_TRUE(pool.enqueue(columnar_payload({1, 2, 3, 4, 5}), /*columnar=*/true));
-
-    ASSERT_TRUE(drive_until(
-        ioc, [&] { return pool.get_stats().processed > 0; }, std::chrono::seconds(2)));
-    pool.stop();
-
-    auto stats = pool.get_stats();
-    EXPECT_EQ(stats.processed, 1u);
-    EXPECT_EQ(stats.match_time_count, 5u)
-        << "avg_match_us must reflect the 5 real per-row searches, not the 1 input message";
 }
 
 TEST(worker_pool, js_mode_columnar_batch_acks_original_message_once_regardless_of_row_count) {

@@ -189,33 +189,20 @@ bool populate_event(
 // event_sink reused across all of them (when matching_engine::reuses_events()
 // says that's safe for this engine - see matching_engine.hpp) instead of a
 // fresh one per row.
-//
-// search_time_out, if non-null, is set to the wall-clock duration of the
-// matching_engine::search() call alone (not deserialize/populate) whenever
-// search actually runs - left untouched (still nullopt) if populate_event
-// bails out first or search throws, so callers can distinguish "no search
-// happened" from "search took some time" without a sentinel duration.
 template <typename Reader>
 std::optional<std::vector<uint64_t>> match_message(
     const matching_engine& tree,
     const attribute_schema& schema,
     Reader& reader,
     event_sink& event,
-    const std::shared_ptr<spdlog::logger>& log,
-    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr)
+    const std::shared_ptr<spdlog::logger>& log)
 {
     if (!populate_event(event, schema, reader, log)) {
         return std::nullopt;
     }
 
     try {
-        auto t0 = std::chrono::steady_clock::now();
-        auto result = tree.search(event);
-        auto t1 = std::chrono::steady_clock::now();
-        if (search_time_out) {
-            *search_time_out = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0);
-        }
-        return result;
+        return tree.search(event);
     } catch (const std::exception& e) {
         if (log) log->warn("event_bridge: matching engine search failed: {}", e.what());
         return std::nullopt;
@@ -231,22 +218,19 @@ std::optional<std::vector<uint64_t>> match_message(
     const matching_engine& tree,
     const attribute_schema& schema,
     Reader& reader,
-    const std::shared_ptr<spdlog::logger>& log,
-    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr)
+    const std::shared_ptr<spdlog::logger>& log)
 {
     auto event = tree.make_event();
-    return match_message(tree, schema, reader, *event, log, search_time_out);
+    return match_message(tree, schema, reader, *event, log);
 }
 
 // Top-level entry: deserialize raw bytes according to format, then match.
-// See match_message() for search_time_out's semantics.
 std::optional<std::vector<uint64_t>> deserialize_and_match(
     const matching_engine& tree,
     const attribute_schema& schema,
     binary_format format,
     std::span<const char> payload,
-    const std::shared_ptr<spdlog::logger>& log,
-    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr);
+    const std::shared_ptr<spdlog::logger>& log);
 
 // One row of a columnar batch that matched at least one subscription.
 struct row_match {
@@ -277,10 +261,6 @@ std::vector<char> serialize_row(const Reader& row) {
 // and matches each row independently. nullopt means the whole batch is
 // malformed (poison, same contract as deserialize_and_match); an empty
 // vector means the batch was well-formed but no row matched anything.
-// rows_searched_out, if non-null, is set to the batch's row count (for
-// worker_pool's avg_match_us accounting - one message can now represent many
-// searches). search_time_out accumulates total nanoseconds across every
-// row's tree.search() call.
 //
 // BSON is not supported here (format == binary_format::bson is rejected at
 // config-validation time before this function is ever called, and has no
@@ -311,8 +291,6 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     binary_format format,
     std::span<const char> payload,
     const std::shared_ptr<spdlog::logger>& log,
-    std::optional<std::chrono::nanoseconds>* search_time_out = nullptr,
-    std::size_t* rows_searched_out = nullptr,
     std::optional<binary_format> output_format = std::nullopt);
 
 } // namespace sidecar

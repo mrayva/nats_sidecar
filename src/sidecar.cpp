@@ -563,9 +563,6 @@ asio::awaitable<void> sidecar_engine::stats_loop() {
         }
 
         auto ws = m_worker_pool ? m_worker_pool->get_stats() : worker_pool::stats{};
-        double avg_match_us = ws.match_time_count > 0
-            ? (double(ws.match_time_ns_total) / double(ws.match_time_count)) / 1000.0
-            : 0.0;
         double avg_fanout_us = ws.fanout_time_count > 0
             ? (double(ws.fanout_time_ns_total) / double(ws.fanout_time_count)) / 1000.0
             : 0.0;
@@ -579,8 +576,7 @@ asio::awaitable<void> sidecar_engine::stats_loop() {
             m_log->info("stats: received={} processed={} matched={} published={} "
                         "match_failures={} publish_failures={} input_dropped={} "
                         "publish_tasks_dropped={} subscriptions={} queue_depth={} "
-                        "queue_bytes={} publish_inflight={} avg_match_us={:.2f} "
-                        "avg_fanout_us={:.2f}",
+                        "queue_bytes={} publish_inflight={} avg_fanout_us={:.2f}",
                        m_messages_received.load(),
                        ws.processed,
                        ws.matched,
@@ -593,13 +589,11 @@ asio::awaitable<void> sidecar_engine::stats_loop() {
                        ws.queue_depth,
                        ws.queue_bytes,
                        ws.publish_inflight,
-                       avg_match_us,
                        avg_fanout_us);
         }
         if (m_cfg.stats_format == "json" || m_cfg.stats_format == "both") {
             m_log->info("stats_json: {}", build_stats_json(
-                m_messages_received.load(), ws, m_sub_mgr.active_count(), avg_match_us,
-                avg_fanout_us));
+                m_messages_received.load(), ws, m_sub_mgr.active_count(), avg_fanout_us));
         }
     }
 }
