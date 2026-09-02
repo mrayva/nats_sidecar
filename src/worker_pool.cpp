@@ -41,7 +41,8 @@ pub_frames build_pub_frames(const std::vector<uint64_t>& matched_ids,
 }
 
 std::string build_stats_json(uint64_t received, const worker_pool::stats& ws,
-                              std::size_t subscriptions, double avg_match_us) {
+                              std::size_t subscriptions, double avg_match_us,
+                              double avg_fanout_us) {
     nlohmann::json j = {
         {"received", received},
         {"processed", ws.processed},
@@ -55,7 +56,8 @@ std::string build_stats_json(uint64_t received, const worker_pool::stats& ws,
         {"queue_depth", ws.queue_depth},
         {"queue_bytes", ws.queue_bytes},
         {"publish_inflight", ws.publish_inflight},
-        {"avg_match_us", avg_match_us}
+        {"avg_match_us", avg_match_us},
+        {"avg_fanout_us", avg_fanout_us}
     };
     return j.dump();
 }
@@ -190,7 +192,9 @@ worker_pool::stats worker_pool::get_stats() const {
         m_publish_counters->publish_inflight.load(std::memory_order_relaxed),
         m_publish_counters->publish_inflight_bytes.load(std::memory_order_relaxed),
         m_match_time_ns_total.load(std::memory_order_relaxed),
-        m_match_time_count.load(std::memory_order_relaxed)
+        m_match_time_count.load(std::memory_order_relaxed),
+        m_fanout_time_ns_total.load(std::memory_order_relaxed),
+        m_fanout_time_count.load(std::memory_order_relaxed)
     };
 }
 
@@ -301,6 +305,12 @@ void worker_pool::worker_loop(unsigned int worker_id) {
 
         m_matched.fetch_add(row_matches->size(), std::memory_order_relaxed);
 
+        // Start of the timed fan-out-resolution window (see stats::fanout_time_ns_total's own
+        // comment for exactly what this does and deliberately does not cover) - only recorded if
+        // this row_matches actually reaches asio::co_spawn() below, not the backpressure-drop
+        // path (see that branch's own `continue` - a dropped message never really got fanned out).
+        auto fanout_start = std::chrono::steady_clock::now();
+
         // Upfront estimate of this message's total publish wire size (same
         // per-frame estimate build_pub_frames() itself uses), reserved
         // against publish_inflight_bytes BEFORE any buffer is actually
@@ -364,6 +374,12 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                 }
             }
         }
+
+        auto fanout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - fanout_start);
+        m_fanout_time_ns_total.fetch_add(
+            static_cast<uint64_t>(fanout_ns.count()), std::memory_order_relaxed);
+        m_fanout_time_count.fetch_add(row_matches->size(), std::memory_order_relaxed);
 
         auto matches_to_publish = std::move(*row_matches);
         auto conn = m_conn;

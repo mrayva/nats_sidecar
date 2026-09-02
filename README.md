@@ -117,7 +117,7 @@ single spdlog-formatted line, e.g.:
 ```
 stats: received=230276 processed=230276 matched=5514544 published=5514544 match_failures=0
 publish_failures=0 input_dropped=0 publish_tasks_dropped=0 subscriptions=1 queue_depth=0
-queue_bytes=0 publish_inflight=0 avg_match_us=0.16
+queue_bytes=0 publish_inflight=0 avg_match_us=0.16 avg_fanout_us=0.05
 ```
 
 Set `stats_format: json` (or `--stats-format json`) to instead emit the same fields as a single
@@ -125,9 +125,10 @@ JSON object, under a `stats_json:` prefix (never `stats:`, so it can't collide w
 already `grep`-ing for the text line):
 
 ```
-stats_json: {"avg_match_us":0.16,"input_dropped":0,"match_failures":0,"matched":5514544,
-"processed":230276,"publish_failures":0,"publish_inflight":0,"publish_tasks_dropped":0,
-"published":5514544,"queue_bytes":0,"queue_depth":0,"received":230276,"subscriptions":1}
+stats_json: {"avg_fanout_us":0.05,"avg_match_us":0.16,"input_dropped":0,"match_failures":0,
+"matched":5514544,"processed":230276,"publish_failures":0,"publish_inflight":0,
+"publish_tasks_dropped":0,"published":5514544,"queue_bytes":0,"queue_depth":0,
+"received":230276,"subscriptions":1}
 ```
 
 `stats_format: both` emits both lines every interval. An unrecognized value silently falls back to
@@ -135,6 +136,18 @@ stats_json: {"avg_match_us":0.16,"input_dropped":0,"match_failures":0,"matched":
 `set_log_level()`) rather than rejecting the config at startup. This exists specifically so
 external tooling can parse a real object instead of regex-scraping the text line, the way every
 benchmark script under `nyse-matrix/` in this project's own history has had to.
+
+`avg_match_us` and `avg_fanout_us` time two distinct, non-overlapping phases of the per-row
+pipeline, added at different points in this project's history specifically to make matching cost
+separable from fan-out cost rather than lumped into one end-to-end number: `avg_match_us` is
+wall-clock time inside `matching_engine::search()` alone (every row searched, matching or not);
+`avg_fanout_us` is wall-clock time resolving output subjects and estimating publish size for a row
+that matched (`worker_pool.cpp`, between `search()` returning and the publish coroutine being
+handed off) - only rows that actually reach the publish coroutine count, and deliberately *not*
+the coroutine itself (frame serialization is real CPU, but it's interleaved with
+`co_await write_raw()`/backpressure waits - timing the whole thing would mix real work with network
+I/O wait time in one number). Neither includes deserialize/populate (before matching) or the actual
+NATS write (after fan-out resolution) - both stay unmeasured today.
 
 ## Configuration
 

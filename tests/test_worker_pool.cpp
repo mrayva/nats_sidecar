@@ -111,7 +111,8 @@ TEST(worker_pool, build_stats_json_field_names_and_values_match_the_text_log_lin
     ws.queue_bytes = 6000;
     ws.publish_inflight = 7;
 
-    auto text = sidecar::build_stats_json(/*received=*/123, ws, /*subscriptions=*/8, /*avg_match_us=*/9.5);
+    auto text = sidecar::build_stats_json(/*received=*/123, ws, /*subscriptions=*/8,
+                                           /*avg_match_us=*/9.5, /*avg_fanout_us=*/1.25);
     auto j = nlohmann::json::parse(text);
 
     EXPECT_EQ(j.at("received").get<uint64_t>(), 123u);
@@ -127,6 +128,7 @@ TEST(worker_pool, build_stats_json_field_names_and_values_match_the_text_log_lin
     EXPECT_EQ(j.at("queue_bytes").get<std::size_t>(), 6000u);
     EXPECT_EQ(j.at("publish_inflight").get<std::size_t>(), 7u);
     EXPECT_DOUBLE_EQ(j.at("avg_match_us").get<double>(), 9.5);
+    EXPECT_DOUBLE_EQ(j.at("avg_fanout_us").get<double>(), 1.25);
 }
 
 TEST(worker_pool, rejects_payload_larger_than_byte_limit) {
@@ -191,6 +193,64 @@ TEST(worker_pool, tracks_match_time_when_search_runs) {
     EXPECT_EQ(stats.matched, 0u);
     EXPECT_EQ(stats.match_time_count, 1u);
     EXPECT_GT(stats.match_time_ns_total, 0u);
+    EXPECT_EQ(stats.fanout_time_count, 0u)
+        << "nothing matched, so the row never reached fan-out resolution at all";
+    EXPECT_EQ(stats.fanout_time_ns_total, 0u);
+}
+
+TEST(worker_pool, tracks_fanout_time_when_message_is_published) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->on_write_raw = [](std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(42)));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published > 0; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.matched, 1u);
+    EXPECT_EQ(stats.fanout_time_count, 1u);
+    EXPECT_GT(stats.fanout_time_ns_total, 0u);
+}
+
+TEST(worker_pool, columnar_fanout_time_count_reflects_matching_row_count_not_total_row_count) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    conn->on_write_raw = [](std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    // 3 rows searched (match_time_count), only 2 (42, 100) match and reach fan-out resolution.
+    ASSERT_TRUE(pool.enqueue(columnar_payload({5, 42, 100}), /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published >= 2; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.processed, 1u) << "one input message, regardless of row count";
+    EXPECT_EQ(stats.match_time_count, 3u) << "all 3 rows were searched";
+    EXPECT_EQ(stats.fanout_time_count, 2u)
+        << "avg_fanout_us must reflect the 2 rows that actually matched and reached fan-out "
+           "resolution, not the 3 searched rows or the 1 input message";
 }
 
 TEST(worker_pool, publishes_matched_message_via_connection) {
