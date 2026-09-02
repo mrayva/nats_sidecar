@@ -2438,6 +2438,22 @@ publisher's own speed instead (the same "obvious rate metric can lie to you" tra
 own "true sustained rate" methodology exists to catch - this benchmark sidesteps it by construction,
 having no publisher to be limited by at all).
 
+**Extended: Arrow input (default), and an optional real NATS *core* publish path.**
+`sidecar_pipeline_bench` now defaults to `input_format=arrow` - exercising `ArrowColumnarRows`
+(the other real production input-decode path, alongside `ColumnarRows<MsgPackDeserializer>`) with
+msgpack as the required republish encoding (Arrow has no single-row encoder of its own) - `msgpack`
+remains available and behaves identically to before. A new `publish=real` option (default: `fake`,
+unchanged) connects to a real local NATS core server instead of the zero-I/O fake connection, so
+real NATS write I/O for the output side can be measured without reintroducing the external-
+publisher/Postgres confound this benchmark exists to remove - plain PUB/`write_raw`, no JetStream
+consumer or KV bucket, nothing to clean up server-side. Real numbers (K=3000, `s`=20 - a heavier-
+match shape than the table above, chosen specifically to stress the publish path): **`fake`
+~1,893,393 rows/s vs. `real` ~1,779,639 rows/s** - a real, modest (~6%) cost for genuine NATS
+socket writes, not free but nowhere near enough to explain the original ~15,352 rows/s combined-
+system ceiling on its own. Arrow-input throughput at the default shape (K=3000, `s`=100,000) came in
+close to msgpack's own number (~18.4M vs. ~17.7M rows/s) - both comfortably in the same
+"nowhere near the bottleneck" territory.
+
 ## License
 
 See LICENSE file.
