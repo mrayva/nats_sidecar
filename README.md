@@ -2209,6 +2209,61 @@ Plausibly Arrow's zero-copy columnar read (no per-row decode into an intermediat
 msgpack's native decode) being cheaper per row - not profiled to confirm that's the actual
 mechanism, just the observed direction of the effect.
 
+## K-scaling investigation: pstree matching cost at K=8000+, and how far two real fixes got
+
+The matching-engine benchmark above (`## Matching-engine benchmark`) measures small-to-moderate K.
+Scaling the same 100%-degenerate `price > X` shape up to K=8000+ subscriptions exposed a real,
+substantial matching-cost blowup - `avg_match_us` at K=8000 started at **76.6µs** (roughly
+500x the K=1 baseline elsewhere in this document), driving true sustained throughput (see the
+"obvious rate metric can lie to you" methodology above - `queue_depth`-continuous-window,
+received-count-delta measurement, not naive wall-clock rate) far below the original 10M rows/s
+target this whole benchmark suite otherwise reaches easily at low K.
+
+**Ruled out first:** more fleet instances (every instance holds the *full* subscription set - only
+row *volume* is load-balanced via the data-plane `queue_group`, never the subscription count -
+confirmed by reading `sidecar.cpp`'s subscribe calls directly: the control-plane subscription has
+no queue_group at all); swapping to atree/betree (both degrade on the identical workload, not
+pstree-specific); and a more realistic mixed subscription shape alone (40% eq / 30% range / 20% AND
+/ 10% OR cut `avg_match_us` only ~27%, 76.6µs → 56.1-56.3µs - real, insufficient on its own).
+
+**Phase 3 - stop re-verifying a subscription's own access predicate at match time**
+(pstree@85d40ea, this repo@3cd5cea/@3fe6cea): `PSTree::matchPoint()`'s own tree walk already
+*exactly* proves a subscription's access predicate for every operator that gets a real,
+value-specific tree placement (`kEq/kElemOf/kBetween/kLt/kLe/kGt/kGe` - confirmed against
+`buildLowLevel`'s own switch; `kNe/kNotElemOf/kIsNotNull` get a "matches every leaf" catch-all
+instead and must still be re-checked in full). Skipping the now-redundant re-check: **3.1x** at the
+100%-degenerate K=8000 shape (76.6µs → ~24.6-24.8µs), **1.6x** at the mixed shape. Real, but still
+80-115x short of both the original 10M rows/s target and any relaxed bar.
+
+**Phase 4 - inline the hot per-candidate fields into `LeafGroupState::groups`**
+(pstree@55dbd2b, this repo@ceb026b): a follow-up `perf annotate --symbol=PSTDynamic::matchEvent`
+profile on a live K=8000 fleet trial found the *new* bottleneck after Phase 3 was a single
+instruction - the read of `subPtr->accIdxSkippable` - eating 80%+ of the function's self-time. Not
+compute: `subPtr` is a pointer chasing into `subscriptions_` (an `unordered_map`), whose entries sit
+scattered across the heap unrelated to a leaf's own candidate-vector order - a cache miss per
+candidate. Inlining `accIdx`/`accIdxSkippable`/`onlyPredicateIsAccess` directly into each group
+entry (so the common case - a single-predicate subscription whose sole predicate is the access
+predicate, exactly the degenerate benchmark shape - never dereferences `subPtr` at all) took
+`avg_match_us` from ~24.6-24.8µs to a measured, fully-drained **9.79µs** (another ~2.5x), and true
+sustained throughput from ~256 rows/s to **~620-635 rows/s** at K=8000 - a real ~2.4x improvement
+that tracks almost exactly with the `avg_match_us` reduction. (This fast path is specific to
+single-predicate subscriptions; multi-predicate subscriptions in the mixed-shape workload still pay
+the `subPtr` dereference, so Phase 4's real-world win there is expected to be smaller than at the
+100%-degenerate shape - not separately re-measured.)
+
+**The honest bottom line:** two real, verified, independently-shipped fixes took K=8000's
+`avg_match_us` from 76.6µs down to 9.79µs (~7.8x cumulative) and true sustained throughput from
+whatever the original pre-Phase-3 rate was up to ~620-635 rows/s. That is still roughly **1,600x
+short of a relaxed 1M rows/s bar**, and further still from the original 10M rows/s target - K=8000
+single-attribute-degenerate subscriptions is a genuinely hard workload for this matching-engine
+design (every one of 8,000 near-identical wide-range predicates lands in largely-overlapping tree
+buckets, so group sizes - and thus per-event candidate-scan cost - stay large no matter how cheap
+each individual candidate check gets). K=16000/K=32000 were not re-run after Phase 4 since K=8000
+was not "meaningfully closer" to either target - a larger K would only look worse, not better.
+Neither fix regressed anything: full sanitizer suites (plain, ASan+UBSan, ThreadSanitizer) stayed
+green on both repos throughout, and pstree's own randomized differential stress-test oracle
+confirmed byte-identical match results before and after each change.
+
 ## License
 
 See LICENSE file.
