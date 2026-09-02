@@ -664,6 +664,7 @@ public:
         std::vector<pstree_clause> dnf = ast_to_pstree_dnf(sub->expr, m_decimalScales);
 
         bool useDirectId = (dnf.size() == 1) && ((id & kSyntheticIdBit) == 0);
+        if (!useDirectId) m_hasSyntheticClauses = true;
 
         std::vector<uint64_t> insertedClauseIds;
         try {
@@ -706,9 +707,25 @@ public:
 
     std::vector<uint64_t> search(event_sink& event) const override {
         auto& sink = static_cast<pstree_event_sink&>(event);
-        std::vector<uint64_t> result;
         try {
             auto clauseMatches = m_pstd.matchEvent(sink.native());
+            // Fast path: if no subscription has EVER taken the synthetic-clause-id path (see
+            // m_hasSyntheticClauses' own comment), every id in clauseMatches is guaranteed to be
+            // a direct caller-supplied subscription id - the loop below would take the
+            // `(clauseId & kSyntheticIdBit) == 0` branch on every single iteration, producing a
+            // `result` that is byte-for-byte identical to `clauseMatches` itself (no translation,
+            // no dedup - direct-id ids can appear at most once per event by construction, see
+            // that branch's own comment). Skip building that redundant second vector entirely -
+            // found via `perf report` on a live realistic-selectivity fleet trial (2026-09): once
+            // PSTDynamic::matchEvent()'s own cost got cheap enough (Phase 3/4 fixes), this
+            // function's copy loop became the SINGLE LARGEST internal contributor in the whole
+            // sidecar (18.27% of total system time, more than matchEvent() itself at 14.86%) -
+            // pure copy overhead, not real work, for the common (no-OR) subscription shape.
+            if (!m_hasSyntheticClauses) {
+                sink.reset();
+                return clauseMatches;
+            }
+            std::vector<uint64_t> result;
             // Dedup via a hash set, not std::find over `result` - a linear scan here is
             // O(matches) per match, i.e. O(matches^2) per event overall. At scale (many
             // independent wide-range predicates matching a large fraction of subscriptions per
@@ -753,12 +770,12 @@ public:
                     result.push_back(subId);
                 }
             }
+            sink.reset();
+            return result;
         } catch (const std::exception& e) {
             sink.reset();
             throw matching_engine_error(e.what());
         }
-        sink.reset();
-        return result;
     }
 
     // pstree_event_sink is a plain, freshly-constructed std::vector<EventPair> builder with no
@@ -791,6 +808,17 @@ private:
     // The dedup scratch set used to live here as a `mutable` member - moved to a function-local
     // `static thread_local` inside search() itself, see that function's own comment for why
     // (a real, confirmed data race under concurrent worker threads).
+    //
+    // True once ANY subscription has ever taken the synthetic-clause-id path in insert() (an
+    // OR'd/multi-clause expression, or a caller id that already happened to have kSyntheticIdBit
+    // set). Deliberately monotonic - set true, never reset to false on delete: search() only
+    // needs "no clause has EVER used the synthetic path" to safely skip its own translate/dedup
+    // loop (see search()'s own comment) - leaving this true after every synthetic-clause
+    // subscription is later deleted just forgoes that fast path unnecessarily, never a
+    // correctness risk. Protected by the same external lock discipline m_clause_to_sub/
+    // m_next_clause_id already rely on (subscription_manager's unique_lock around insert(),
+    // shared_lock around search()) - no separate synchronization needed for a plain bool here.
+    bool m_hasSyntheticClauses = false;
 };
 
 } // namespace

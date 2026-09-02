@@ -461,3 +461,96 @@ TEST(matching_engine, pstree_concurrent_search_with_or_subscriptions_does_not_ra
     // ordinary matching still works correctly afterward.
     EXPECT_TRUE(contains(search_one(250.0, 50, "AAPL"), 1));
 }
+
+// search()'s own translate/dedup loop (matching_engine.cpp) is skipped entirely when no
+// subscription has ever taken the synthetic-clause-id path (m_hasSyntheticClauses stays false) -
+// found to matter via `perf report` on a live fleet trial once PSTDynamic::matchEvent()'s own
+// cost got cheap enough for search()'s own copy loop to become the largest single contributor.
+// This test builds an engine with ONLY single-clause (no OR) subscriptions - implicitly
+// exercising that fast path - and confirms it produces correct matches, not just "doesn't crash".
+TEST(matching_engine, pstree_search_fast_path_with_only_single_clause_subscriptions_is_correct) {
+    std::vector<sidecar::attribute_def> attrs = {
+        {"trade_price",  sidecar::attribute_type::float_val},
+        {"trade_volume", sidecar::attribute_type::integer},
+        {"symbol",       sidecar::attribute_type::string},
+    };
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    engine->insert(1, "trade_price > 100.0");
+    engine->insert(2, "trade_volume > 1000");
+    engine->insert(3, "symbol = \"AAPL\"");
+    engine->insert(4, "trade_price > 500.0 and trade_volume > 2000");
+
+    auto search_one = [&engine](double price, int64_t volume, std::string_view symbol) {
+        auto sink = engine->make_event();
+        sink->with_float("trade_price", price);
+        sink->with_integer("trade_volume", volume);
+        sink->with_string("symbol", symbol);
+        return engine->search(*sink);
+    };
+
+    auto r1 = search_one(150.0, 500, "AAPL");
+    EXPECT_TRUE(contains(r1, 1));
+    EXPECT_FALSE(contains(r1, 2));
+    EXPECT_TRUE(contains(r1, 3));
+    EXPECT_FALSE(contains(r1, 4));
+
+    auto r2 = search_one(600.0, 3000, "MSFT");
+    EXPECT_TRUE(contains(r2, 1));
+    EXPECT_TRUE(contains(r2, 2));
+    EXPECT_FALSE(contains(r2, 3));
+    EXPECT_TRUE(contains(r2, 4));
+
+    auto r3 = search_one(1.0, 1, "GOOG");
+    EXPECT_TRUE(r3.empty());
+}
+
+// m_hasSyntheticClauses is deliberately monotonic - once any subscription takes the synthetic-
+// clause-id path (an OR'd/multi-clause expression), it stays true for the engine's whole
+// lifetime, even if that subscription is never referenced again. matching_engine has no
+// incremental delete (subscription_manager rebuilds a fresh engine instead - see this file's own
+// class comment), so this test demonstrates the invariant the flag depends on directly: an engine
+// that has an OR'd subscription present alongside single-clause ones (forcing the slow
+// translate/dedup path for every search) must still produce results for the single-clause
+// subscriptions IDENTICAL to an engine built with only those single-clause subscriptions (the
+// fast path) - proving the two code paths are equivalent, not just that neither crashes.
+TEST(matching_engine, pstree_search_results_identical_whether_or_not_synthetic_clauses_are_present) {
+    std::vector<sidecar::attribute_def> attrs = {
+        {"trade_price",  sidecar::attribute_type::float_val},
+        {"trade_volume", sidecar::attribute_type::integer},
+        {"symbol",       sidecar::attribute_type::string},
+    };
+    auto fast_engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    fast_engine->insert(1, "trade_price > 100.0");
+    fast_engine->insert(2, "trade_volume > 1000");
+    fast_engine->insert(3, "symbol = \"AAPL\"");
+
+    auto slow_engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    // Inserted FIRST, before any single-clause subscription - forces m_hasSyntheticClauses = true
+    // for the rest of this engine's lifetime, exactly as it would for a real fleet that has ever
+    // accepted one OR'd expression.
+    slow_engine->insert(100, "trade_price > 9999.0 or symbol = \"ZZZZ\"");
+    slow_engine->insert(1, "trade_price > 100.0");
+    slow_engine->insert(2, "trade_volume > 1000");
+    slow_engine->insert(3, "symbol = \"AAPL\"");
+
+    auto search_one = [](sidecar::matching_engine& engine, double price, int64_t volume,
+                          std::string_view symbol) {
+        auto sink = engine.make_event();
+        sink->with_float("trade_price", price);
+        sink->with_integer("trade_volume", volume);
+        sink->with_string("symbol", symbol);
+        return engine.search(*sink);
+    };
+
+    for (auto [price, volume, symbol] :
+         {std::tuple{150.0, 500, "AAPL"}, std::tuple{600.0, 3000, "MSFT"},
+          std::tuple{1.0, 1, "GOOG"}}) {
+        auto fast_result = search_one(*fast_engine, price, volume, symbol);
+        auto slow_result = search_one(*slow_engine, price, volume, symbol);
+        for (uint64_t id : {1, 2, 3}) {
+            EXPECT_EQ(contains(fast_result, id), contains(slow_result, id))
+                << "sub " << id << " disagreed between fast/slow search() paths for price="
+                << price << " volume=" << volume << " symbol=" << symbol;
+        }
+    }
+}
