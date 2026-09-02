@@ -2454,6 +2454,34 @@ system ceiling on its own. Arrow-input throughput at the default shape (K=3000, 
 close to msgpack's own number (~18.4M vs. ~17.7M rows/s) - both comfortably in the same
 "nowhere near the bottleneck" territory.
 
+**The selectivity sweep, redone with the publish-independent harness.** The original K-scaling
+investigation's own selectivity sweep (`s`=20 to `s`=100,000, above) ran on the combined real-fleet
+system - actual K varied 768-3553 due to run-to-run subscription dedup, and throughput was
+confounded by the publisher-bound ~15,352 rows/s ceiling this whole section exists to explain away.
+Redone with `sidecar_pipeline_bench` at a fixed requested K=8000 (arrow input, fake publish, 2-3
+repeats per point - this harness has far less run-to-run noise than the real-fleet trials did, being
+fully in-process with no external I/O to jitter):
+
+| `s` | K (actual) | matched (of 230,500) | avg rows/s | range across repeats |
+|---:|---:|---:|---:|---:|
+| 20 | 8000 | 12,056 | 1,494,717 | 1,431,823 - 1,557,611 |
+| 100 | 8000 | 2,383 | 1,028,374 | 976,644 - 1,073,016 |
+| 1,000 | 7,997 | 230 | 2,716,497 | 2,702,605 - 2,730,389 |
+| 10,000 | 7,970 | 28 | 11,743,608 | 11,738,992 - 11,748,224 |
+| 100,000 | 7,696 | 6 | 16,682,748 | 15,845,219 - 17,520,277 |
+
+Broadly monotonic (fewer matches -> higher throughput) with one real, reproducible exception:
+**`s`=100 is slower than both `s`=20 and `s`=1,000 - confirmed across 3 repeats (976,644-1,073,016
+rows/s, a tight cluster, not noise)**, despite matching *fewer* rows than `s`=20. The likely
+mechanism (not fully confirmed): `avg_fanout_us` is a *per-matching-row* average, but the
+`output_subjects`-resolution work it times runs once per *batch* (worker_pool.cpp) - a batch with
+few matching rows (`s`=100: ~5.2 matching rows/batch of 500) divides whatever fixed per-batch
+overhead exists across fewer rows than a batch with many (`s`=20: ~26 matching rows/batch),
+inflating the per-row average without necessarily meaning more real work happened. The raw
+wall-clock/throughput numbers above are unaffected by this and are the ones to trust directly -
+noted honestly here, not smoothed over, matching this whole investigation's own standing practice
+for real-but-unexplained results.
+
 ## License
 
 See LICENSE file.
