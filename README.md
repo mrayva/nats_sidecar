@@ -2446,13 +2446,19 @@ remains available and behaves identically to before. A new `publish=real` option
 unchanged) connects to a real local NATS core server instead of the zero-I/O fake connection, so
 real NATS write I/O for the output side can be measured without reintroducing the external-
 publisher/Postgres confound this benchmark exists to remove - plain PUB/`write_raw`, no JetStream
-consumer or KV bucket, nothing to clean up server-side. Real numbers (K=3000, `s`=20 - a heavier-
-match shape than the table above, chosen specifically to stress the publish path): **`fake`
-~1,893,393 rows/s vs. `real` ~1,779,639 rows/s** - a real, modest (~6%) cost for genuine NATS
-socket writes, not free but nowhere near enough to explain the original ~15,352 rows/s combined-
-system ceiling on its own. Arrow-input throughput at the default shape (K=3000, `s`=100,000) came in
-close to msgpack's own number (~18.4M vs. ~17.7M rows/s) - both comfortably in the same
-"nowhere near the bottleneck" territory.
+consumer or KV bucket, nothing to clean up server-side. **First single-pair comparison (K=3000,
+`s`=20) looked like a real ~6% cost for genuine NATS socket writes (`fake` ~1,893,393 rows/s vs.
+`real` ~1,779,639 rows/s) - re-checked with 3 repeats each and retracted**: `fake` alone spans
+1,469,960-1,912,476 rows/s run-to-run (mean ~1,734,598), `real` spans 1,633,205-1,877,342 (mean
+~1,735,979) - the two distributions overlap almost completely and the means are effectively
+identical (`real` even marginally higher in this sample). The original "6%" was noise from a single
+unrepeated pair, not a real effect - **no detectable throughput cost from real NATS-core publish
+at this workload**, at least not one this benchmark's own run-to-run variance (~9-10%, see the
+selectivity-sweep repeats above) can resolve. Caught only because the claim was checked against
+repeats before being trusted, the same discipline this investigation has applied throughout.
+Arrow-input throughput at the default shape (K=3000, `s`=100,000) came in close to msgpack's own
+number (~18.4M vs. ~17.7M rows/s) - both comfortably in the same "nowhere near the bottleneck"
+territory.
 
 **The selectivity sweep, redone with the publish-independent harness.** The original K-scaling
 investigation's own selectivity sweep (`s`=20 to `s`=100,000, above) ran on the combined real-fleet
