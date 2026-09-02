@@ -2089,6 +2089,98 @@ the sidecar side (400 OS threads competing for 24 cores at 16 backends x 25 thre
 currently worth chasing further: the fleet only needs ~11.4M rows/s at N=6, comfortably under what
 the publisher can already deliver.
 
+## Smallest fleet size: down to N=1, once the real bottleneck (queue capacity, not threads) was found
+
+Following on directly from N=6 above: the natural next question was how much further the instance
+count could go, on the same 115,020,848-row NYSE publish (`engine: pstree`, `pub_workers=24`,
+`--source-table nyse_bench_snapshot_price_exchange`, msgpack format, columnar batches of 500 rows,
+`price > 500.0` subscription). Two real findings came out of this pass, both worth internalizing
+independently of the final numbers: **thread count was the wrong knob**, and **the obvious rate
+metric can lie to you**.
+
+**First attempt - sweeping `--workers` (worker_threads) at N=4 - failed.** N=4 (16.4% loss in the
+table above) never reached zero loss at any `--workers` from 2 to 5; the closest was `--workers 4`
+at 0.17% loss, and `--workers 5` was *worse* than 4 - the same non-monotonic signature the
+worker_threads-scaling investigation earlier in this document already proved (via `perf`+`taskset`)
+to be CPU oversubscription, not something more threads fixes.
+
+**The real bottleneck: per-instance input-queue capacity.** A control run confirmed N=4/
+`worker_threads=1` at base.yaml's own long-standing defaults (`input_queue_max_messages: 10000`,
+`input_queue_max_bytes: 67108864` = 64MiB) drops 16.3% - matching the original finding almost
+exactly, regardless of thread count. Bumping the queue 10x (100,000 messages / 640MiB) at
+`worker_threads=1` - no other change - fully drains, reproducibly, at ~11.0-11.5M rows/s. The
+bottleneck was backpressure (`worker_pool::enqueue_impl` dropping input once the bounded queue
+fills), not matching throughput - the entire earlier worker_threads sweep was tuning the wrong
+lever.
+
+**Pushed down from there, N=3 → N=2 → N=1**, holding the queue bump fixed and adjusting only
+`--workers`:
+
+| N | worker_threads | dropped | rows/s |
+|---:|---:|---:|---:|
+| 4 | 1 | 0% | ~11.0-11.5M |
+| 3 | 2 | 0% | ~10.6-11.5M |
+| 2 | 1 | 0% | ~11.5-12.4M |
+| 1 | 3 | 0% | ~14.4-14.9M |
+
+None of these needed more than a handful of `worker_threads` - the earlier assumption that fewer
+instances need proportionally more threads did **not** hold cleanly (N=2 at `worker_threads=1`
+outran N=3 at `worker_threads=1`, which was rate-short at 9.85M and needed `worker_threads=2` to
+clear 10M/s) - a real, unexplained inconsistency, not smoothed over here. N=1 - a single instance,
+no fleet at all - needed `worker_threads=3` and (initially) a much bigger queue than N=2-4, since
+one instance there absorbs the *entire* 230,276-batch volume alone with no NATS queue-group
+load-balancing to split it.
+
+**A real methodology trap, caught at N=1: the obvious rate metric can be wrong.** Every number
+elsewhere in this document (`rows_published / publish_wall_clock_seconds`) is the *publisher's*
+speed, not necessarily the sidecar's - it only works as a stand-in when the sidecar keeps pace with
+the publisher in real time. A big enough input queue lets an instance report `dropped=0` by
+absorbing the entire burst and quietly draining the backlog *after* the publisher already finished
+- which makes that proxy read as a clean pass even when the instance never actually sustained
+10M rows/s in real time. Caught this by checking each instance's own periodic `stats:` log lines for
+stretches where `queue_depth` stayed nonzero throughout (genuinely backlogged, not idle-then-catch-
+up) and computing rows/s from the received-count delta across exactly that stretch - a true lower
+bound on sustained throughput, immune to end-of-run buffering. Re-verified N=2 this way (confirmed
+genuine, ~11.5-12.4M sustained) and used it to validate every N=1 trial from the start, since N=1's
+whole passing configuration depends on a large queue that would otherwise make this exact trap easy
+to fall into.
+
+**Queue size has a real cost (RAM) and shouldn't just be "big enough to pass."** The queue sizes
+above were initially reused across N values rather than individually right-sized. Once actually
+measured against each configuration's own observed peak `queue_depth` (with a ~15-20% margin, not
+shaved to the exact peak):
+
+| N | worker_threads | input_queue_max_messages | input_queue_max_bytes | observed peak queue_depth |
+|---:|---:|---:|---:|---:|
+| 4 | 1 | 25,000 | 150MB | 17,249-21,099 |
+| 3 | 2 | 25,000 | 150MB | 18,442-20,545 |
+| 2 | 1 | 80,000 | 500MB | 66,000-69,600 |
+| 1 | 3 | 165,000 | 1,073,741,824 (1GiB) | 139,710-147,565 |
+
+Every one of these shrank once measured individually - N=4/N=3 down to 150MB from a reused 640MiB,
+N=1 down to 1GiB from a reused 2.5GiB. N=2's peak backlog (66k-69.6k) being *larger* than N=3/N=4's
+(17k-21k) despite fewer instances splitting the load is the same non-monotonic pattern as the
+worker_threads inconsistency above - noted, not explained.
+
+**Final answer: a single instance (N=1) is sufficient** - `engine: pstree`, `worker_threads: 3`,
+`input_queue_max_messages: 165000`, `input_queue_max_bytes: 1073741824`, `pub_workers=24` - fully
+drains the entire 115M-row table and truly sustains ~14.4-14.9M rows/s, confirmed reproducibly. This
+is now `base.yaml`'s own default configuration in this benchmark harness. If you want redundancy
+(more than one process, so a single crash doesn't drop the whole fleet) rather than the bare
+minimum instance count, N=2 at `worker_threads: 1` with an 80,000-message/500MB queue is the next
+cheapest point that still clears both bars - the table above has the full picture for any N you
+might actually want to run instead of the literal minimum.
+
+**Retested at N=1 with Arrow input instead of msgpack (output still msgpack, per Arrow's own
+read-only/different-output_format requirement) - the same settings carried over with no
+adjustment, and came out faster.** Same `worker_threads: 3`, same `input_queue_max_messages: 165000`
+/ `input_queue_max_bytes: 1073741824`, same `pub_workers=24`, only `format: arrow` +
+`input_columnar: true` + `output_format: msgpack` changed: dropped=0 both trials, true sustained
+rate **~15.6-16.5M rows/s** - higher than msgpack input's ~14.4-14.9M at the identical settings.
+Plausibly Arrow's zero-copy columnar read (no per-row decode into an intermediate structure, unlike
+msgpack's native decode) being cheaper per row - not profiled to confirm that's the actual
+mechanism, just the observed direction of the effect.
+
 ## License
 
 See LICENSE file.
