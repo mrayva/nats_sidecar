@@ -287,4 +287,18 @@ if(SIDECAR_BUILD_BENCHMARKS)
     set_target_properties(diag_int_attrs PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+
+    # Publish-independent sidecar throughput benchmark: drives the real deserialize/populate/
+    # match/fan-out pipeline via worker_pool with zero real NATS I/O (tests/fake_connection.hpp),
+    # zero Postgres, zero external publisher process - see the .cpp's own comment for why this
+    # exists (a real fleet-trial ceiling was found to be publisher-bound, not sidecar-bound, which
+    # masked a real sidecar-side fix's own measured effect). tests/ added to this one target's own
+    # include path for fake_connection.hpp - a test-only header, not part of sidecar_lib's public
+    # include path.
+    add_executable(sidecar_pipeline_bench benchmarks/sidecar_pipeline_bench.cpp)
+    target_link_libraries(sidecar_pipeline_bench PRIVATE sidecar_lib)
+    target_include_directories(sidecar_pipeline_bench PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+    set_target_properties(sidecar_pipeline_bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
 endif()
