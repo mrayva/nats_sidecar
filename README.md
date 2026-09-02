@@ -2384,6 +2384,33 @@ mystery floor, is the largest real remaining contributor (~50%), with matching a
 mean optimizing the deserialize/populate path first, matching cost second - both real, `perf`-
 measured targets now, not unmeasured territory. Not pursued past this point without new direction.
 
+**Deserialize/decode fix - cache the redundant double `mp_skip` in zerialize's msgpack map/array
+iterators** (`mrayva/zerialize@01144c9`, this repo's own pin bump `f386f8b`): reading the code
+behind the ~50% deserialize/decode share above found `MsgPackDeserializer::KeysView`/
+`EntriesView`/`ElementsView`'s own iterators called `mp_skip` in `operator*()` to learn the current
+element's byte size, then called it *again* in `operator++()` to recompute that identical size just
+to advance the offset - a real, avoidable 2x redundancy on the single most common access pattern
+(dereference-then-increment), which `ColumnarRows::advance()` (called once per row) drives directly
+through `ElementsView::iterator`. Fixed by caching `operator*()`'s computed size for `operator++()`
+to reuse (still correct if a caller increments without ever dereferencing first). Verified: `perf`
+on the same K~3088 regime before/after - `mp_skip`'s own total share dropped **19.41% → 13.34%**,
+and `advance()`'s own slice of it dropped **8.24% → 5.34%** (~35% relative reduction), exactly the
+targeted mechanism, confirmed by direct measurement rather than inferred. Full `sidecar_test` suite
+green (plain/ASan+UBSan/ThreadSanitizer) and `zerialize`'s own test suite green throughout.
+
+**End-to-end throughput impact: real per the profiler, but not cleanly separable from this
+benchmark's own ceiling.** Two pre-fix and two post-fix trials of the identical K~3088 regime:
+pre-fix spanned 10,948-15,352 rows/s, post-fix landed at 15,351-15,352 rows/s both times - at the
+very top of the pre-fix range, not clearly above it. Two of the *pre-fix* trials independently hit
+the exact same ~15,352 rows/s ceiling the post-fix trials did, which looks like a publisher-side
+limit (`pub_workers=24`, `batch_size=500`) rather than a sidecar-processing one - once the sidecar
+is fast enough to keep pace with the publisher in real time, making the sidecar faster still
+doesn't raise measured throughput, because the publisher becomes the binding constraint instead.
+This is the same honest category of result Phase 5 already hit: a real, `perf`-confirmed win in
+isolation, whose contribution to *this specific benchmark's* end-to-end number is masked by a
+different bottleneck at the fast end. Not chased further - the mechanism (real, targeted, verified)
+is sound regardless of whether this particular publisher setup can expose it end to end.
+
 ## License
 
 See LICENSE file.
