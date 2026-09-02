@@ -2315,10 +2315,63 @@ floor can resolve, not a confirmed win. This is the same honest category of resu
 investigation has already hit more than once elsewhere (see pstree's own project history) - reported
 as such rather than oversold.
 
-**What's left, if this is worth continuing:** `nats-server`'s own 26.65% CPU share is now
-comparable in size to the sidecar's own remaining matching-tree cost (37.82%) - genuinely
-out-of-repo (upstream NATS server internals: subject-routing `Sublist.match`, protocol parsing, Go
-GC), but real. No further work has been scoped past this point without new direction.
+**`nats-server`'s own 26.65% CPU share is comparable in size to the sidecar's own remaining
+matching-tree cost (37.82%)** - genuinely out-of-repo (upstream NATS server internals: subject-
+routing `Sublist.match`, protocol parsing, Go GC), not pursued further.
+
+## What subscription selectivity would it take to reach 1M rows/s? A controlled answer.
+
+The question this whole investigation was ultimately trying to answer: given a target throughput
+(1M rows/s), how selective (`s` = matched-fraction⁻¹, i.e. one subscription matching 1/s of the
+dataset) would subscriptions need to be? Answering this rigorously needed something that didn't
+exist yet: `avg_match_us` only ever timed matching - a single end-to-end throughput number couldn't
+be decomposed into "would shrink with more selective subscriptions" vs. "a fixed floor regardless of
+selectivity."
+
+**Added `avg_fanout_us`** (`worker_pool.cpp`/`.hpp`, `sidecar.cpp`): times the synchronous,
+CPU-bound work between `matching_engine::search()` returning and the publish coroutine being handed
+to `asio::co_spawn()` - resolving `output_subjects` and estimating publish size for a row that
+matched. Deliberately excludes the async publish coroutine itself (frame serialization is
+interleaved with `co_await write_raw()`/backpressure waits - timing that whole thing would mix real
+CPU cost with network I/O wait time in one misleading number, the same trap this document's own
+"true sustained rate" methodology already avoids elsewhere) and excludes rows dropped by
+backpressure (never actually fanned out). Verified via new targeted tests
+(`tracks_fanout_time_when_message_is_published`,
+`columnar_fanout_time_count_reflects_matching_row_count_not_total_row_count`) and the full
+`sidecar_test` suite under plain/ASan+UBSan/ThreadSanitizer.
+
+**Controlled sweep**: five trials at fixed schema/harness, each with `price > X` thresholds drawn
+from the real price distribution via narrow percentile bands (`gen_price_threshold_subs_realistic.py`
+`--lo-percentile`/`--hi-percentile`) centered at target selectivities `s` ≈ 20, 100, 1000, 10000,
+100000. (Real subscription count `K` after the registry's own identical-expression dedup varied
+768-3553 across trials - a real confound worth a cleaner re-run if this gets revisited, not
+controlled for here.)
+
+| target `s` | K (actual) | matches/event | `avg_match_us` | `avg_fanout_us` | throughput (rows/s) |
+|---:|---:|---:|---:|---:|---:|
+| 20 | 3553 | 25.2 | 0.39µs | 22.38µs | 8,179 (not fully drained) |
+| 100 | 768 | 5.24 | 0.13µs | 4.43µs | 11,514 |
+| 1,000 | 2369 | 0.523 | 0.11µs | 31.64µs | 15,351 |
+| 10,000 | 2958 | 0.052 | 0.10µs | 28.22µs | 11,510 |
+| 100,000 | 3088 | 0.0052 | 0.10µs | 39.51µs | 11,513 |
+
+**The honest, decisive answer: no selectivity in this range gets anywhere close to 1M rows/s -
+and throughput stops improving past `s`≈100 at all.** From `s`=100 onward, throughput plateaus at
+~11,500-15,000 rows/s regardless of how much further selectivity increases (even at `s`=100,000,
+where only 0.5% of events match *anything*). The per-event budget (`3 worker_threads / throughput`)
+stays essentially flat at ~195-260µs across every one of these trials - and matching (~0.1µs) plus
+fan-out-resolution (paid on well under 1% of rows once `s` is large) account for **under 0.1% of
+that budget**. Over 99.9% of real per-event cost is coming from somewhere this investigation has
+never measured: deserialize/populate (before matching) and/or the actual async publish/NATS-write
+path and/or system-level queue/scheduling overhead - paid on *every* row regardless of whether it
+matches anything, which is exactly why it doesn't shrink as selectivity increases further.
+
+**This reframes the original question.** Subscription selectivity was never the lever that gets
+this pipeline to 1M rows/s once `s` is already past roughly 100 - a fixed per-event floor
+elsewhere in the pipeline is. Closing that gap would mean instrumenting and optimizing the
+deserialize/populate/publish-write/queue-mechanics path this investigation has consistently
+excluded from scope so far, not tuning subscription shape any further. Not pursued past this point
+without new direction.
 
 ## License
 
