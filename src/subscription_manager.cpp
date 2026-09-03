@@ -1,4 +1,5 @@
 #include "subscription_manager.hpp"
+#include <fmt/format.h>
 
 // This file replaced an RCU-style "rebuild a brand-new tree from scratch and atomically swap it
 // in" pattern that ran on every single subscribe() call - O(current subscription count) work per
@@ -181,7 +182,7 @@ subscription_manager::tree_read_guard subscription_manager::acquire_tree() const
 std::optional<std::string> subscription_manager::output_subject(uint64_t id) const {
     std::shared_lock lock(m_mutex);
     if (m_subscriptions.find(id) == m_subscriptions.end()) return std::nullopt;
-    return m_output_prefix + "." + std::to_string(id);
+    return fmt::format("{}.{}", m_output_prefix, id);
 }
 
 std::size_t subscription_manager::active_count() const {

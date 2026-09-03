@@ -2655,6 +2655,28 @@ cost into a plain, branch-free pointer bump. Not yet attempted or measured; note
 candidate, not a finding in its own right - given how the last two "obvious" fixes on this same
 function turned out under real measurement, it would need the same rigor before trusting it.
 
+**Third attempt at the `std::to_string` hotspot, and this one actually worked.** The first two
+attempts (caching, then a faster itoa algorithm) both kept the same underlying shape: build the
+output string via several separate `+=`/`append()` calls, each paying its own capacity-check/grow
+overhead - the exact same class of cost the matchEvent finding above just identified in
+`std::vector`, just on `std::string` instead. A third attempt targeted that shape directly instead
+of the integer conversion: `fmt::format("{}.{}", m_output_prefix, id)`
+(`subscription_manager.cpp::output_subject()`) and `fmt::format_to(std::back_inserter(wire), "PUB {} {}\r\n", subject, payload.size())`
+(`worker_pool.cpp::append_pub_frame()`) each replace 4-5 separate append calls with one `fmt` call
+that composes the whole piece in a single pass - `fmt` was already a linked dependency, no new
+FetchContent needed. Full `sidecar_test` suite green (plain/ASan+UBSan/ThreadSanitizer), byte-
+identical wire output (existing exact-wire-format tests unchanged).
+
+This time `perf stat -e cycles:u` came back one-sided in the *right* direction: **8/8** interleaved
+pairs at `s`=1/K=8000 used *fewer* cycles (-1.2% to -5.65%, mean ~-3.5%), and **4/4** pairs at a
+more realistic `s`=100/K=8000 did even better (-12.1% to -13.3%, mean ~-12.5% - larger, not smaller,
+at the more realistic selectivity, since fan-out/string-building work is a bigger fraction of
+total per-row cost there than at `s`=1's matching-dominated extreme). Committed
+(`subscription_manager.cpp`, `worker_pool.cpp`). The distinguishing factor across all three
+attempts: fixing *what kind of operation* was redundant (many small appends instead of one
+composed write) paid off; fixing *which algorithm* computed an individual value did not - a useful
+data point for the next hot-symbol chase on this codebase.
+
 ## License
 
 See LICENSE file.
