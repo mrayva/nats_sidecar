@@ -149,6 +149,25 @@ TEST(lease_manager, delete_lease_marks_record_deleted) {
     EXPECT_EQ(it->second.op, nats_asio::kv_entry::operation::del);
 }
 
+// Regression test for a real usability gap found while reviewing the client protocol: deleting an
+// already-deleted key returns nats_asio::error_code::key_not_found (a real failure status, not
+// success) - delete_lease() must treat that specific failure as success anyway, so a caller
+// (sidecar.cpp's on_unsubscribe_request) can safely repeat/retry an unsubscribe the same way
+// subscribe is already documented as safe to repeat, instead of getting a hard error for an
+// outcome ("this lease is gone") it already wanted.
+TEST(lease_manager, delete_lease_on_already_deleted_key_still_succeeds) {
+    asio::io_context ioc(1);
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::subscription_manager sub_mgr(sample_attributes(), "test.output", make_log());
+    sidecar::lease_manager lm(ioc, conn, sub_mgr, "leases", 60, 60, make_log());
+
+    ASSERT_TRUE(run_to_completion<bool>(ioc, lm.persist_lease(1, "temperature > 30.0", "client-1")));
+    ASSERT_TRUE(run_to_completion<bool>(ioc, lm.delete_lease(1, "client-1")));
+
+    bool deleted_again = run_to_completion<bool>(ioc, lm.delete_lease(1, "client-1"));
+    EXPECT_TRUE(deleted_again) << "deleting an already-gone lease must succeed, not error";
+}
+
 // This is the exact scenario broken by the nats_asio kv_get bug found during
 // dependency review: a lease's KV entry is genuinely gone (expired/deleted
 // server-side), and reconciliation must treat that as key_not_found and

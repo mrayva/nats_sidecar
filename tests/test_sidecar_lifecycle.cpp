@@ -711,6 +711,49 @@ TEST(sidecar_engine, on_unsubscribe_request_removes_lease_and_replies_removed) {
     EXPECT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 0u);
 }
 
+// Regression test for the same usability gap test_lease_manager.cpp's own
+// delete_lease_on_already_deleted_key_still_succeeds guards at the lease_manager layer - this one
+// proves it end to end through on_unsubscribe_request: a repeated/retried unsubscribe for the
+// same (id, client_id), after the first one already succeeded, must reply {"removed": true}
+// again, not {"error": ...}.
+TEST(sidecar_engine, on_unsubscribe_request_already_removed_replies_removed_true) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_publish = [](std::string_view, std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+    auto sub_payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.sub"), std::move(sub_payload))));
+
+    auto unsub_payload = json_payload({{"id", 1}, {"client_id", "client-1"}});
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_unsubscribe_request(
+                 engine, std::string("_INBOX.unsub"), std::move(unsub_payload))));
+    ASSERT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 0u);
+
+    std::string captured_reply;
+    conn->on_publish = [&](std::string_view, std::span<const char> payload) -> asio::awaitable<nats_asio::status> {
+        captured_reply.assign(payload.data(), payload.size());
+        co_return nats_asio::status{};
+    };
+
+    auto retry_payload = json_payload({{"id", 1}, {"client_id", "client-1"}});
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_unsubscribe_request(
+                 engine, std::string("_INBOX.unsub"), std::move(retry_payload))));
+
+    auto reply = nlohmann::json::parse(captured_reply);
+    EXPECT_FALSE(reply.contains("error"))
+        << "a retried/repeated unsubscribe must be idempotent, not an error: " << reply.dump();
+    EXPECT_EQ(reply.at("id").get<uint64_t>(), 1u);
+    EXPECT_TRUE(reply.at("removed").get<bool>());
+}
+
 TEST(sidecar_engine, on_unsubscribe_request_delete_failure_replies_with_error) {
     asio::io_context ioc(1);
     sidecar::sidecar_engine engine(ioc, sample_config(), make_log());

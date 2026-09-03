@@ -570,7 +570,7 @@ Response:
 {"id": 1, "removed": true}
 ```
 
-`removed` is `true` if the subscription was fully removed (no remaining lease holders), `false` if other clients still hold leases.
+`removed` is `true` if the subscription was fully removed (no remaining lease holders), `false` if other clients still hold leases. Like subscribe, this is safe to repeat/retry: unsubscribing a lease that's already gone (a double-unsubscribe, a retried request after a network hiccup, or one that already expired naturally via TTL) still replies `{"removed": true}` rather than an error - the caller's actual intent is already satisfied either way.
 
 ### List subscriptions
 

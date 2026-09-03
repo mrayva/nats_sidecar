@@ -204,6 +204,19 @@ asio::awaitable<bool> lease_manager::delete_lease(
     auto [revision, status] = co_await m_conn->kv_delete(
         m_bucket, key, std::chrono::seconds(5));
     if (status.failed()) {
+        if (status.code() == nats_asio::error_code::key_not_found) {
+            // Already gone - a double-unsubscribe, a retried request after a network hiccup, or a
+            // lease that already expired naturally via TTL. Treat as success: the caller's actual
+            // intent ("I don't want this lease anymore") is already satisfied, exactly the same
+            // "already gone counts as done" reasoning subscription_manager::remove_lease()'s own
+            // not_found branch already applies one layer up - this makes unsubscribe safe to
+            // retry/repeat, matching subscribe's own documented idempotency, instead of the caller
+            // getting a hard error for an outcome it already wanted.
+            m_log->debug("lease_manager: lease '{}' already gone - treating unsubscribe as "
+                        "already-satisfied", key);
+            m_expirations.erase(key);
+            co_return true;
+        }
         m_log->error("lease_manager: failed to delete lease '{}': {}",
                      key, status.error());
         co_return false;
