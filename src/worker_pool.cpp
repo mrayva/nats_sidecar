@@ -19,6 +19,15 @@ void append_pub_frame(std::string& wire, const std::string& subject,
     wire.append(payload.data(), payload.size());
     wire += "\r\n";
 }
+
+// Mirrors subscription_manager::kArrayIndexCap (private there, duplicated here rather than
+// exposed just for this) - same underlying assumption: real subscription ids are dense/monotonic
+// (NATS JetStream KV bucket revision numbers), so array-indexing the "have I already resolved
+// this id THIS message" check below is a real O(1) win over hashing, same as it was for
+// subscription_manager's own persistent storage. Ids at or above this cap (never produced by the
+// real registry, only reachable via restore()'s arbitrary-id public API) fall back to the
+// output_subjects map's own count() check, same as before this change - rare enough not to matter.
+constexpr uint64_t kDedupArrayCap = 1'000'000;
 } // namespace
 
 pub_frames build_pub_frames(const std::vector<uint64_t>& matched_ids,
@@ -214,6 +223,18 @@ asio::awaitable<bool> worker_pool::wait_for_publications(
 void worker_pool::worker_loop(unsigned int worker_id) {
     m_log->debug("Worker {} started", worker_id);
 
+    // Per-batch de-dup scratch for the output_subjects resolution loop below (see kDedupArrayCap's
+    // own comment for the array-indexing rationale). Declared here, once per worker thread, and
+    // reused across every message this thread ever processes - not rebuilt per message the way
+    // output_subjects itself still is. dedup_current_generation is bumped once per message; a
+    // slot only counts as "already resolved this message" if its stored generation matches the
+    // current one, which lets the same array double as the check across every message without
+    // ever needing an O(current size) clear between them - grows on demand (like
+    // subscription_manager's own m_subscriptions_by_id) so memory cost tracks the highest id this
+    // one worker thread has actually seen, not a fixed preallocation.
+    std::vector<uint64_t> dedup_generation;
+    uint64_t dedup_current_generation = 0;
+
     queued_message qm;
     while (m_running.load(std::memory_order_acquire) ||
            m_queued_messages.load(std::memory_order_acquire) != 0) {
@@ -364,9 +385,16 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         // subscription - unlike the old tree_snapshot::output_subjects map, which was rebuilt in
         // full on every single subscribe/unsubscribe.
         std::unordered_map<uint64_t, std::string> output_subjects;
+        ++dedup_current_generation;
         for (const auto& rm : *row_matches) {
             for (uint64_t sub_id : rm.matched_ids) {
-                if (output_subjects.count(sub_id)) continue;
+                if (sub_id < kDedupArrayCap) {
+                    if (sub_id >= dedup_generation.size()) dedup_generation.resize(sub_id + 1, 0);
+                    if (dedup_generation[sub_id] == dedup_current_generation) continue;
+                    dedup_generation[sub_id] = dedup_current_generation;
+                } else if (output_subjects.count(sub_id)) {
+                    continue;
+                }
                 if (auto subj = m_sub_mgr.output_subject(sub_id)) {
                     output_subjects.emplace(sub_id, std::move(*subj));
                 }

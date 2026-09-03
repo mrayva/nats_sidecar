@@ -2881,6 +2881,58 @@ correctness verification; the natural next step - applying the same array/genera
 technique to `worker_pool.cpp`'s own per-batch map - is a follow-up, not yet done as of this
 commit.
 
+## The follow-up: array-indexing `worker_pool.cpp`'s own per-batch dedup map
+
+Picking up the follow-up flagged above: `worker_pool.cpp`'s `output_subjects` map is rebuilt fresh
+for every message, and its `.count(sub_id)` check runs once per `(row, matched_id)` pair - not just
+once per *unique* id, unlike `subscription_manager`'s persistent storage (which is looked up once
+per id total, ever). At high fan-out this is the more frequently-hit hashtable, so it's the more
+plausible home for whatever win the previous section's real-pipeline result didn't fully capture.
+
+Same mechanism as `subscription_manager`'s array, applied differently: a `std::vector<uint64_t>
+dedup_generation` plus a `uint64_t dedup_current_generation` counter, both declared once per
+worker thread (locals in `worker_loop()`, alongside the existing `queued_message qm;`) and reused
+across every message that one thread ever processes - not rebuilt per message. Bumping the
+generation counter once per message turns the array into an O(1) "have I already resolved this id
+*this* message" check with no clear step between messages: a slot only counts as current if its
+stored generation matches `dedup_current_generation` right now. Ids below a 1,000,000 cap (mirrors
+`subscription_manager::kArrayIndexCap` - same dense/monotonic-id assumption, duplicated as
+`kDedupArrayCap` rather than exposed just for this) use the array; the rare id above it falls back
+to the original map's own `.count()`, unchanged. The map itself (`output_subjects`) still gets
+built and handed to the publish coroutine exactly as before - only the per-pair *existence check*
+that gated whether to bother calling `output_subject()` and inserting into it changed to the array.
+This mechanism itself isn't new: it's the *other* half of what `dedup_bench.cpp`'s isolated
+microbenchmark validated together in the previous section (that test modeled the persistent store
+and the per-message dedup as one combined array design) - no new isolated benchmark was needed to
+justify trying it here.
+
+Verified: full `sidecar_test` suite green under all three configs (316/316 - plain, ASan+UBSan,
+ThreadSanitizer; TSan relevant even though this state is worker-thread-local, not shared, as a
+sign-off on the new per-thread persistent scratch pattern itself).
+
+Measured on the real pipeline the same way as every other change in this investigation -
+interleaved `perf stat -e cycles:u`, alternating start order across repeats to rule out the
+run-order confound this document found earlier - at three selectivities:
+
+- **`s`=1: 8/8 pairs favorable, mean -5.93% (stdev 2.26%)** - a real, clean win.
+- **`s`=20: 4/8 favorable, mean +1.34% (stdev 12.65%)** - noise, no signal, once extended past an
+  initially-misleading 4-pair sample (3/4 favorable) that didn't survive a larger run.
+- **`s`=100: 2/8 favorable, mean +1.51%** - no signal either, slightly unfavorable if anything.
+
+Understood, not just observed, and it's the mirror image of the previous section's result:
+`s`=1 is this benchmark's *highest* per-row fan-out (selectivity 1/`s` = 1, so most subscriptions
+match most rows - average fan-out approaches K itself), while `s`=20 and `s`=100 have
+progressively smaller per-row fan-out (roughly K/20 and K/100 on average). The per-*message* dedup
+array wins specifically where a single message's own dedup pass has to walk a very large number of
+ids at once - exactly the large-N regime `dedup_bench.cpp` validated (`avg_fanout` 986 and 400) -
+and shows no benefit where per-row fan-out is small enough that the hash map's own overhead was
+already negligible relative to everything else the row does. Combined with the previous section's
+finding (persistent-storage half wins clearly at `s`=20, not `s`=1), the two halves of the same
+array/generation-counter idea end up winning at *different* selectivities, depending on which
+access pattern - many distinct ids looked up once each over time, vs. one message repeatedly
+re-checking a huge shared id set - is actually the bottleneck at that fan-out level. Committed
+(`src/worker_pool.cpp`) on the strength of the real, low-variance `s`=1 result.
+
 ## License
 
 See LICENSE file.
