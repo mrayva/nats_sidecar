@@ -196,13 +196,6 @@ private:
     static constexpr uint64_t kArrayIndexCap = 1'000'000;
     std::vector<std::optional<subscription_info>> m_subscriptions_by_id;
     std::unordered_map<uint64_t, subscription_info> m_subscriptions_overflow;
-
-    // m_subscriptions.size() (the map's own live-entry count) no longer exists to read this back
-    // from - maintained explicitly at every mutation site instead (subscribe()/restore()'s new-
-    // subscription branches increment, remove_lease()'s fully_removed and remove_subscription()
-    // decrement). rebuild_tree_locked() no longer touches this - it neither adds nor removes
-    // subscriptions, only reconstructs the tree from whatever's already live.
-    std::size_t m_active_count_tracked = 0;
 };
 
 } // namespace sidecar
