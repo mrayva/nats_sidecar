@@ -2615,6 +2615,46 @@ trusting a perf-profile hypothesis" discipline this document has needed more tha
 finding) - a hot symbol in a sampling profile is a lead, not a proof, and the fix it suggests still
 has to earn its keep against a real, repeated, low-noise measurement before shipping.
 
+**A second attempt, same result: a faster `std::to_string` algorithm didn't help either.**
+Reasoning that the caching attempt's failure was about *where* the value was fetched from
+(cache-cold memory) rather than the `std::to_string` computation itself being cheap, a follow-up
+tried swapping the algorithm in place instead: `jeaiii::to_text_from_integer`
+(https://github.com/jeaiii/itoa, MIT) writing digits directly into the destination buffer at the
+exact same two call sites, same call frequency, no restructuring - a `simditoa/benchmarks` run
+showed it as the fastest realistic contender for short (1-8 digit) integers specifically, well
+ahead of `std::to_chars`/`fmt`/SIMD converters at that end of the range. Vendored via
+`FetchContent`, full `sidecar_test` suite green (plain/ASan+UBSan/ThreadSanitizer, byte-identical
+wire output). The same `perf stat -e cycles:u` interleaved methodology - 8 pairs this time, not 5 -
+came back just as one-sided: **8 out of 8** pairs used *more* cycles with jeaiii, +0.42% to +9.00%
+(mean ~+3.5%, noisier and larger than the caching attempt's regression, not smaller). Reverted
+(CMake FetchContent block, `src/fast_itoa.hpp`, both call sites) rather than carry an unused
+dependency for a change that didn't pay off.
+
+The likely explanation: modern libstdc++ (GCC 13/14, what this host and CI both build with) already
+implements `std::to_string` for integers via a table-driven fast path broadly similar in spirit to
+jeaiii's own approach, not the `snprintf`-based implementation older libstdc++ versions used - so
+there was less headroom to win back than the external benchmark (comparing against `std::to_chars`,
+not `std::to_string`, and on different hardware) suggested. Two independent, rigorously-verified
+attempts at this exact hot symbol - one via caching, one via a faster algorithm - both came back
+negative. Per this project's own standing pattern elsewhere (see pstree's own hot-path
+investigation history), that's a reasonable point to stop chasing this specific symbol rather than
+try a third approach.
+
+**What `PSTDynamic::matchEvent()` itself actually spends time on, once inside it:** a `perf
+annotate` source-line breakdown (RelWithDebInfo build, same `s`=1/K=8000 benchmark) attributes
+**~82% of matchEvent's own time to two adjacent lines** - the capacity check
+(`if (this->_M_impl._M_finish != this->_M_impl._M_end_of_storage)`, 43.3%) and pointer increment
+(`++this->_M_impl._M_finish;`, 38.5%) inside `std::vector<uint64_t>::push_back()`'s inline fast
+path, appending each matched subscription id to the result vector - not the boolean-expression
+evaluation logic itself. The `GroupEntry` fast-path checks from Phase 4
+(`entry.accIdxSkippable && entry.onlyPredicateIsAccess`) account for another ~7.8%. This points at
+a concrete, not-yet-tried next lead: the result vector isn't reserve()'d ahead of the match loop, so
+at high fan-out (hundreds to low thousands of matches per row at this end of the sweep) it likely
+reallocates and regrows repeatedly - pre-reserving based on a size hint could turn this dominant
+cost into a plain, branch-free pointer bump. Not yet attempted or measured; noted here as the next
+candidate, not a finding in its own right - given how the last two "obvious" fixes on this same
+function turned out under real measurement, it would need the same rigor before trusting it.
+
 ## License
 
 See LICENSE file.
