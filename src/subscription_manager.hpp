@@ -28,6 +28,17 @@ struct subscription_info {
     std::unordered_set<std::string> lease_holders;
 };
 
+// One row of list_subscriptions()'s own output - deliberately narrower than subscription_info:
+// lease_holder_count (not the raw lease_holders set) so a caller exposing this over a network
+// endpoint (see sidecar.cpp's on_list_subscriptions_request()) isn't handed every other client's
+// own identifier just by asking "what's subscribed right now" - see that endpoint's own comment
+// for the full reasoning.
+struct subscription_summary {
+    uint64_t id;
+    std::string expression;
+    std::size_t lease_holder_count;
+};
+
 // Manages boolean expression subscriptions in the matching engine.
 // One live matching_engine, mutated via true incremental insert() calls (see subscribe()/
 // restore()) and protected by a shared_mutex: writers (subscribe/restore/remove, always on the
@@ -99,6 +110,16 @@ public:
     // Stats
     std::size_t active_count() const;
 
+    // Snapshot of currently-active subscriptions, optionally filtered to just those `client_id`
+    // leases (nullopt: every active subscription, the "what's the server actually doing"
+    // admin use case - see sidecar.cpp's on_list_subscriptions_request()). No pagination here -
+    // callers apply offset/limit themselves after filtering, since subscription counts at this
+    // project's scale don't justify a streaming/cursor design. Order is unspecified (follows
+    // for_each_locked()'s own array-then-overflow-map traversal order), same as every other
+    // "no particular order" contract in this class.
+    std::vector<subscription_summary> list_subscriptions(
+        std::optional<std::string> client_id_filter = std::nullopt) const;
+
 private:
     // Discards the current tree and rebuilds it from scratch by re-parsing and re-inserting
     // every expression in m_subscriptions. O(current subscription count) - only used where that
@@ -127,8 +148,10 @@ private:
     // callers already do that alongside their own m_expr_to_id.erase() call.
     void erase_locked(uint64_t id);
 
-    // Invokes fn(id, expression) for every currently-live subscription, in no particular order -
-    // used only by rebuild_tree_locked(), which doesn't care about order.
+    // Invokes fn(id, info) for every currently-live subscription, in no particular order - shared
+    // by rebuild_tree_locked() (only needs info.expression) and list_subscriptions() (needs
+    // info.expression and info.lease_holders.size() too), so the array-vs-overflow-map traversal
+    // lives in exactly one place rather than being duplicated for the second caller.
     template <typename Fn>
     void for_each_locked(Fn&& fn) const;
 

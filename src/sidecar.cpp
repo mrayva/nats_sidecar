@@ -153,6 +153,33 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
     m_stats_request_sub = std::move(stats_ctrl);
     m_log->info("Listening for stats requests on '{}'", m_cfg.stats_request_subject);
 
+    // Subscribe to on-demand subscription-listing subject (request/reply)
+    auto [list_subs_ctrl, list_subs_ctrl_status] = co_await m_conn->subscribe(
+        m_cfg.list_subscriptions_subject,
+        [this](auto subject, auto reply_to, auto payload) -> asio::awaitable<void> {
+            std::string subject_copy(subject);
+            std::optional<std::string> reply_copy;
+            if (reply_to) reply_copy = std::string(*reply_to);
+            std::vector<char> payload_copy(payload.begin(), payload.end());
+            asio::co_spawn(
+                m_ioc,
+                on_list_subscriptions_request(std::move(subject_copy), std::move(reply_copy),
+                                              std::move(payload_copy)),
+                asio::detached);
+            co_return;
+        }
+    );
+
+    if (list_subs_ctrl_status.failed()) {
+        m_log->error("Failed to subscribe to list-subscriptions subject '{}': {}",
+                    m_cfg.list_subscriptions_subject, list_subs_ctrl_status.error());
+        m_ioc.stop();
+        co_return;
+    }
+    m_list_subscriptions_sub = std::move(list_subs_ctrl);
+    m_log->info("Listening for subscription-listing requests on '{}'",
+               m_cfg.list_subscriptions_subject);
+
     // Start stats reporting
     m_stats_timer = std::make_unique<asio::steady_timer>(m_ioc);
     asio::co_spawn(m_ioc, stats_loop(), asio::detached);
@@ -661,6 +688,71 @@ asio::awaitable<void> sidecar_engine::on_stats_request(
 
     if (s.failed()) {
         m_log->error("Failed to reply to stats request: {}", s.error());
+    }
+}
+
+asio::awaitable<void> sidecar_engine::on_list_subscriptions_request(
+    std::string /*subject*/,
+    std::optional<std::string> reply_to,
+    std::vector<char> payload)
+{
+    if (!reply_to) {
+        m_log->warn("List-subscriptions request without reply_to - ignoring");
+        co_return;
+    }
+
+    // Defaults/cap chosen to bound worst-case reply size against NATS's own max-payload limit
+    // without the caller needing to know that constraint exists - see config::
+    // list_subscriptions_subject's own comment and the README's "List subscriptions" section.
+    constexpr std::size_t kDefaultLimit = 500;
+    constexpr std::size_t kMaxLimit = 5000;
+
+    std::string reply_str;
+    try {
+        std::optional<std::string> client_id_filter;
+        std::size_t offset = 0;
+        std::size_t limit = kDefaultLimit;
+
+        // Request body is entirely optional - an empty payload means "list everything, first
+        // page", matching on_stats_request's own "no body required" contract.
+        if (!payload.empty()) {
+            auto req = nlohmann::json::parse(std::string_view(payload.data(), payload.size()));
+            if (req.contains("client_id")) client_id_filter = req.at("client_id").get<std::string>();
+            if (req.contains("offset")) offset = req.at("offset").get<std::size_t>();
+            if (req.contains("limit")) limit = std::min(req.at("limit").get<std::size_t>(), kMaxLimit);
+        }
+
+        auto matching = m_sub_mgr.list_subscriptions(client_id_filter);
+        std::size_t total_matching = matching.size();
+
+        nlohmann::json subs = nlohmann::json::array();
+        for (std::size_t i = offset; i < matching.size() && subs.size() < limit; ++i) {
+            const auto& s = matching[i];
+            subs.push_back({
+                {"id", s.id},
+                {"expression", s.expression},
+                {"lease_holder_count", s.lease_holder_count}
+            });
+        }
+
+        nlohmann::json reply = {
+            {"subscriptions", subs},
+            {"total_matching", total_matching},
+            {"offset", offset},
+            {"returned", subs.size()}
+        };
+        reply_str = reply.dump();
+    } catch (const std::exception& e) {
+        reply_str = nlohmann::json({{"error", std::string("Bad request: ") + e.what()}}).dump();
+    }
+
+    auto s = co_await m_conn->publish(
+        *reply_to,
+        std::span<const char>(reply_str.data(), reply_str.size()),
+        std::nullopt);
+
+    if (s.failed()) {
+        m_log->error("Failed to reply to list-subscriptions request: {}", s.error());
     }
 }
 

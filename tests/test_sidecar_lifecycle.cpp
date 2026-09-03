@@ -12,6 +12,7 @@
 #include <zerialize/protocols/msgpack.hpp>
 #include <chrono>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <spdlog/sinks/null_sink.h>
@@ -207,6 +208,14 @@ struct sidecar_engine_test_access {
                                                           std::vector<char> payload) {
         return engine.on_unsubscribe_request("sidecar.unsubscribe", std::move(reply_to),
                                               std::move(payload));
+    }
+
+    static asio::awaitable<void> on_list_subscriptions_request(
+        sidecar::sidecar_engine& engine,
+        std::optional<std::string> reply_to,
+        std::vector<char> payload) {
+        return engine.on_list_subscriptions_request("sidecar.list_subscriptions",
+                                                      std::move(reply_to), std::move(payload));
     }
 };
 
@@ -769,6 +778,185 @@ TEST(sidecar_engine, on_unsubscribe_request_without_reply_to_does_not_publish) {
     ASSERT_TRUE(run_void_to_completion(
         ioc, sidecar::sidecar_engine_test_access::on_unsubscribe_request(
                  engine, std::nullopt, std::move(payload))));
+
+    EXPECT_FALSE(publish_called);
+}
+
+// --- on_list_subscriptions_request ---
+
+TEST(sidecar_engine, on_list_subscriptions_request_no_filter_returns_every_subscription) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_publish = [](std::string_view, std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+
+    // Two expressions, one shared by both clients, one held only by client-2.
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply"),
+                 json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}}))));
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply"),
+                 json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-2"}}))));
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply"),
+                 json_payload({{"expression", "temperature > 50.0"}, {"client_id", "client-2"}}))));
+
+    std::string captured_reply;
+    conn->on_publish = [&](std::string_view, std::span<const char> payload) -> asio::awaitable<nats_asio::status> {
+        captured_reply.assign(payload.data(), payload.size());
+        co_return nats_asio::status{};
+    };
+
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_list_subscriptions_request(
+                 engine, std::string("_INBOX.list"), std::vector<char>{})));
+
+    auto reply = nlohmann::json::parse(captured_reply);
+    EXPECT_EQ(reply.at("total_matching").get<std::size_t>(), 2u);
+    EXPECT_EQ(reply.at("offset").get<std::size_t>(), 0u);
+    EXPECT_EQ(reply.at("returned").get<std::size_t>(), 2u);
+    ASSERT_EQ(reply.at("subscriptions").size(), 2u);
+
+    bool found_shared = false, found_only_client2 = false;
+    for (auto& s : reply.at("subscriptions")) {
+        if (s.at("expression").get<std::string>() == "temperature > 30.0") {
+            found_shared = true;
+            EXPECT_EQ(s.at("lease_holder_count").get<std::size_t>(), 2u);
+        } else if (s.at("expression").get<std::string>() == "temperature > 50.0") {
+            found_only_client2 = true;
+            EXPECT_EQ(s.at("lease_holder_count").get<std::size_t>(), 1u);
+        }
+    }
+    EXPECT_TRUE(found_shared);
+    EXPECT_TRUE(found_only_client2);
+}
+
+TEST(sidecar_engine, on_list_subscriptions_request_filtered_by_client_id) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_publish = [](std::string_view, std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply"),
+                 json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}}))));
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply"),
+                 json_payload({{"expression", "temperature > 50.0"}, {"client_id", "client-2"}}))));
+
+    std::string captured_reply;
+    conn->on_publish = [&](std::string_view, std::span<const char> payload) -> asio::awaitable<nats_asio::status> {
+        captured_reply.assign(payload.data(), payload.size());
+        co_return nats_asio::status{};
+    };
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_list_subscriptions_request(
+                 engine, std::string("_INBOX.list"),
+                 json_payload({{"client_id", "client-1"}}))));
+
+    auto reply = nlohmann::json::parse(captured_reply);
+    ASSERT_EQ(reply.at("subscriptions").size(), 1u);
+    EXPECT_EQ(reply.at("subscriptions")[0].at("expression").get<std::string>(), "temperature > 30.0");
+}
+
+TEST(sidecar_engine, on_list_subscriptions_request_pagination_covers_full_set_with_no_overlap) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_publish = [](std::string_view, std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        co_return nats_asio::status{};
+    };
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(run_void_to_completion(
+            ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                     engine, std::string("_INBOX.reply"),
+                     json_payload({{"expression", "temperature > " + std::to_string(i) + ".0"},
+                                   {"client_id", "client-1"}}))));
+    }
+
+    std::string captured_reply;
+    conn->on_publish = [&](std::string_view, std::span<const char> payload) -> asio::awaitable<nats_asio::status> {
+        captured_reply.assign(payload.data(), payload.size());
+        co_return nats_asio::status{};
+    };
+
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_list_subscriptions_request(
+                 engine, std::string("_INBOX.list"),
+                 json_payload({{"limit", 3}}))));
+    auto page1 = nlohmann::json::parse(captured_reply);
+    EXPECT_EQ(page1.at("total_matching").get<std::size_t>(), 5u);
+    EXPECT_EQ(page1.at("offset").get<std::size_t>(), 0u);
+    EXPECT_EQ(page1.at("returned").get<std::size_t>(), 3u);
+    ASSERT_EQ(page1.at("subscriptions").size(), 3u);
+
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_list_subscriptions_request(
+                 engine, std::string("_INBOX.list"),
+                 json_payload({{"offset", 3}, {"limit", 3}}))));
+    auto page2 = nlohmann::json::parse(captured_reply);
+    EXPECT_EQ(page2.at("total_matching").get<std::size_t>(), 5u);
+    EXPECT_EQ(page2.at("offset").get<std::size_t>(), 3u);
+    EXPECT_EQ(page2.at("returned").get<std::size_t>(), 2u);
+    ASSERT_EQ(page2.at("subscriptions").size(), 2u);
+
+    std::set<uint64_t> page1_ids, page2_ids;
+    for (auto& s : page1.at("subscriptions")) page1_ids.insert(s.at("id").get<uint64_t>());
+    for (auto& s : page2.at("subscriptions")) page2_ids.insert(s.at("id").get<uint64_t>());
+    for (auto id : page1_ids) EXPECT_FALSE(page2_ids.contains(id)) << "pages must not overlap";
+    EXPECT_EQ(page1_ids.size() + page2_ids.size(), 5u) << "the two pages together cover the full set";
+}
+
+TEST(sidecar_engine, on_list_subscriptions_request_invalid_json_replies_with_error) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    std::string captured_reply;
+    conn->on_publish = [&](std::string_view, std::span<const char> payload) -> asio::awaitable<nats_asio::status> {
+        captured_reply.assign(payload.data(), payload.size());
+        co_return nats_asio::status{};
+    };
+
+    std::vector<char> bad_payload = {'{', 'n', 'o', 't', ' ', 'j', 's', 'o', 'n'};
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_list_subscriptions_request(
+                 engine, std::string("_INBOX.list"), std::move(bad_payload))));
+
+    auto reply = nlohmann::json::parse(captured_reply);
+    EXPECT_TRUE(reply.contains("error"));
+}
+
+TEST(sidecar_engine, on_list_subscriptions_request_without_reply_to_does_not_publish) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, sample_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    bool publish_called = false;
+    conn->on_publish = [&](std::string_view, std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        publish_called = true;
+        co_return nats_asio::status{};
+    };
+
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_list_subscriptions_request(
+                 engine, std::nullopt, std::vector<char>{})));
 
     EXPECT_FALSE(publish_called);
 }

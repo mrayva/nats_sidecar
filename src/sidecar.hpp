@@ -118,6 +118,15 @@ private:
         std::optional<std::string> reply_to,
         std::vector<char> payload);
 
+    // Callback: on-demand subscription-listing request (request/reply pattern, mirroring
+    // on_stats_request above). Request body is optional JSON
+    // {"client_id": "...", "offset": N, "limit": M} - all fields optional, see the README's own
+    // "List subscriptions" section for the full contract.
+    asio::awaitable<void> on_list_subscriptions_request(
+        std::string subject,
+        std::optional<std::string> reply_to,
+        std::vector<char> payload);
+
     asio::io_context& m_ioc;
     config m_cfg;
     std::shared_ptr<spdlog::logger> m_log;
@@ -130,6 +139,7 @@ private:
     nats_asio::isubscription_sptr m_subscribe_sub;
     nats_asio::isubscription_sptr m_unsubscribe_sub;
     nats_asio::isubscription_sptr m_stats_request_sub;
+    nats_asio::isubscription_sptr m_list_subscriptions_sub;
     subscription_manager m_sub_mgr;
     attribute_schema m_schema;
     std::unique_ptr<lease_manager> m_lease_mgr;

@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/null_sink.h>
+#include <algorithm>
 #include <chrono>
 
 namespace {
@@ -324,4 +325,70 @@ TEST(subscription_manager_betree, is_not_empty_is_rejected) {
         sidecar::matching_engine_error
     );
     EXPECT_EQ(mgr.active_count(), 0u);
+}
+
+namespace {
+const sidecar::subscription_summary* find_summary(
+    const std::vector<sidecar::subscription_summary>& subs, uint64_t id) {
+    auto it = std::find_if(subs.begin(), subs.end(),
+                           [id](const auto& s) { return s.id == id; });
+    return it != subs.end() ? &*it : nullptr;
+}
+} // namespace
+
+TEST(subscription_manager, list_subscriptions_returns_every_active_subscription) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
+    uint64_t id1 = mgr.subscribe("temperature > 30.0", "client-1");
+    uint64_t id2 = mgr.subscribe("severity > 5", "client-1");
+
+    auto subs = mgr.list_subscriptions();
+    ASSERT_EQ(subs.size(), 2u);
+
+    auto* s1 = find_summary(subs, id1);
+    ASSERT_NE(s1, nullptr);
+    EXPECT_EQ(s1->expression, "temperature > 30.0");
+    EXPECT_EQ(s1->lease_holder_count, 1u);
+
+    auto* s2 = find_summary(subs, id2);
+    ASSERT_NE(s2, nullptr);
+    EXPECT_EQ(s2->expression, "severity > 5");
+    EXPECT_EQ(s2->lease_holder_count, 1u);
+}
+
+TEST(subscription_manager, list_subscriptions_lease_holder_count_reflects_multiple_clients) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
+    uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
+    mgr.subscribe("temperature > 30.0", "client-2");
+    mgr.subscribe("temperature > 30.0", "client-3");
+
+    auto subs = mgr.list_subscriptions();
+    ASSERT_EQ(subs.size(), 1u);
+    EXPECT_EQ(subs[0].id, id);
+    EXPECT_EQ(subs[0].lease_holder_count, 3u);
+}
+
+TEST(subscription_manager, list_subscriptions_filtered_by_client_id_narrows_correctly) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
+    uint64_t shared_id = mgr.subscribe("temperature > 30.0", "client-1");
+    mgr.subscribe("temperature > 30.0", "client-2");
+    uint64_t only_client1_id = mgr.subscribe("severity > 5", "client-1");
+    mgr.subscribe("active", "client-2");
+
+    auto client1_subs = mgr.list_subscriptions("client-1");
+    ASSERT_EQ(client1_subs.size(), 2u);
+    EXPECT_NE(find_summary(client1_subs, shared_id), nullptr);
+    EXPECT_NE(find_summary(client1_subs, only_client1_id), nullptr);
+
+    auto client_none_subs = mgr.list_subscriptions("client-does-not-exist");
+    EXPECT_TRUE(client_none_subs.empty())
+        << "a client with no subscriptions gets an empty list, not an error";
+}
+
+TEST(subscription_manager, list_subscriptions_excludes_removed_subscription) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log());
+    uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
+    ASSERT_TRUE(mgr.remove_subscription(id));
+
+    auto subs = mgr.list_subscriptions();
+    EXPECT_TRUE(subs.empty());
 }

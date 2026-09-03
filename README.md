@@ -90,6 +90,7 @@ the legacy single-connection config shape - they're rejected if the config file 
 | `--input-stream-storage file\|memory` | JetStream input-stream storage backend (default `file`); `memory` exists purely for isolating the durable mode's protocol cost from its disk-I/O cost - not for production use, since it loses all persisted messages on a `nats-server` restart |
 | `--subscribe-subject SUBJ` | Subscription request subject |
 | `--unsubscribe-subject SUBJ` | Unsubscription request subject |
+| `--list-subscriptions-subject SUBJ` | On-demand subscription-listing request subject |
 | `--lease-bucket NAME` | NATS KV lease bucket name |
 | `--lease-ttl SECS` | Lease TTL in seconds |
 | `--lease-check-interval SECS` | Lease reconciliation interval in seconds |
@@ -570,6 +571,55 @@ Response:
 ```
 
 `removed` is `true` if the subscription was fully removed (no remaining lease holders), `false` if other clients still hold leases.
+
+### List subscriptions
+
+The only other control-plane gap `stats_request_subject` doesn't cover: `active_count()` is a
+count, not a list, and every other subscription lookup (by id, by expression) requires the caller
+to already know the key. Send an (entirely optional) JSON request to the
+`list_subscriptions_subject`:
+
+```json
+{"client_id": "my-client", "offset": 0, "limit": 500}
+```
+
+All three fields are optional - an empty request body lists every active subscription, first page.
+- No `client_id`: the "what's the server actually doing" admin use case - every active
+  subscription.
+- `client_id` present: narrows to only subscriptions that client currently leases - a lower-risk,
+  self-service use case (a client reconciling its own held subscriptions after a restart, without
+  needing to remember every id itself).
+- `offset`/`limit` paginate the (optionally filtered) result set. `limit` defaults to 500, capped
+  at 5000 server-side regardless of what's requested, to bound worst-case reply size against
+  NATS's own max-payload limit without the caller needing to know that constraint exists.
+
+Response:
+
+```json
+{
+  "subscriptions": [
+    {"id": 1, "expression": "temperature > 30.0 AND location = \"warehouse\"", "lease_holder_count": 2}
+  ],
+  "total_matching": 1,
+  "offset": 0,
+  "returned": 1
+}
+```
+
+`total_matching` is the filtered-but-unpaginated count, so a caller knows whether more pages exist
+(request the next page with `offset` = this response's own `offset` + `returned`); `returned` is
+just `subscriptions.length` in this specific reply.
+
+Deliberately **not** included: the raw list of client ids holding each lease - only a count.
+Exposing individual client identifiers to any caller that can reach this NATS subject would be a
+new category of information disclosure this control plane doesn't have anywhere else today
+(`subscribe`/`unsubscribe` only ever return information about the *requesting* client's own
+state); a count is enough to answer "what's actually subscribed right now" without introducing
+that. Every instance in a fleet answers identically for the *unfiltered* case (`subscribe_subject`/
+`unsubscribe_subject` are broadcast, not queue-grouped - see the Subscribe section above - so
+every instance's live subscription state converges to the same set), so a plain `request()` call
+capturing whichever instance replies first is a valid fleet-wide answer, not just that one
+instance's own view.
 
 ## Durable JetStream consumer: loss-proof input, at a real cost
 

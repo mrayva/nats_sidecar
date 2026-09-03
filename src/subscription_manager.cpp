@@ -78,17 +78,17 @@ void subscription_manager::erase_locked(uint64_t id) {
 template <typename Fn>
 void subscription_manager::for_each_locked(Fn&& fn) const {
     for (std::uint64_t id = 0; id < m_subscriptions_by_id.size(); ++id) {
-        if (m_subscriptions_by_id[id]) fn(id, m_subscriptions_by_id[id]->expression);
+        if (m_subscriptions_by_id[id]) fn(id, *m_subscriptions_by_id[id]);
     }
     for (const auto& [id, info] : m_subscriptions_overflow) {
-        fn(id, info.expression);
+        fn(id, info);
     }
 }
 
 void subscription_manager::rebuild_tree_locked() {
     std::unique_ptr<matching_engine> tree = build_matching_engine(m_engine, m_attributes);
-    for_each_locked([&tree](uint64_t id, const std::string& expression) {
-        tree->insert(id, expression);
+    for_each_locked([&tree](uint64_t id, const subscription_info& info) {
+        tree->insert(id, info.expression);
     });
     m_tree = std::move(tree);
     // m_active_count is maintained incrementally at each mutation site now (see its own comment
@@ -255,6 +255,18 @@ std::optional<std::string> subscription_manager::output_subject(uint64_t id) con
 std::size_t subscription_manager::active_count() const {
     std::shared_lock lock(m_mutex);
     return m_active_count;
+}
+
+std::vector<subscription_summary> subscription_manager::list_subscriptions(
+    std::optional<std::string> client_id_filter) const {
+    std::shared_lock lock(m_mutex);
+    std::vector<subscription_summary> result;
+    result.reserve(m_active_count);
+    for_each_locked([&](uint64_t id, const subscription_info& info) {
+        if (client_id_filter && !info.lease_holders.contains(*client_id_filter)) return;
+        result.push_back({id, info.expression, info.lease_holders.size()});
+    });
+    return result;
 }
 
 } // namespace sidecar

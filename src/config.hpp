@@ -169,6 +169,14 @@ struct config {
     // is the same JSON build_stats_json() produces for "stats_json:".
     std::string stats_request_subject = "sidecar.stats";
 
+    // On-demand subscription listing (request/reply) - the one control-plane gap stats_request_
+    // subject doesn't cover (active_count() is a count, not a list). Reply is
+    // {id, expression, lease_holder_count} per active subscription (deliberately not the raw
+    // lease-holder client ids - see sidecar.cpp's on_list_subscriptions_request() for why),
+    // optionally filtered to one client_id, paginated via offset/limit - see the README's own
+    // "List subscriptions" section for the full request/response shape.
+    std::string list_subscriptions_subject = "sidecar.list_subscriptions";
+
     // Soft-state leases via NATS KV
     std::string lease_bucket = "sidecar-leases";
     uint32_t lease_ttl_seconds = 3600;
