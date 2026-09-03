@@ -28,6 +28,13 @@ class NatsClient:
         self._stream.close()
         self._socket.close()
 
+    def publish(self, subject: str, payload: bytes) -> None:
+        """Fire-and-forget publish - no SUB/UNSUB, no reply wait. Used by
+        churn_load_test.py's data-plane load generator; kept here (not
+        duplicated there) since it's a generically useful NatsClient
+        primitive, same reasoning as request() itself living here."""
+        self._send(f"PUB {subject} {len(payload)}\r\n".encode() + payload + b"\r\n")
+
     def request(self, subject: str, body: dict, timeout: float = 10) -> dict:
         sid = self._next_sid
         self._next_sid += 1

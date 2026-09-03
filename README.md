@@ -3098,6 +3098,71 @@ adaptive gate successfully avoids it by almost never engaging when the system is
 pressure. Committed on the strength of the real `s`=1 result and the confirmed absence of an `s`=100
 regression; `s`=20's own lack of signal is reported honestly rather than smoothed over.
 
+## High-churn-under-load: subscribe/unsubscribe cost while the data plane is under sustained load
+
+Every performance investigation in this document up to this point assumed a *static* subscription
+set - K fixed, no subscribes/unsubscribes happening while the data plane is under load. That's a
+real, unexamined gap: `subscription_manager::rebuild_tree_locked()` is O(current subscription
+count) and runs on every fully-removed subscription (none of a-tree/be-tree/pstree expose a delete
+primitive) *while holding `m_mutex`'s exclusive lock* - the same lock every worker thread's
+`acquire_tree()` needs (as a shared lock) before it can match a single row.
+
+**Tool**: `tests/churn_load_test.py`, built on `tests/integration_sidecar.py`'s own `NatsClient`/
+process-lifecycle machinery (a real `nats-server` + a real `nats_sidecar` binary, not a fake
+connection) rather than a from-scratch harness. Two concurrent load generators, each its own
+NATS connection/Python thread: a raw msgpack data-plane publisher, and a subscribe/unsubscribe
+churn driver holding a steady-state target K, in two modes - "warm" (a fixed pool of K
+expressions, reused across many client ids - no `subscription_registry` KV round trips once each
+pool entry is known) and "cold" (every cycle a brand-new expression - a real KV round trip every
+time). After each run, `sidecar.list_subscriptions` (this document's own "admin-facing
+subscription listing" section) cross-checks the churn driver's own bookkeeping against the
+server's real state - a real, direct use of that endpoint's own stated purpose, and something with
+no verification path before it existed.
+
+**Two real bugs in the tool itself, found and fixed while first using it** (kept here, not scrubbed
+- matching this document's own practice everywhere else): (1) `build/bin/nats_sidecar` was stale
+(only `sidecar_lib`/`sidecar_test` had been rebuilt that session, not the actual executable target)
+- the first run hung indefinitely on `sidecar.list_subscriptions` because the running binary
+predated that endpoint entirely. (2) The warm-mode add/remove balance decision originally compared
+lease-*pair* count against target K, conflated with a `target_k / 4` pool size - since most warm-mode
+adds are reuses (not new distinct subscriptions), lease count could take far longer to reach target
+K than the run's own duration allowed, so warm mode could run for its entire duration in pure "add"
+bias, never reaching steady-state churn at all. Fixed by keying the balance decision on *distinct*
+id count consistently, and by round-robining through the warm pool on first coverage instead of
+sampling it randomly (plain random sampling is a coupon-collector process - covering all K pool
+entries at least once takes an *expected* K·ln(K) draws, ~6900 for K=1000, not K).
+
+**Findings** (K=100 vs. K=1000, `cold` mode, `--churn-rate 50 --data-rate 2000 --selectivity 10`,
+60s runs with the first 25s excluded from percentiles as ramp-up):
+
+- **Unsubscribe (removal) cost scales with K, confirmed cleanly**: mean **1.40ms at K=100** →
+  mean **13.53ms at K=1000** (~10x, tracking the ~10x K increase) - and this holds across the
+  *whole* distribution, not just a tail (K=1000: p50=13.44ms, p99=15.48ms, p999=18.21ms - mean,
+  median, and p99 are all close together, meaning *every* removal pays this cost, not just a rare
+  unlucky few). This is `rebuild_tree_locked()`'s O(K) cost, real and directly measurable for the
+  first time in this document.
+- **Subscribe (insert) cost stays cheap regardless of K**: ~1.0-1.3ms at both K=100 and K=1000, in
+  both warm and cold mode - confirms `subscribe()`'s own true incremental `insert()` (this
+  document's own earlier fix for the old O(K²) bulk-rebuild pattern) still holds under sustained
+  churn, not just at insert time in isolation.
+- **Warm vs. cold, isolated per side**: on *subscribe*, cold pays a real but modest premium over
+  warm at matched K=1000 (mean 1.31ms cold vs. 0.96ms warm) - the registry KV round trip's own
+  cost, smaller than the K-scaling effect above. On *unsubscribe*, warm and cold cost the
+  essentially the same when a full removal happens (warm's own few sampled removals: mean 4.29ms,
+  max 13.77ms - in the same range as cold's 13.53ms mean) - consistent with `rebuild_tree_locked()`
+  being entirely registry-independent, exactly as the architecture would predict (the registry is
+  only ever consulted on the *insert* side).
+
+**Not yet confirmed - a real, honest limitation of this first pass, not a negative result**: this
+tool measures the churn *request's own* round-trip latency, which necessarily includes the
+synchronous rebuild cost by construction (the reply isn't sent until `remove_lease()` -
+`rebuild_tree_locked()` included - returns). It does **not** yet directly show whether *worker-thread
+matching* latency also stalls during that same window (the original concern: `m_mutex`'s exclusive
+lock blocking every worker's `acquire_tree()` for the ~13ms a K=1000 rebuild takes) - that would need
+either sub-100ms-granularity sampling of `processed`/`matched` looking for stalls, or direct
+instrumentation around `acquire_tree()` itself. Left as a clearly scoped follow-up, not conflated
+with what's actually been confirmed above.
+
 ## License
 
 See LICENSE file.
