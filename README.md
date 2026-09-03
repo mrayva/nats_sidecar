@@ -3194,6 +3194,73 @@ visible instead of diluting one into the other. This doesn't change the cold-mod
 comparison above - cold mode's expressions are never reused, so every one of its removals was
 already a full removal by construction.)
 
+**A second, more consequential correction, found while verifying the fix below**: every number
+above was measured against **a-tree**, not pstree - `config/example.yaml` (this tool's own default
+`--config`) sets `engine: atree`, and the tool had no way to override it until the fix below added
+one. The *finding itself* is still completely valid (`rebuild_tree_locked()` doesn't care which
+engine it's rebuilding - the cost is inherent to the "discard and re-insert everything" strategy,
+not to a-tree specifically), but every reference to "this project's own flagship/most-benchmarked
+engine" in the paragraphs above was an unverified assumption, not a checked fact. Corrected here
+rather than silently fixed, matching this document's own standing practice.
+
+## Fixing it: true incremental delete for pstree, replacing rebuild_tree_locked() on removal
+
+The class-level comment `rebuild_tree_locked()` cites for its own existence - "none of a-tree/
+be-tree/pstree expose a delete primitive" - turned out to be **factually wrong for pstree
+specifically**. Reading `pst_dynamic.hpp` directly: `PSTDynamic::deleteSubscription(subId)`
+(Algorithm 6) is a genuinely incremental delete - it touches only the leaf nodes reachable from
+the *one* affected subscription's own access predicate, not the whole tree, and already includes
+space reclamation. It was already used safely, just narrowly: `pstree_matching_engine::insert()`'s
+own rollback-on-failure path already called it to undo a partially-completed insert. It had simply
+never been wired up for the general "remove a live subscription" case `subscription_manager`
+actually needs on every real unsubscribe.
+
+**Design**: `matching_engine.hpp` gains `supports_remove()`/`remove(id)`, the same safe-default
+pattern as `supports_count()`/`search_count()` from the earlier adaptive-dispatch work - zero code
+changes to a-tree/be-tree, which simply inherit the defaults (`false` / throws).
+`pstree_matching_engine` gets a real override backed directly by `deleteSubscription()`, plus one
+new piece of bookkeeping `insert()` didn't previously need to keep: a forward map from a
+caller-facing subscription id to the (possibly several, for an OR'd expression) underlying
+PSTDynamic clause ids it expanded into at insert time - the reverse of the `m_clause_to_sub` map
+`search()` already maintains. `subscription_manager`'s own two removal call sites
+(`remove_lease()`'s full-removal branch, `remove_subscription()`) now check
+`supports_remove()` and call the true `remove()` when available, falling back to the unchanged
+`rebuild_tree_locked()` otherwise - a-tree/be-tree keep today's behavior exactly, at zero risk.
+
+One real test-design lesson from building this: an early version of the concurrency test called
+`remove()` and `search()` directly on a raw `matching_engine`, with no external locking - and it
+crashed (`std::bad_alloc`, real internal-state corruption) almost immediately. That wasn't a
+production bug; it was testing an invariant this layer never promised. `subscription_manager::
+m_mutex` is what actually serializes writers against readers in this codebase (its own
+"deliberately NOT lock-free for readers" doc comment says so directly) - every *other* existing
+concurrent test at the `matching_engine.cpp` layer only exercises concurrent reads for exactly this
+reason. The real concurrency test belongs at the `subscription_manager` layer instead, where the
+locking actually lives - see `pstree_remove_lease_concurrent_with_search_does_not_race`.
+
+**Verified, with a real pstree-specific before/after** (the tool needed a new `--engine` flag
+first, itself a fix for the mix-up above - `churn_load_test.py --engine pstree`, same K=1000/`cold`/
+60s configuration as the original finding):
+
+| | subscribe | unsubscribe (full removal) | cumulative lock-hold | data-plane isolated vs. overlapped | dropped messages |
+|---|---|---|---|---|---|
+| **before** (pstree, rebuild-based) | mean 10.08ms | mean **37.19ms**, p50 33.45ms | **22.6s of 35s steady-state (~65%)** | mean 3.27ms vs. **26.37ms** | **41 of 103,917** |
+| **after** (pstree, true `remove()`) | mean 1.48ms | mean **1.09ms**, p50 1.00ms | **952ms of 35s (~2.7%)** | mean 0.61ms vs. **0.82ms** | **0 of 103,985** |
+
+Every one of the plan's own verification criteria held, and more strongly than expected - pstree's
+own rebuild cost was actually *worse* than a-tree's at the same K (37.19ms vs. a-tree's own
+13.95ms mean), so pstree had more to gain from this fix, not less. `unsubscribe` now costs about
+the same as `subscribe` (both cheap, incremental operations, as they should be) instead of ~34x
+more. The data-plane isolated-vs-overlapped gap - the actual causal signal for "does this stall
+worker-thread matching" - shrinks from a ~8x mean difference to a difference so small it's within
+this measurement's own noise floor. And a real, previously-unreported consequence surfaces in the
+"before" row that latency percentiles alone don't capture: **41 real dropped messages** - not just
+slow, actually lost, on a plain core-NATS input subject with no redelivery - a direct
+consequence of the rebuild stalling matching long enough to exceed whatever timeout or
+backpressure mechanism was in the path. The fix eliminates this too.
+
+Full `sidecar_test` suite green under all three configs (348/348 - plain/ASan+UBSan/
+ThreadSanitizer) both before and after this change.
+
 ## License
 
 See LICENSE file.

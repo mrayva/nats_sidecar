@@ -3,7 +3,9 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/null_sink.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <thread>
 
 namespace {
 
@@ -391,4 +393,98 @@ TEST(subscription_manager, list_subscriptions_excludes_removed_subscription) {
 
     auto subs = mgr.list_subscriptions();
     EXPECT_TRUE(subs.empty());
+}
+
+// --- pstree engine: real removal now goes through matching_engine::remove() (a true incremental
+// delete) instead of rebuild_tree_locked() - see subscription_manager::remove_from_tree_locked()'s
+// own comment. Mirrors the existing atree-default remove_lease_complete/
+// output_subject_absent_after_remove tests above, but for pstree specifically, since
+// test_subscription_manager.cpp never constructed a pstree instance before this - the real
+// pipeline (subscribe -> remove_lease -> output_subject/active_count) needs its own direct
+// coverage through the new path, not just at the matching_engine.cpp layer in isolation.
+
+TEST(subscription_manager, pstree_remove_lease_complete_stops_matching) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::pstree);
+    uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
+
+    auto removal = mgr.remove_lease(id, "client-1");
+    EXPECT_EQ(removal, sidecar::lease_removal::fully_removed);
+    EXPECT_EQ(mgr.active_count(), 0u);
+    EXPECT_FALSE(mgr.output_subject(id).has_value());
+
+    auto tree = mgr.acquire_tree();
+    ASSERT_TRUE(tree);
+    ASSERT_TRUE(tree->supports_remove()) << "sanity check: this test is only meaningful if pstree "
+                                            "actually took the new remove() path, not a rebuild";
+    auto sink = tree->make_event();
+    sink->with_float("temperature", 40.0);
+    EXPECT_TRUE(tree->search(*sink).empty())
+        << "a removed subscription must never match again, whether removal went through remove() "
+           "or a rebuild";
+}
+
+TEST(subscription_manager, pstree_remove_subscription_force_remove_stops_matching) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::pstree);
+    uint64_t keep_id = mgr.subscribe("severity > 5", "client-1");
+    uint64_t remove_id = mgr.subscribe("temperature > 30.0", "client-1");
+
+    ASSERT_TRUE(mgr.remove_subscription(remove_id));
+    EXPECT_EQ(mgr.active_count(), 1u);
+    EXPECT_FALSE(mgr.output_subject(remove_id).has_value());
+    EXPECT_TRUE(mgr.output_subject(keep_id).has_value())
+        << "an unrelated subscription must be entirely unaffected by another one's force-removal";
+
+    auto tree = mgr.acquire_tree();
+    ASSERT_TRUE(tree);
+    auto sink = tree->make_event();
+    sink->with_float("temperature", 40.0);
+    sink->with_integer("severity", 0);
+    EXPECT_TRUE(tree->search(*sink).empty());
+}
+
+// The REAL concurrency contract remove() actually relies on: subscription_manager::m_mutex
+// serializes remove_lease() (exclusive lock, via remove_from_tree_locked()) against every worker
+// thread's acquire_tree()+search() (shared lock) - see that class's own "Deliberately NOT
+// lock-free for readers" doc comment. This is the properly-synchronized counterpart to
+// test_matching_engine.cpp's own deliberately-REMOVED "concurrent with search, no locking at all"
+// test - see that file's own comment for why testing remove() without this layer's locking isn't
+// a meaningful test of anything this codebase actually promises. Must pass under
+// ThreadSanitizer (build-tsan).
+TEST(subscription_manager, pstree_remove_lease_concurrent_with_search_does_not_race) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::pstree);
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < 20; ++i) {
+        ids.push_back(mgr.subscribe("temperature > " + std::to_string(i) + ".0", "client-1"));
+    }
+
+    std::atomic<bool> stop{false};
+    std::thread remover([&mgr, &ids, &stop]() {
+        for (uint64_t id : ids) {
+            if (stop.load()) break;
+            mgr.remove_lease(id, "client-1");
+        }
+    });
+
+    constexpr int kThreads = 8;
+    constexpr int kIterationsPerThread = 2000;
+    std::vector<std::thread> searchers;
+    searchers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        searchers.emplace_back([&mgr, t]() {
+            for (int i = 0; i < kIterationsPerThread; ++i) {
+                auto tree = mgr.acquire_tree();
+                if (!tree) continue;
+                auto sink = tree->make_event();
+                sink->with_float("temperature", static_cast<double>((t * 37 + i) % 30));
+                tree->search(*sink);
+            }
+        });
+    }
+    for (auto& th : searchers) th.join();
+    stop.store(true);
+    remover.join();
+    // Reaching here without crashing/hanging under TSan is the actual assertion.
 }

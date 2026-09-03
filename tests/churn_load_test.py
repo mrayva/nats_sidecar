@@ -344,6 +344,16 @@ def main() -> None:
         "--ramp-seconds", type=float, default=3.0,
         help="initial period excluded from churn-latency percentiles (warm-mode pool population)")
     parser.add_argument("--input-subject", default="sensor.data")
+    parser.add_argument(
+        "--engine", choices=["atree", "betree", "pstree"], default=None,
+        help="override the matching engine (default: whatever --config itself specifies). "
+             "A real gap found while first using this tool for its own stated purpose: without "
+             "this flag, every run silently used --config's own engine setting (config/example.yaml "
+             "defaults to atree) regardless of which engine the caller actually meant to "
+             "characterize - rebuild_tree_locked()'s cost is real for EVERY engine that doesn't "
+             "support matching_engine::remove() (today: only pstree does), so a caller testing "
+             "pstree specifically must pass --engine pstree explicitly, not assume the config "
+             "file's own default matches their intent.")
     args = parser.parse_args()
 
     port = free_port()
@@ -363,16 +373,20 @@ def main() -> None:
                 )
             wait_for_log(server, server_log, "Server is ready")
 
+            sidecar_args = [
+                str(args.sidecar), "-c", str(args.config), "-p", str(port),
+                "--lease-bucket", "churn-test-leases",
+                "--lease-ttl", "3600",
+                "--lease-check-interval", "3600",
+                "--workers", "0",
+                "--stats-interval", "3600",
+            ]
+            if args.engine is not None:
+                sidecar_args += ["--engine", args.engine]
+
             with sidecar_log.open("w") as output:
                 sidecar = subprocess.Popen(
-                    [
-                        str(args.sidecar), "-c", str(args.config), "-p", str(port),
-                        "--lease-bucket", "churn-test-leases",
-                        "--lease-ttl", "3600",
-                        "--lease-check-interval", "3600",
-                        "--workers", "0",
-                        "--stats-interval", "3600",
-                    ],
+                    sidecar_args,
                     stdout=output, stderr=subprocess.STDOUT,
                 )
             wait_for_log(sidecar, sidecar_log, "Sidecar engine started")
@@ -416,7 +430,8 @@ def main() -> None:
                 daemon=True,
             )
 
-            print(f"Starting: mode={args.mode} target_k={args.target_k} churn_rate={args.churn_rate}/s "
+            print(f"Starting: engine={args.engine or '(from --config)'} mode={args.mode} "
+                  f"target_k={args.target_k} churn_rate={args.churn_rate}/s "
                   f"data_rate={args.data_rate}/s selectivity=1/{args.selectivity} duration={args.duration}s")
 
             # Listener first, so it's already receiving before any data-plane traffic exists -

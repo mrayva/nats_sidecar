@@ -96,6 +96,14 @@ void subscription_manager::rebuild_tree_locked() {
     // nothing to update here.
 }
 
+void subscription_manager::remove_from_tree_locked(uint64_t id) {
+    if (m_tree->supports_remove()) {
+        m_tree->remove(id);
+    } else {
+        rebuild_tree_locked();
+    }
+}
+
 uint64_t subscription_manager::subscribe(const std::string& expression,
                                          const std::string& client_id) {
     std::unique_lock lock(m_mutex);
@@ -190,9 +198,9 @@ lease_removal subscription_manager::remove_lease(uint64_t subscription_id,
     sub->lease_holders.erase(client_id);
 
     if (sub->lease_holders.empty()) {
-        // No more clients — remove subscription and rebuild the tree. No engine here exposes a
-        // delete primitive, so this stays O(remaining subscriptions), same as before this file's
-        // insert-path fix - see rebuild_tree_locked()'s own comment. Save the expression before
+        // No more clients — remove the subscription from the tree (a true incremental remove()
+        // when the engine supports it, a full rebuild otherwise - see remove_from_tree_locked()'s
+        // own comment) and from this class's own bookkeeping. Save the expression before
         // erase_locked() clears the record (reclaiming its string/set memory - the id itself is
         // never reused, see m_subscriptions_by_id's own header comment, so the record can safely
         // go back to empty rather than needing to remember anything about what it held).
@@ -202,7 +210,7 @@ lease_removal subscription_manager::remove_lease(uint64_t subscription_id,
                    subscription_id, removed_expression);
         erase_locked(subscription_id);
         --m_active_count;
-        rebuild_tree_locked();
+        remove_from_tree_locked(subscription_id);
         return lease_removal::fully_removed;
     }
 
@@ -223,7 +231,7 @@ bool subscription_manager::remove_subscription(uint64_t subscription_id) {
                subscription_id, expression);
     erase_locked(subscription_id);
     --m_active_count;
-    rebuild_tree_locked();
+    remove_from_tree_locked(subscription_id);
     return true;
 }
 

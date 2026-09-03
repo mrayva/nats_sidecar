@@ -168,6 +168,26 @@ public:
     virtual std::size_t search_count(event_sink& /*event*/) const {
         throw matching_engine_error("search_count() not supported by this engine");
     }
+
+    // Whether remove() below is really implemented for this engine (a true incremental delete)
+    // rather than the base-class default, which throws. subscription_manager::remove_from_tree_
+    // locked() checks this once per removal and falls back to rebuild_tree_locked() (discard and
+    // re-insert every remaining subscription) when it's false - the ONLY reason that fallback
+    // exists at all: neither a-tree nor be-tree exposes a delete primitive this codebase can call.
+    // pstree's own PSTDynamic::deleteSubscription() (Algorithm 6) genuinely does - see
+    // pstree_matching_engine::remove()'s own comment for why this was already safely exercised
+    // once (insert()'s own rollback-on-failure path) before ever being wired up for real removal.
+    // Defaults false for every engine but pstree.
+    virtual bool supports_remove() const { return false; }
+
+    // Removes `id` from the live tree in place - genuinely incremental, not a rebuild. Only ever
+    // called after supports_remove() has been confirmed true for this engine; the base-class
+    // default throws rather than silently no-op'ing, matching search_count()'s own "unsupported
+    // by this engine" convention (see that method's own comment for why a caller-side gating bug
+    // must fail loudly here too).
+    virtual void remove(uint64_t /*id*/) {
+        throw matching_engine_error("remove() not supported by this engine");
+    }
 };
 
 // Builds a fresh matching_engine for the given engine type and attribute

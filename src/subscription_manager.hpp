@@ -124,10 +124,20 @@ private:
     // Discards the current tree and rebuilds it from scratch by re-parsing and re-inserting
     // every expression in m_subscriptions. O(current subscription count) - only used where that
     // cost is unavoidable: as a safety net after a failed incremental insert() (see subscribe()/
-    // restore()'s own comments), and for remove_lease()/remove_subscription(), since none of
-    // a-tree/be-tree/pstree expose a delete primitive. Must be called with m_mutex already
-    // held exclusively.
+    // restore()'s own comments), and as remove_from_tree_locked()'s own fallback for an engine
+    // that doesn't support true removal (a-tree/be-tree - see matching_engine::supports_remove()'s
+    // own comment for why this is no longer universal). Must be called with m_mutex already held
+    // exclusively.
     void rebuild_tree_locked();
+
+    // Removes `id` from the live tree - the actual real-removal path remove_lease()'s
+    // fully_removed branch and remove_subscription() call, as opposed to rebuild_tree_locked()'s
+    // OWN two call sites (subscribe()/restore()'s insert-failure rollback, unrelated to removal at
+    // all). Uses the engine's own true incremental remove() when supported (pstree), falling back
+    // to a full rebuild otherwise (a-tree/be-tree, unchanged behavior) - see matching_engine.hpp's
+    // own supports_remove()/remove() doc comments for the full reasoning. Must be called with
+    // m_mutex already held exclusively.
+    void remove_from_tree_locked(uint64_t id);
 
     // Below: the array-vs-overflow-map split (see m_subscriptions_by_id's own comment for why
     // both exist) collapsed into one small set of helpers so subscribe()/restore()/remove_lease()/

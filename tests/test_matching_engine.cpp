@@ -696,3 +696,97 @@ TEST(matching_engine, pstree_search_count_concurrent_with_or_subscriptions_does_
     // ordinary counting still works correctly afterward.
     EXPECT_GE(count_one(250.0, 50, "AAPL"), std::size_t{1});
 }
+
+// remove() - a-tree/be-tree zero-risk contract, mirroring search_count_unsupported_by_default's
+// own shape.
+TEST_P(matching_engine_test, remove_unsupported_by_default) {
+    auto engine = sidecar::build_matching_engine(GetParam(), trade_attributes());
+    engine->insert(1, "trade_price > 100.0");
+    EXPECT_FALSE(engine->supports_remove());
+    EXPECT_THROW(engine->remove(1), sidecar::matching_engine_error);
+}
+
+TEST(matching_engine, pstree_supports_remove_returns_true) {
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, trade_attributes());
+    EXPECT_TRUE(engine->supports_remove());
+}
+
+TEST(matching_engine, pstree_remove_single_clause_subscription_stops_matching) {
+    // Deliberately NOT trade_attributes() (has a "tags" string_list attribute) - pstree rejects
+    // list-valued attributes outright, same reason the existing OR/concurrent pstree tests below
+    // already use their own narrower schema instead.
+    std::vector<sidecar::attribute_def> attrs = {
+        {"trade_price",  sidecar::attribute_type::float_val},
+        {"trade_volume", sidecar::attribute_type::integer},
+    };
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    engine->insert(1, "trade_price > 100.0");
+    engine->insert(2, "trade_volume > 1000");
+
+    auto search_one = [&engine](double price, int64_t volume) {
+        auto sink = engine->make_event();
+        sink->with_float("trade_price", price);
+        sink->with_integer("trade_volume", volume);
+        return engine->search(*sink);
+    };
+
+    EXPECT_TRUE(contains(search_one(150.0, 500), 1));
+    engine->remove(1);
+    EXPECT_FALSE(contains(search_one(150.0, 500), 1))
+        << "removed subscription must never match again";
+    EXPECT_TRUE(contains(search_one(150.0, 2000), 2))
+        << "an unrelated subscription must be entirely unaffected by another one's removal";
+}
+
+// The m_sub_to_clauses path - an OR'd subscription expands into multiple underlying PSTDynamic
+// clause ids at insert() time; remove() must delete ALL of them, not just one, so the
+// subscription stops matching on EVERY one of its own original OR branches, not just some.
+TEST(matching_engine, pstree_remove_or_subscription_stops_matching_on_all_clauses) {
+    std::vector<sidecar::attribute_def> attrs = {
+        {"trade_price",  sidecar::attribute_type::float_val},
+        {"trade_volume", sidecar::attribute_type::integer},
+        {"symbol",       sidecar::attribute_type::string},
+    };
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    engine->insert(1, "trade_price > 500.0 or symbol = \"ZZZZ\"");
+
+    auto search_one = [&engine](double price, std::string_view symbol) {
+        auto sink = engine->make_event();
+        sink->with_float("trade_price", price);
+        sink->with_integer("trade_volume", 0);
+        sink->with_string("symbol", symbol);
+        return engine->search(*sink);
+    };
+
+    // Confirm both OR branches genuinely match before removal.
+    EXPECT_TRUE(contains(search_one(600.0, "AAPL"), 1)) << "first OR branch (price) should match";
+    EXPECT_TRUE(contains(search_one(1.0, "ZZZZ"), 1)) << "second OR branch (symbol) should match";
+
+    engine->remove(1);
+
+    EXPECT_FALSE(contains(search_one(600.0, "AAPL"), 1))
+        << "first OR branch must no longer match after remove()";
+    EXPECT_FALSE(contains(search_one(1.0, "ZZZZ"), 1))
+        << "second OR branch must no longer match after remove() either - not just one of the two "
+           "underlying clause ids";
+}
+
+TEST(matching_engine, pstree_remove_unknown_id_throws_matching_engine_error) {
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, trade_attributes());
+    engine->insert(1, "trade_price > 100.0");
+    EXPECT_THROW(engine->remove(999), sidecar::matching_engine_error);
+}
+
+// NOTE: no "remove() concurrent with search()" test at THIS layer, deliberately. An earlier
+// version of this test called both directly on a raw matching_engine with no external
+// synchronization at all, and immediately crashed (std::bad_alloc from PSTDynamic's own internal
+// state, corrupted by the unsynchronized concurrent mutation) - a real finding, but about the
+// test's own premise, not a production bug: matching_engine was never designed to be safely
+// mutated and read concurrently on its own. subscription_manager::m_mutex is what actually
+// serializes remove() (exclusive lock) against search() (shared lock) in production - see that
+// class's own "Deliberately NOT lock-free for readers" doc comment - and every existing
+// concurrent test AT THIS layer (pstree_concurrent_search_with_or_subscriptions_does_not_race,
+// pstree_search_count_concurrent_with_or_subscriptions_does_not_race) only exercises concurrent
+// READS for exactly this reason. The real concurrency test for remove() belongs one layer up,
+// where the actual locking lives - see test_subscription_manager.cpp's own
+// pstree_remove_lease_concurrent_with_search_does_not_race.

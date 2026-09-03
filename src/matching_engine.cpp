@@ -699,6 +699,13 @@ public:
             }
             throw matching_engine_error(e.what());
         }
+
+        // Only the multi-clause (OR'd) case needs this: the common direct-id case's one clause id
+        // already IS `id` itself, so remove() can find it with no lookup at all. Recorded only
+        // once the loop above has FULLY succeeded (never for a rolled-back insert, which already
+        // cleaned up via the catch blocks above and never reaches here) - see remove()'s own
+        // comment for how this gets consumed.
+        if (!useDirectId) m_sub_to_clauses[id] = std::move(insertedClauseIds);
     }
 
     std::unique_ptr<event_sink> make_event() const override {
@@ -831,6 +838,38 @@ public:
         }
     }
 
+    bool supports_remove() const override { return true; }
+
+    // Genuinely incremental delete, backed directly by PSTDynamic::deleteSubscription()
+    // (Algorithm 6) - already proven safe by this class's own insert() rollback path (see its own
+    // comment: an insert that fails partway through already calls deleteSubscription() on
+    // whatever succeeded before the failure), just never wired up before for the general "remove
+    // a live subscription" case subscription_manager actually needs on every real unsubscribe -
+    // that path used to fall back to discarding and rebuilding the entire tree, since "no engine
+    // exposes a delete primitive" was true for a-tree/be-tree but not, in fact, for pstree.
+    void remove(uint64_t id) override {
+        try {
+            auto it = m_sub_to_clauses.find(id);
+            if (it != m_sub_to_clauses.end()) {
+                // Multi-clause (OR'd) subscription - every one of its synthetic clause ids needs
+                // its own deleteSubscription() call, and its own m_clause_to_sub entry erased
+                // (clause ids are never reused, so a stale entry could never cause a WRONG match,
+                // but it would sit there unreclaimed forever otherwise).
+                for (uint64_t clauseId : it->second) {
+                    m_pstd.deleteSubscription(clauseId);
+                    m_clause_to_sub.erase(clauseId);
+                }
+                m_sub_to_clauses.erase(it);
+            } else {
+                // Common case: `id` itself is the one and only clause id (see insert()'s own
+                // comment for when this path is taken) - no lookup needed at all.
+                m_pstd.deleteSubscription(id);
+            }
+        } catch (const std::exception& e) {
+            throw matching_engine_error(e.what());
+        }
+    }
+
 private:
     // Declaration order matters here: members initialize in this order, and m_parsing_tree's
     // own initializer (below) passes m_unused_indices by reference into build_betree() - it
@@ -852,6 +891,12 @@ private:
     decimal_scale_map m_decimalScales;
     std::unordered_map<uint64_t, uint64_t> m_clause_to_sub;
     uint64_t m_next_clause_id = 1;
+    // Forward mapping insert() didn't previously need to persist (its own local
+    // insertedClauseIds was only ever used for rollback-on-failure) - populated only for the
+    // multi-clause (OR'd) case, consulted by remove() to find every underlying PSTDynamic
+    // subscription a single caller-facing `id` actually expanded into. Absent entry means the
+    // common direct-id case: `id` itself is the one and only clause id, no lookup needed.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> m_sub_to_clauses;
     // The dedup scratch set used to live here as a `mutable` member - moved to a function-local
     // `static thread_local` inside search() itself, see that function's own comment for why
     // (a real, confirmed data race under concurrent worker threads).
