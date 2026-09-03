@@ -2787,6 +2787,43 @@ bigger fraction of a smaller per-row total as matching work shrinks). Committed
 that only declare the attributes actually used in expressions, rather than mirroring an entire
 upstream table, have a real, measurable throughput reason to do so, not just a tidiness one.
 
+## "Push-style" matching: an isolated microbenchmark validated it, the real fusion opportunity didn't
+
+Prompted by asking whether `matching_engine::search()` could return individual matched ids as
+found (a SAX-style streaming callback) instead of collecting a complete `std::vector<uint64_t>`
+first. The real change - touching the shared interface across all three engines, including
+a-tree's Rust FFI boundary - was too large to attempt speculatively, so the underlying mechanism
+was validated in isolation first: a throwaway microbenchmark compared "collect N ids into a
+`reserve()`'d vector, then iterate once to do real per-id work" against "invoke an inlinable
+template callback per id, doing the same work directly, no intermediate vector at all" (same
+64MB-distractor cache-eviction methodology as the earlier `uint32_t` test). Checksums matched
+(correctness), and the fused version won cleanly: **6/6** pairs at N=986 (mean **-8.16%**), **5/6**
+at N=400 (mean **-9.17%**) - the first idea in this whole hot-path investigation to pass this cheap
+validation stage, unlike the four before it.
+
+That result was real, but specific to what it actually tested: eliminating an *expensive*
+intermediate vector (standing in for `matchEvent`'s own `matchingSubs`, independently confirmed at
+~82.8% of that function's self-time). The engine interface itself couldn't be touched without a
+much larger redesign, so the real attempt scoped down to what `worker_pool.cpp` *could* safely
+fuse on its own: the two-pass shape where `output_subjects` (a `sub_id -> subject string` dedup
+map) is built on the worker thread, then the async publish coroutine separately re-`find()`s into
+that same map once per match. Restructured so the worker-thread pass also records a resolved
+`const std::string*` per (row, matched_id) - eliminating the coroutine's redundant lookup - full
+`sidecar_test` suite green under all three configs (this touches cross-thread pointer lifetime, so
+ThreadSanitizer mattered here specifically), byte-identical wire output.
+
+Measured as a clear regression, growing worse at lower selectivity: **7/8** pairs unfavorable at
+`s`=1/K=8000 (mean **+4.7%** more cycles), **4/4** at `s`=20 (mean **+13.2%**). Root cause,
+understood after the fact: `output_subjects.find()`'s own cost had already shown as negligible
+(under 0.3%) in every profile taken this session - it was never the expensive thing the
+microbenchmark's "N" represented. The real change didn't eliminate `matchEvent`'s own vector (still
+can't, without the engine-interface redesign) - it added a *new* one (the resolved-pointer list)
+to save a lookup that was already cheap, and that new vector pays the same cache-cold-allocation
+tax the whole hot-path investigation keeps running into. Reverted. The isolated test's positive
+result stands as real and correctly diagnosed the general principle; it just wasn't reachable
+without the bigger interface change this attempt deliberately avoided - a useful, concrete data
+point for whether that larger redesign would be worth attempting for real.
+
 ## License
 
 See LICENSE file.
