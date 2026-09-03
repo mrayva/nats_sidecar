@@ -2824,6 +2824,63 @@ result stands as real and correctly diagnosed the general principle; it just was
 without the bigger interface change this attempt deliberately avoided - a useful, concrete data
 point for whether that larger redesign would be worth attempting for real.
 
+## `subscription_manager`'s hash-map storage replaced with array-indexed storage - a real win, this time
+
+A different lever on the same `output_subject()`/dedup hot path: `perf annotate`'s source-line
+view of that region attributed the overwhelming majority of its cost to inlined libstdc++
+hashtable machinery (`_M_key_equals`, bucket-chain walking, hashing) - the same class of cost as
+every prior attempt here, but this time targeting the *lookup mechanism itself* rather than what
+gets cached. `subscription_registry::resolve_id()` (`src/subscription_registry.cpp:147-165`)
+confirmed subscription ids are dense, monotonic, permanent integers in real use (NATS JetStream KV
+bucket revision numbers - entries are never rewritten), so a hash map isn't actually required for
+`subscription_manager`'s own `m_subscriptions` storage - direct array indexing is available.
+
+Validated in isolation first (same methodology as every other idea here): a microbenchmark
+comparing a K=8000-entry `std::unordered_map` (persistent record store + a fresh per-batch dedup
+map, matching the real two-lookup shape) against array indexing (a dense `std::vector` + a reused,
+generation-counter-based per-batch array, avoiding both the hashing *and* the per-batch
+reallocation) - **6/6 pairs favorable at both a `s`=1-like and `s`=20-like fan-out, mean -51.2%
+and -54.3%** respectively. The strongest, cleanest isolated result of this whole investigation.
+
+**Real implementation, scoped to `subscription_manager` only this round** (the per-batch
+`output_subjects` map in `worker_pool.cpp` is a separate follow-up, see below): replaced the
+single `std::unordered_map<uint64_t, subscription_info> m_subscriptions` with a hybrid design -
+`m_subscriptions_by_id` (a `std::vector<std::optional<subscription_info>>`, indexed directly by
+id) for ids below a 1-million cap, falling back to `m_subscriptions_overflow` (the original
+`unordered_map`, functionally unchanged) above it. The cap exists because `restore()` is a public
+API that must stay correct for an arbitrary caller-supplied `uint64_t`, not just the registry's own
+dense sequence - confirmed by an existing test (`independent_instances_restoring_same_id_agree_on_output_topic`)
+that deliberately restores a `~0x9F3A7B2...`-shaped id; a pure flat vector would have tried to
+allocate ~1.4 exabytes for that one test and correctly threw instead. One important correctness
+point worth stating explicitly: **ids are never reused for a different expression** even after a
+subscription's slot is cleared - `subscription_registry`'s own permanence guarantee already commits
+to "the same expression always resolves to the same id, forever," so recycling a dead slot's id
+for something else would break that. A dead slot's *contents* (expression string, lease-holder set)
+do get reclaimed via `.reset()`, exactly like `unordered_map::erase()` already did - `restore()`
+repopulates a revived id from the caller's own persisted data, never from anything remembered
+locally. Six call sites (`subscribe`/`restore`/`remove_lease`/`remove_subscription`/
+`get_subscription`/`output_subject`, plus `rebuild_tree_locked`'s iteration) now share this split
+via `find_locked()`/`insert_locked()`/`erase_locked()`/`for_each_locked()` instead of repeating the
+array-vs-overflow branch six times over. Verified: full `sidecar_test` suite green under all three
+configs (ThreadSanitizer specifically relevant here - concurrent readers/writers over the same
+storage), byte-identical behavior including the huge-id edge case.
+
+Measured on the real pipeline via `sidecar_pipeline_bench` + interleaved `perf stat -e cycles:u`:
+**4/4 pairs favorable at `s`=20 (mean -18.6%)** - a real, clean win - but only **5/8 at `s`=1 (mean
+-0.93%)**, mostly noise. Understood, not just observed: this implementation only replaced *one* of
+the two hash-map lookups the isolated microbenchmark's win came from - `worker_pool.cpp`'s own
+per-batch `output_subjects` dedup map (checked on *every* `(row, id)` pair, not just each id's
+first occurrence within a batch) is still the original, untouched hash map, and at `s`=1's dense
+repeat rate that's the far more frequently-hit half. `s`=1 is also the selectivity where this
+document's own earlier finding - ~94% of matched rows get dropped by backpressure before ever
+reaching the dedup loop at all - means dedup was already a small share of `s`=1's total cost
+regardless of how much this change improved it. `s`=20 loses less to that and has a lower average
+fan-out, so the array win shows through cleanly. Committed
+(`src/subscription_manager.hpp`/`.cpp`) on the strength of the real `s`=20 result and full
+correctness verification; the natural next step - applying the same array/generation-counter
+technique to `worker_pool.cpp`'s own per-batch map - is a follow-up, not yet done as of this
+commit.
+
 ## License
 
 See LICENSE file.
