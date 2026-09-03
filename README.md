@@ -2743,6 +2743,50 @@ point). Filed alongside the two `to_string` reverts as the same lesson again: a 
 percentage in a sampling profile - even from `perf annotate`'s source-line view, not just flat
 `perf report` - is a lead to verify, not a size estimate of the fix's payoff.
 
+## Record width: does trimming non-predicate fields actually help? Yes, strongly - at most selectivities
+
+A different theory from the ones above: instead of chasing a specific hot line, test whether the
+*shape of the input record itself* matters - does publishing only the fields any subscription
+could reference (`price`, `exchange`, `symbol`, `trade_volume`) outperform publishing a
+realistically wide record that also carries fields no subscription ever touches?
+
+`sidecar_pipeline_bench` gained a `record_shape` argument (`narrow` default, `wide`) and two new
+always-present predicate fields (`symbol`, `trade_volume`, alongside the existing `price`/
+`exchange`) to make this testable. `record_shape=wide` adds the same 11 non-predicate columns the
+real NYSE trade fixture table has beyond those 4 (see `pgnats/scripts/nyse_trade_short_cols_view.sql`'s
+own column list: `time`, `sale_condition`, `trade_stop_indicator`, `trade_correction_indicator`,
+`sequence_number`, `trade_id`, `source_of_trade`, `trade_reporting_facility`,
+`participant_timestamp`, `trf_timestamp`, `trade_through_exempt_indicator` - realistically-shaped
+synthetic values, short codes for the indicator/id columns matching the real table's own 1-4
+character values). Both msgpack and Arrow input paths support it. The mechanism this isolates:
+`populate_event()`'s per-row key walk (`event_bridge.hpp`) has to parse/skip every column present
+in the payload via `mapKeys()`'s `mp_skip`-driven iteration (`msgpack.hpp`) even for columns the
+schema doesn't recognize (`schema.lookup()` returns nullopt, so it's a wasted walk, not a wasted
+match) - confirmed directly by reading that code before running anything, not assumed. The payload
+is also bigger, meaning more bytes `memmove`'d per matched subscription during fan-out
+(`append_pub_frame`).
+
+Verified via the same interleaved `perf stat -e cycles:u` methodology as every other finding in
+this section, at K=8000 across three selectivities:
+
+| `s` | pairs favoring narrow | mean effect |
+|---|---|---|
+| 1 | 8/8 | **+13.76%** more cycles for `wide` |
+| 20 | 4/4 | **+22.79%** more cycles for `wide` |
+| 100 | 2/8 | -1.55% (noise - no real effect either way) |
+
+A real, strong, one-sided effect at `s`=1 and `s`=20 - the theory holds. `s`=100's near-zero,
+mixed-direction result is reported honestly rather than smoothed over: `s`=100 sits inside the
+already-documented, still-unexplained `s`≈16-128 throughput "valley" from earlier in this
+investigation (see the selectivity-sweep section above) - plausible that whatever drives that
+valley interacts with this effect in a way not chased down here, not evidence the theory is wrong
+at low fan-out generally (`s`=20, arguably more representative of "low fan-out" than `s`=100 is,
+shows the *largest* effect of the three points tested, consistent with per-row decode cost being a
+bigger fraction of a smaller per-row total as matching work shrinks). Committed
+(`benchmarks/sidecar_pipeline_bench.cpp`) - a genuinely actionable finding: production schemas
+that only declare the attributes actually used in expressions, rather than mirroring an entire
+upstream table, have a real, measurable throughput reason to do so, not just a tidiness one.
+
 ## License
 
 See LICENSE file.
