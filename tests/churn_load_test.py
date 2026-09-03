@@ -87,41 +87,78 @@ class Percentiles:
 
     def report(self) -> dict[str, dict[str, float]]:
         with self._lock:
-            out = {}
-            for op, samples in self._samples.items():
-                if not samples:
-                    continue
-                s = sorted(samples)
-                out[op] = {
-                    "count": len(s),
-                    "mean_ms": statistics.mean(s) * 1000,
-                    "p50_ms": s[len(s) // 2] * 1000,
-                    "p99_ms": s[min(len(s) - 1, int(len(s) * 0.99))] * 1000,
-                    "p999_ms": s[min(len(s) - 1, int(len(s) * 0.999))] * 1000,
-                    "max_ms": s[-1] * 1000,
-                }
-            return out
+            # percentiles_of() is defined later in this file (module-level function-call
+            # resolution happens at call time, not definition time - fine regardless of source
+            # order) - shared with analyze_data_plane_latency() so there's exactly one percentile
+            # computation in this tool, not two copies that could quietly drift apart.
+            return {op: percentiles_of(samples) for op, samples in self._samples.items() if samples}
 
 
 def data_plane_worker(
-    nats_host: str, nats_port: int, subject: str, rate: float, stop_event: threading.Event
+    nats_host: str, nats_port: int, subject: str, rate: float, stop_event: threading.Event,
+    sent_seqs: set,
 ) -> None:
-    """Publishes msgpack-encoded {"temperature": v} rows at (approximately - see the module's own
-    docstring: no claim of precise real-time scheduling here, this is a load generator, not a
-    timing benchmark) `rate` messages/sec until stop_event is set. Its own dedicated NatsClient/
-    TCP connection - never shared with the churn thread's."""
+    """Publishes msgpack-encoded {"temperature": v, "seq": n, "send_ts": t} rows at
+    (approximately - see the module's own docstring: no claim of precise real-time scheduling
+    here, this is a load generator, not a timing benchmark) `rate` messages/sec until stop_event
+    is set. Its own dedicated NatsClient/TCP connection - never shared with the churn thread's.
+
+    `seq`/`send_ts` ride along verbatim in the republished output for any row-mode message that
+    matches (worker_pool.cpp forwards qm.payload - the client's own original raw bytes - not a
+    re-serialized copy, confirmed by reading worker_loop() directly), and populate_event() silently
+    skips any key outside the configured schema (event_bridge.hpp: `if (!type_opt) continue;`) -
+    so these two extra fields never affect matching, but do let output_listener_worker() correlate
+    a received message back to when it was actually sent, using this SAME process's own
+    time.monotonic() clock (both threads live in this one Python process - no cross-machine clock
+    sync concern). `send_ts` is what the latency measurement is built on; `seq` is only used for
+    an approximate drop-count sanity check (`sent_seqs` collects every seq actually sent)."""
     client = NatsClient(nats_host, nats_port)
     rng = random.Random()
     interval = 1.0 / rate if rate > 0 else 0
+    seq = 0
     try:
         while not stop_event.is_set():
             t0 = time.monotonic()
-            payload = msgpack.packb({"temperature": rng.uniform(0, TEMP_MAX)}, use_bin_type=True)
+            row = {"temperature": rng.uniform(0, TEMP_MAX), "seq": seq, "send_ts": t0}
+            payload = msgpack.packb(row, use_bin_type=True)
             client.publish(subject, payload)
+            sent_seqs.add(seq)
+            seq += 1
             if interval > 0:
                 remaining = interval - (time.monotonic() - t0)
                 if remaining > 0:
                     time.sleep(remaining)
+    finally:
+        client.close()
+
+
+def output_listener_worker(
+    nats_host: str, nats_port: int, topic: str, stop_event: threading.Event, samples: list,
+) -> None:
+    """Subscribes directly to the matched-output topic (via subscribe_raw()/read_message() - a
+    standing subscription, not request()'s one-shot reply pattern) and records
+    (send_ts, recv_ts, latency_seconds) for every delivered message - the actual end-to-end
+    publish -> filtered-output latency this tool exists to measure, not a proxy for it. Its own
+    dedicated NatsClient with a short socket_timeout (0.5s, vs. the other connections' default 5s)
+    so its read loop can check stop_event responsively instead of blocking for seconds at
+    shutdown."""
+    client = NatsClient(nats_host, nats_port, socket_timeout=0.5)
+    client.subscribe_raw(topic)
+    try:
+        while not stop_event.is_set():
+            event = client.read_message()
+            if event is None:
+                continue
+            _subject, payload = event
+            recv_ts = time.monotonic()
+            try:
+                row = msgpack.unpackb(payload, raw=False)
+            except Exception:
+                continue  # not one of ours, or truncated - skip rather than crash the listener
+            send_ts = row.get("send_ts")
+            if send_ts is None:
+                continue
+            samples.append((send_ts, recv_ts, recv_ts - send_ts, row.get("seq")))
     finally:
         client.close()
 
@@ -137,6 +174,7 @@ def churn_worker(
     stop_event: threading.Event,
     percentiles: Percentiles,
     live_out: list,
+    rebuild_windows: list,
 ) -> None:
     """Subscribe/unsubscribe cycle loop holding a steady-state K (DISTINCT active subscription
     count - what subscription_manager::active_count()/list_subscriptions actually count, not
@@ -211,11 +249,22 @@ def churn_worker(
                 sub_id, client_id, expr = live.pop(idx)
                 t_op = time.monotonic()
                 reply = client.request("sidecar.unsubscribe", {"id": sub_id, "client_id": client_id})
-                latency = time.monotonic() - t_op
+                t_op_end = time.monotonic()
+                latency = t_op_end - t_op
                 if "error" in reply:
                     raise RuntimeError(f"unsubscribe failed mid-churn: {reply}")
+                # Only a FULLY removed subscription (no lease holders left) triggers
+                # subscription_manager::rebuild_tree_locked() - a partial removal (other clients
+                # still hold it) is cheap and never touches the tree at all. Bucketing these
+                # separately (instead of one blended "unsubscribe" percentile, an earlier version
+                # of this function's own mistake) is what makes the rebuild cost itself directly
+                # visible, not diluted by however many cheap partial removals happen alongside it.
                 if not in_ramp:
-                    percentiles.record("unsubscribe", latency)
+                    if reply.get("removed"):
+                        percentiles.record("unsubscribe_full_removal", latency)
+                        rebuild_windows.append((t_op, t_op_end))
+                    else:
+                        percentiles.record("unsubscribe_partial", latency)
 
             if interval > 0:
                 remaining = interval - (time.monotonic() - t0)
@@ -238,6 +287,45 @@ def fetch_all_subscriptions(client: NatsClient) -> list:
         if reply["returned"] == 0 or offset >= reply["total_matching"]:
             break
     return all_subs
+
+
+def percentiles_of(values: list) -> dict:
+    if not values:
+        return {}
+    s = sorted(values)
+    return {
+        "count": len(s),
+        "mean_ms": statistics.mean(s) * 1000,
+        "p50_ms": s[len(s) // 2] * 1000,
+        "p99_ms": s[min(len(s) - 1, int(len(s) * 0.99))] * 1000,
+        "p999_ms": s[min(len(s) - 1, int(len(s) * 0.999))] * 1000,
+        "max_ms": s[-1] * 1000,
+    }
+
+
+def analyze_data_plane_latency(
+    latency_samples: list, rebuild_windows: list, run_start: float, ramp_seconds: float
+) -> dict:
+    """Splits data-plane (send_ts, recv_ts, latency, seq) samples into two groups: a message's
+    own processing interval [send_ts, recv_ts] overlaps at least one recorded full-removal
+    rebuild_tree_locked() window, or it doesn't - then reports percentiles for BOTH groups
+    separately. This is the actual causal test for whether the rebuild's exclusive-lock hold
+    stalls worker-thread matching: if it does, "during rebuild" latency should be measurably
+    worse than "isolated" latency, not just a slightly noisier version of the same distribution.
+    O(samples * rebuild_windows) overlap check - fine at this tool's scale (thousands of samples,
+    tens to low hundreds of rebuild windows)."""
+    steady_state = [s for s in latency_samples if s[0] >= run_start + ramp_seconds]
+
+    def overlaps_any_window(send_ts: float, recv_ts: float) -> bool:
+        return any(send_ts <= end and recv_ts >= start for start, end in rebuild_windows)
+
+    during = [s[2] for s in steady_state if overlaps_any_window(s[0], s[1])]
+    isolated = [s[2] for s in steady_state if not overlaps_any_window(s[0], s[1])]
+    return {
+        "overall": percentiles_of([s[2] for s in steady_state]),
+        "during_rebuild_window": percentiles_of(during),
+        "isolated": percentiles_of(isolated),
+    }
 
 
 def main() -> None:
@@ -292,23 +380,51 @@ def main() -> None:
             stop_event = threading.Event()
             percentiles = Percentiles()
             live_out: list = []
+            rebuild_windows: list = []
+            latency_samples: list = []
+            sent_seqs: set = set()
+
+            stats_client = NatsClient("127.0.0.1", port)
+
+            # Latency probe: one dedicated subscription matching every published row
+            # ("temperature >= 0.0" - values are uniform in [0, TEMP_MAX)), so every data-plane
+            # message gets republished to its own topic - that's what output_listener_worker()
+            # measures real end-to-end latency against. A real client_id of its own, entirely
+            # separate from the churn driver's own churn-N client ids, so this subscription is
+            # never touched by churn (it must survive the whole run to keep measuring).
+            probe_reply = stats_client.request(
+                "sidecar.subscribe", {"expression": "temperature >= 0.0", "client_id": "latency-probe"})
+            if "error" in probe_reply:
+                raise RuntimeError(f"failed to set up latency-probe subscription: {probe_reply}")
+            probe_topic = probe_reply["topic"]
 
             data_thread = threading.Thread(
                 target=data_plane_worker,
-                args=("127.0.0.1", port, args.input_subject, args.data_rate, stop_event),
+                args=("127.0.0.1", port, args.input_subject, args.data_rate, stop_event, sent_seqs),
                 daemon=True,
             )
             churn_thread = threading.Thread(
                 target=churn_worker,
                 args=("127.0.0.1", port, args.mode, args.target_k, args.churn_rate,
-                      args.selectivity, args.ramp_seconds, stop_event, percentiles, live_out),
+                      args.selectivity, args.ramp_seconds, stop_event, percentiles, live_out,
+                      rebuild_windows),
+                daemon=True,
+            )
+            listener_thread = threading.Thread(
+                target=output_listener_worker,
+                args=("127.0.0.1", port, probe_topic, stop_event, latency_samples),
                 daemon=True,
             )
 
             print(f"Starting: mode={args.mode} target_k={args.target_k} churn_rate={args.churn_rate}/s "
                   f"data_rate={args.data_rate}/s selectivity=1/{args.selectivity} duration={args.duration}s")
 
-            stats_client = NatsClient("127.0.0.1", port)
+            # Listener first, so it's already receiving before any data-plane traffic exists -
+            # otherwise the very first messages would be measured as "lost" rather than just
+            # "sent before we were listening".
+            listener_thread.start()
+            time.sleep(0.2)
+            run_start = time.monotonic()
             data_thread.start()
             churn_thread.start()
 
@@ -325,6 +441,7 @@ def main() -> None:
             stop_event.set()
             data_thread.join(timeout=10)
             churn_thread.join(timeout=10)
+            listener_thread.join(timeout=10)
 
             final_stats = stats_client.request("sidecar.stats", {})
             actual_subs = fetch_all_subscriptions(stats_client)
@@ -334,15 +451,34 @@ def main() -> None:
             # leases legitimately share the same sub_id (that's the whole point of the pool), so
             # the correctness check needs the number of DISTINCT subscription ids, not the number
             # of leases, to match what sidecar.list_subscriptions itself counts (one row per
-            # subscription, with its own lease_holder_count - not one row per lease).
+            # subscription, with its own lease_holder_count - not one row per lease). The
+            # latency-probe subscription itself is real, active, and correctly shows up in
+            # list_subscriptions too, but it's never part of the churn driver's own bookkeeping -
+            # exclude its id from both sides rather than let it look like an off-by-one leak.
             expected_k = len({sub_id for sub_id, _client_id, _expr in live_out})
-            actual_k = len(actual_subs)
+            actual_k = len([s for s in actual_subs if s["id"] != probe_reply["id"]])
             correctness_ok = expected_k == actual_k
 
             print("\n=== Churn latency (steady-state, ramp excluded) ===")
             for op, p in percentiles.report().items():
                 print(f"  {op}: n={p['count']} mean={p['mean_ms']:.2f}ms p50={p['p50_ms']:.2f}ms "
                       f"p99={p['p99_ms']:.2f}ms p999={p['p999_ms']:.2f}ms max={p['max_ms']:.2f}ms")
+
+            print("\n=== Data-plane latency (publish -> filtered-output delivery, steady-state) ===")
+            dp = analyze_data_plane_latency(latency_samples, rebuild_windows, run_start, args.ramp_seconds)
+            for group in ("overall", "isolated", "during_rebuild_window"):
+                p = dp[group]
+                if not p:
+                    print(f"  {group}: (no samples)")
+                    continue
+                print(f"  {group}: n={p['count']} mean={p['mean_ms']:.2f}ms p50={p['p50_ms']:.2f}ms "
+                      f"p99={p['p99_ms']:.2f}ms p999={p['p999_ms']:.2f}ms max={p['max_ms']:.2f}ms")
+            print(f"  {len(rebuild_windows)} full-removal rebuild window(s) recorded "
+                  f"(cumulative {sum(end - start for start, end in rebuild_windows) * 1000:.1f}ms "
+                  "of exclusive-lock hold time)")
+            approx_dropped = len(sent_seqs) - len({s[3] for s in latency_samples if s[3] is not None})
+            print(f"  approx. dropped (sent but never observed on output, incl. any still in "
+                  f"flight at shutdown): {approx_dropped} of {len(sent_seqs)} sent")
 
             print("\n=== Final data-plane stats ===")
             print(f"  {final_stats}")

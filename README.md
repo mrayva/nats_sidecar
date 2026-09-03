@@ -3109,12 +3109,14 @@ primitive) *while holding `m_mutex`'s exclusive lock* - the same lock every work
 
 **Tool**: `tests/churn_load_test.py`, built on `tests/integration_sidecar.py`'s own `NatsClient`/
 process-lifecycle machinery (a real `nats-server` + a real `nats_sidecar` binary, not a fake
-connection) rather than a from-scratch harness. Two concurrent load generators, each its own
-NATS connection/Python thread: a raw msgpack data-plane publisher, and a subscribe/unsubscribe
-churn driver holding a steady-state target K, in two modes - "warm" (a fixed pool of K
-expressions, reused across many client ids - no `subscription_registry` KV round trips once each
-pool entry is known) and "cold" (every cycle a brand-new expression - a real KV round trip every
-time). After each run, `sidecar.list_subscriptions` (this document's own "admin-facing
+connection) rather than a from-scratch harness. Three concurrent actors, each its own NATS
+connection/Python thread: a raw msgpack data-plane publisher; a subscribe/unsubscribe churn driver
+holding a steady-state target K, in two modes - "warm" (a fixed pool of K expressions, reused
+across many client ids - no `subscription_registry` KV round trips once each pool entry is known)
+and "cold" (every cycle a brand-new expression - a real KV round trip every time); and a listener
+subscribed directly to a dedicated probe subscription that matches every published row, measuring
+real end-to-end publish-to-delivery latency (see the follow-up below for why this third actor was
+added). After each run, `sidecar.list_subscriptions` (this document's own "admin-facing
 subscription listing" section) cross-checks the churn driver's own bookkeeping against the
 server's real state - a real, direct use of that endpoint's own stated purpose, and something with
 no verification path before it existed.
@@ -3130,7 +3132,10 @@ K than the run's own duration allowed, so warm mode could run for its entire dur
 bias, never reaching steady-state churn at all. Fixed by keying the balance decision on *distinct*
 id count consistently, and by round-robining through the warm pool on first coverage instead of
 sampling it randomly (plain random sampling is a coupon-collector process - covering all K pool
-entries at least once takes an *expected* K·ln(K) draws, ~6900 for K=1000, not K).
+entries at least once takes an *expected* K·ln(K) draws, ~6900 for K=1000, not K). (3), found while
+adding the latency probe: `"temperature >= 0"` was rejected outright (`matching_engine_error`,
+mismatched types) - `temperature` is a `float` attribute and the bare integer literal `0` isn't
+auto-promoted the way it is at some other call sites; needed `"temperature >= 0.0"`.
 
 **Findings** (K=100 vs. K=1000, `cold` mode, `--churn-rate 50 --data-rate 2000 --selectivity 10`,
 60s runs with the first 25s excluded from percentiles as ramp-up):
@@ -3153,15 +3158,41 @@ entries at least once takes an *expected* K·ln(K) draws, ~6900 for K=1000, not 
   being entirely registry-independent, exactly as the architecture would predict (the registry is
   only ever consulted on the *insert* side).
 
-**Not yet confirmed - a real, honest limitation of this first pass, not a negative result**: this
-tool measures the churn *request's own* round-trip latency, which necessarily includes the
-synchronous rebuild cost by construction (the reply isn't sent until `remove_lease()` -
-`rebuild_tree_locked()` included - returns). It does **not** yet directly show whether *worker-thread
-matching* latency also stalls during that same window (the original concern: `m_mutex`'s exclusive
-lock blocking every worker's `acquire_tree()` for the ~13ms a K=1000 rebuild takes) - that would need
-either sub-100ms-granularity sampling of `processed`/`matched` looking for stalls, or direct
-instrumentation around `acquire_tree()` itself. Left as a clearly scoped follow-up, not conflated
-with what's actually been confirmed above.
+**Follow-up: does this actually stall worker-thread matching, not just the churn request itself?**
+The findings above measure the churn *request's own* round-trip latency, which necessarily
+includes the synchronous rebuild cost by construction - they don't, on their own, show whether
+*worker-thread matching* latency also stalls during that same window (the original concern:
+`m_mutex`'s exclusive lock blocking every worker's `acquire_tree()` while a rebuild runs). Extended
+the tool to answer this directly rather than by proxy: the data-plane publisher now embeds a
+`seq`/`send_ts` in every row (silently ignored for matching - `populate_event()` already skips any
+key outside the configured schema - but preserved verbatim in the republished output, since
+row-mode forwards the client's own original raw bytes, not a re-serialized copy), and a dedicated
+listener subscribes directly to a probe subscription matching every row, recording real end-to-end
+publish-to-delivery latency. Cross-referencing each sample's own `[send_ts, recv_ts]` interval
+against the churn thread's recorded full-removal rebuild windows splits every message into
+"isolated" or "overlapped a rebuild" - the actual causal test, not an inference from aggregate
+averages.
+
+**Confirmed, cleanly, at K=1000** (same run shape as above; `unsubscribe_full_removal` is 871
+samples, `subscribe` 870): **median data-plane latency shifts from 0.48ms (isolated, n=37,699) to
+9.37ms (overlapped a rebuild, n=22,815)** - not a tail effect, the *typical* experience for a
+message whose processing window overlapped one. Full picture: isolated mean=1.00ms/p99=5.31ms/
+max=12.72ms vs. overlapped mean=9.28ms/p99=21.43ms/max=45.71ms. Across this one 60s run, 871
+full-removal rebuilds accumulated **12.2 seconds of cumulative exclusive-lock hold time - roughly
+35% of the run's own steady-state wall-clock window** - at a churn rate (50 cycles/sec, ~25
+removes/sec) and K (1000) that aren't exotic for a real fleet. Hypothesis #1 is confirmed, not just
+plausible: `rebuild_tree_locked()`'s exclusive lock is a real, measurable, and substantial tax on
+data-plane matching latency under concurrent churn, at a scale this project's own benchmarks
+already treat as ordinary.
+
+(One correction to the earlier findings above, made while building this extension: the original
+`unsubscribe` percentile bucket blended full removals - the only kind that actually calls
+`rebuild_tree_locked()` - with partial removals - a lease dropped but others remain, which never
+touch the tree at all. Warm mode's own earlier-reported "mean=4.29ms, max=13.77ms, n=11" was this
+blend; splitting into `unsubscribe_full_removal`/`unsubscribe_partial` makes the two costs directly
+visible instead of diluting one into the other. This doesn't change the cold-mode K=100-vs-K=1000
+comparison above - cold mode's expressions are never reused, so every one of its removals was
+already a full removal by construction.)
 
 ## License
 

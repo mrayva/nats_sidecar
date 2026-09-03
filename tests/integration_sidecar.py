@@ -11,9 +11,9 @@ from pathlib import Path
 
 
 class NatsClient:
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, socket_timeout: float = 5) -> None:
         self._socket = socket.create_connection((host, port), timeout=5)
-        self._socket.settimeout(5)
+        self._socket.settimeout(socket_timeout)
         self._stream = self._socket.makefile("rb")
         self._next_sid = 1
         self._next_inbox = 1
@@ -27,6 +27,27 @@ class NatsClient:
     def close(self) -> None:
         self._stream.close()
         self._socket.close()
+
+    def subscribe_raw(self, subject: str) -> int:
+        """Plain, standing SUB (no auto-UNSUB) - used by churn_load_test.py's output listener to
+        keep receiving many messages on a matched output topic, unlike request()'s own one-shot
+        reply subscription. Caller drains it with read_message() in a loop."""
+        sid = self._next_sid
+        self._next_sid += 1
+        self._send(f"SUB {subject} {sid}\r\nPING\r\n".encode())
+        self._wait_for_pong()
+        return sid
+
+    def read_message(self):
+        """Public, non-raising wrapper around _read_event() for a standing subscribe_raw()
+        subscription - returns (subject, payload_bytes) for a real message, or None on a
+        protocol no-op (PING/PONG/etc., already handled inside _read_event()) OR a read timeout
+        (this NatsClient's own socket_timeout - the caller's loop is expected to check its own
+        stop condition and call again, not treat a timeout as an error)."""
+        try:
+            return self._read_event()
+        except (socket.timeout, TimeoutError):
+            return None
 
     def publish(self, subject: str, payload: bytes) -> None:
         """Fire-and-forget publish - no SUB/UNSUB, no reply wait. Used by
@@ -104,7 +125,12 @@ class NatsClient:
         payload = self._stream.read(size)
         if len(payload) != size or self._stream.read(2) != b"\r\n":
             raise RuntimeError("truncated NATS message")
-        return fields[1].decode(), payload.decode()
+        # Raw bytes, not decode()'d here - request()'s own JSON control-plane replies are always
+        # UTF-8 text, but subscribe_raw()/read_message() (churn_load_test.py's output listener)
+        # need this for binary msgpack data-plane payloads too. json.loads() already accepts
+        # bytes/bytearray directly (auto-detects encoding), so this is a safe, non-breaking
+        # widening for request()'s own existing call site, not just an addition for the new one.
+        return fields[1].decode(), payload
 
 
 def free_port() -> int:
