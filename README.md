@@ -572,6 +572,39 @@ Response:
 
 `removed` is `true` if the subscription was fully removed (no remaining lease holders), `false` if other clients still hold leases. Like subscribe, this is safe to repeat/retry: unsubscribing a lease that's already gone (a double-unsubscribe, a retried request after a network hiccup, or one that already expired naturally via TTL) still replies `{"removed": true}` rather than an error - the caller's actual intent is already satisfied either way.
 
+### Grace period / dead-client cleanup
+
+There's no explicit "client disconnected" signal in this design - a client's only renewal action is
+calling `subscribe` again for the same expression/`client_id` (cheap: `subscription_manager::
+subscribe()`'s "reused expression" branch is just a lease-holder-set insert, no tree mutation). A
+client that stops renewing - crashes, forgets to unsubscribe, network partition - has its
+subscription torn down somewhere between `lease_ttl_seconds` (time since its last renewal) and
+`lease_ttl_seconds + lease_check_interval_seconds` later (worst case, if it just missed a sweep of
+`lease_manager`'s own `cleanup_loop()`/`reconcile_once()`). That window is this sidecar's grace
+period for a gone client, and it's a pure config tradeoff via `config/example.yaml`'s
+`lease_ttl_seconds`/`lease_check_interval_seconds` (defaults 3600s/60s - see that file's own comment
+for a "responsive" example profile, ~15-20s worst-case, trading off against needing clients to
+re-subscribe roughly that often to stay alive).
+
+A transport-level alternative - reacting directly to the client's NATS connection dropping instead
+of an absent renewal - was investigated and deliberately not pursued: `nats_asio` doesn't expose a
+connection's identity to application code at all (no CID, no settable client-name field), and this
+sidecar's `client_id` is a pure application-level string with no relationship to any actual NATS
+connection today. Making that work would mean building a new client-side convention (a client's
+NATS connection name equal to its `client_id`), extending `nats_asio` to support it, standing up a
+second, `$SYS`-account-scoped sidecar connection with elevated credentials to receive
+`$SYS.ACCOUNT.<acct>.DISCONNECT` events, and accepting a documented NATS clustering caveat
+(nats-server#3177) where those events don't reliably reach every fleet node - real cross-repo work
+for a signal that's still only as trustworthy as client cooperation. The existing TTL/reconcile
+mechanism achieves the same practical goal (bounded, tunable dead-client cleanup) with zero new
+code, so that's what this project uses.
+
+One thing that makes a short `lease_check_interval_seconds` cheap even under real subscription
+churn: every lease `reconcile_once()` finds expired now goes through the same incremental
+`matching_engine::remove()` path (pstree) the "High-churn-under-load" section above measures - a
+tight sweep interval no longer means paying an O(K) tree rebuild per expiry the way it would have
+before that fix.
+
 ### List subscriptions
 
 The only other control-plane gap `stats_request_subject` doesn't cover: `active_count()` is a

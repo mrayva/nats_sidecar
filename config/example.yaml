@@ -29,10 +29,32 @@ output_prefix: "sensor.filtered"
 subscribe_subject: "sidecar.subscribe"
 unsubscribe_subject: "sidecar.unsubscribe"
 
-# Soft-state lease settings (NATS KV)
+# Soft-state lease settings (NATS KV). A client's only renewal signal is
+# calling sidecar.subscribe again for the same expression/client_id (cheap -
+# just a lease-holder-set insert, no tree mutation - see subscription_manager
+# ::subscribe()'s "reused expression" branch); there is no separate heartbeat
+# endpoint. If a client stops renewing (crash, forgot to unsubscribe, etc.),
+# its subscription is torn down somewhere between lease_ttl_seconds and
+# lease_ttl_seconds + lease_check_interval_seconds later - that window is
+# this sidecar's "grace period" for a gone client. The two knobs trade off
+# directly: shorter values mean faster cleanup of dead clients but require
+# clients to re-subscribe that often just to stay alive; the defaults below
+# favor rarely-needed renewal over fast cleanup (a dead client's resources
+# can linger up to an hour). See README.md's "Grace period / dead-client
+# cleanup" section for the full reasoning, including why a short
+# lease_check_interval_seconds is now cheap even under high subscription
+# churn (see the "High-churn-under-load" section's remove() fix).
 lease_bucket: "sidecar-leases"
 lease_ttl_seconds: 3600           # bucket is created/validated with this TTL
 lease_check_interval_seconds: 60  # reconcile expired/deleted lease keys
+
+# Example "responsive grace period" profile instead of the defaults above -
+# a dead client's subscription is cleaned up within ~15-20s instead of up to
+# ~1 hour, at the cost of clients needing to re-subscribe every ~10-15s to
+# stay alive. Uncomment and tune for your own deployment's actual renewal
+# cadence - these are illustrative starting points, not a recommended default.
+# lease_ttl_seconds: 15
+# lease_check_interval_seconds: 5
 
 # A-Tree attribute schema - defines the fields available for boolean expressions
 # Clients write expressions like: temperature > 30.0 AND location = "warehouse-A"
