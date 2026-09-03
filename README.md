@@ -2719,6 +2719,30 @@ too literally on heavily-templated, aggressively-inlined library code). `contain
 itself (6%) is untouched by this change - it's a buffer-growth cost, not a parsing one - and
 remains an open, not-yet-tried lead if `fmt`'s own hot path gets revisited again.
 
+**Pushing matchEvent's optimization further - resize()+index instead of reserve()+push_back() -
+looked promising but didn't hold up.** A follow-up `perf annotate` after the `reserve()` fix found
+push_back()'s own capacity-check-and-increment *still* ~82.8% of matchEvent's self-time - `reserve()`
+eliminates reallocation but not the per-call branch, since `std::vector` has no "I already know
+this fits" mode. The natural next step: `resize(idUpperBound)` up front, write through a plain
+index (`matchingSubs[writeIdx++] = id`) instead of `push_back()`, then `resize(writeIdx)` down to
+the real count - no capacity check anywhere in the hot loop. Verified: pstree's full suite green
+(plain, ASan+UBSan, manual ThreadSanitizer), `sidecar_test` green under all three configs
+(byte-identical match results, differential tests included).
+
+Measured impact was far smaller than the 82.8% figure suggested, and mixed rather than a clean
+win: at `s`=1/K=8000, only **5/8** interleaved `perf stat -e cycles:u` pairs favored it (mean
+-1.2%, essentially noise-level); at the more realistic `s`=20, it was a clear **regression**,
+**4/4** pairs worse (mean **+4.6%**). The likely mechanism: `resize()` zero-fills the *entire*
+upper bound up front (cheap per byte, but the upper bound is a worst-case estimate - every
+candidate matching - not the real count), while `push_back()` only ever touches as many elements
+as actually match. At lower selectivity, more candidates get rejected by their predicate check, so
+the gap between "upper bound sized" and "real match count" widens, and the upfront zero-fill cost
+outgrows the per-element check it was meant to avoid. Reverted (pstree left at 3093b3f, the
+`reserve()`+`push_back()` version - no pin change needed since nothing was committed past that
+point). Filed alongside the two `to_string` reverts as the same lesson again: a hot symbol's raw
+percentage in a sampling profile - even from `perf annotate`'s source-line view, not just flat
+`perf report` - is a lead to verify, not a size estimate of the fix's payoff.
+
 ## License
 
 See LICENSE file.
