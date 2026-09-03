@@ -160,7 +160,135 @@ std::optional<std::vector<row_match>> dispatch_columnar_output(
     return std::nullopt;
 }
 
+// Count-only sibling of match_columnar_batch<OutProtocol, Rows>() above - same reused-event_sink
+// shape, but calls count_message() (search_count()) instead of match_message() (search()), and
+// never calls serialize_row() at all, so no OutProtocol template parameter is needed here.
+// `total_payload_bytes` is the caller's own payload.size() (the whole batch's wire size, cheaply
+// known upfront) - used only to compute columnar_count_estimate::estimated_bytes's own
+// avg_row_payload_bytes proxy (see that field's own doc comment in event_bridge.hpp).
+template <typename Rows>
+std::optional<columnar_count_estimate> count_columnar_rows_batch(
+    const matching_engine& tree,
+    const attribute_schema& schema,
+    Rows& rows,
+    std::size_t total_payload_bytes,
+    const std::shared_ptr<spdlog::logger>& log)
+{
+    const bool reuse_event = tree.reuses_events();
+    std::unique_ptr<event_sink> reused_event = reuse_event ? tree.make_event() : nullptr;
+
+    columnar_count_estimate estimate;
+    std::size_t row_count = 0;
+
+    auto process_row = [&](std::size_t i, auto&& row) -> bool {
+        ++row_count;
+        auto count = reuse_event
+            ? count_message(tree, schema, row, *reused_event, log)
+            : count_message(tree, schema, row, log);
+        if (!count) {
+            // Mirrors match_columnar_batch()'s own "poison the whole batch" contract on a
+            // row-level failure - same per-message (not per-row) failure granularity as every
+            // other entry point in this file.
+            if (log) {
+                log->warn("event_bridge: row {} of columnar batch failed to count; "
+                          "poisoning whole batch", i);
+            }
+            return false;
+        }
+        if (*count > 0) {
+            estimate.matched_row_count += 1;
+            estimate.total_match_count += *count;
+        }
+        return true;
+    };
+
+    bool ok = true;
+    std::size_t i = 0;
+    for (auto&& row : rows) {
+        if (!process_row(i++, row)) { ok = false; break; }
+    }
+    if (!ok) return std::nullopt;
+
+    // Uniform per-row average, the only cheap size proxy available (see
+    // columnar_count_estimate::estimated_bytes's own doc comment) - guard row_count == 0 (an
+    // empty batch) to avoid a division by zero; there is nothing to estimate in that case anyway
+    // (total_match_count is already 0).
+    std::size_t avg_row_payload_bytes = row_count > 0 ? total_payload_bytes / row_count : 0;
+    estimate.estimated_bytes = estimate.total_match_count * (avg_row_payload_bytes + 64);
+
+    return estimate;
+}
+
 } // namespace
+
+std::optional<columnar_count_estimate> count_match_columnar_batch(
+    const matching_engine& tree,
+    const attribute_schema& schema,
+    binary_format format,
+    std::span<const char> payload,
+    const std::shared_ptr<spdlog::logger>& log)
+{
+    try {
+        // Arrow input: same ArrowColumnarRows reader deserialize_and_match_columnar() uses, but
+        // no output-format dispatch is needed here at all (unlike that function's own Arrow
+        // branch) - this path never re-encodes a row, so there is no OutProtocol to pick.
+        if (format == binary_format::arrow) {
+            ArrowColumnarRows rows(payload);
+            return count_columnar_rows_batch(tree, schema, rows, payload.size(), log);
+        }
+
+        auto bytes = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+
+        switch (format) {
+            case binary_format::msgpack: {
+                zerialize::MsgPack::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                return count_columnar_rows_batch(tree, schema, rows, payload.size(), log);
+            }
+            case binary_format::cbor: {
+                zerialize::CBOR::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                return count_columnar_rows_batch(tree, schema, rows, payload.size(), log);
+            }
+            case binary_format::flexbuffers: {
+                zerialize::Flex::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                return count_columnar_rows_batch(tree, schema, rows, payload.size(), log);
+            }
+            case binary_format::zera: {
+                zerialize::Zera::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                return count_columnar_rows_batch(tree, schema, rows, payload.size(), log);
+            }
+            case binary_format::ion: {
+                zerialize::Ion::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                return count_columnar_rows_batch(tree, schema, rows, payload.size(), log);
+            }
+            case binary_format::beve: {
+                zerialize::Beve::Deserializer reader(bytes);
+                auto rows = zerialize::columnar_rows(reader);
+                return count_columnar_rows_batch(tree, schema, rows, payload.size(), log);
+            }
+            case binary_format::bson:
+                // Same restriction as deserialize_and_match_columnar()'s own bson-as-input
+                // rejection - see that function's own comment.
+                if (log) {
+                    log->error("event_bridge: columnar batching is not supported "
+                              "for format=bson");
+                }
+                return std::nullopt;
+            case binary_format::arrow:
+                // Unreachable - handled at the top of this function.
+                return std::nullopt;
+        }
+    } catch (const std::exception& e) {
+        if (log) log->debug("event_bridge: columnar count-pass deserialization failed: {}", e.what());
+    }
+
+    return std::nullopt;
+}
 
 std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     const matching_engine& tree,

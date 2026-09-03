@@ -773,3 +773,126 @@ TEST(worker_pool, js_mode_leaves_unacked_on_inflight_backpressure_drop) {
     EXPECT_TRUE(js_sub->termed_stream_seqs.empty());
     EXPECT_TRUE(js_sub->nakked_stream_seqs.empty());
 }
+
+// --- Backpressure-adaptive dispatch (pstree + columnar only - see worker_pool.hpp's m_engine
+// comment). The peek is a non-mutating heuristic; the real, authoritative decision is still the
+// identical try_reserve_publish_capacity() check both the direct and adaptive paths share - see
+// worker_loop()'s own comment for why, under the exact threshold comparisons used here
+// (peek: `current >= cap`; real: `current + this_message's_estimate > cap`), "the peek predicts
+// pressure" mathematically implies "the real check also rejects" for any message with a positive
+// estimate - meaning the "predicted pressure but kept anyway" fallback branch is a genuine,
+// race-dependent edge case in real concurrent operation, not something constructible on demand
+// through this test's single-threaded, controlled setup. What IS directly, deterministically
+// testable here: (1) pstree+columnar still publishes correctly end to end when
+// adaptive-eligible but NOT under pressure (the common case - confirms the new m_engine/
+// adaptive_eligible plumbing doesn't disturb it), and (2) the gate-drop branch's own observable
+// contract (no publish, no write, but processed/matched stats still reflect the count pass that
+// genuinely ran) - both real, load-bearing regression guards for this change even without a
+// racy misprediction scenario.
+
+TEST(worker_pool, pstree_columnar_publishes_normally_when_adaptive_eligible_but_not_under_pressure) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    cfg.engine = sidecar::engine_type::pstree;
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(
+        cfg.attributes, cfg.output_prefix, worker_log(), sidecar::engine_type::pstree);
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::atomic<int> write_raw_calls{0};
+    std::string last_wire;
+    conn->on_write_raw = [&](std::span<const char> data) -> asio::awaitable<nats_asio::status> {
+        write_raw_calls.fetch_add(1);
+        last_wire.assign(data.data(), data.size());
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    // Row 0 (5) doesn't match; rows 1 and 2 (42, 100) do - same shape as
+    // columnar_batch_matches_each_row_independently_and_writes_once above, just on pstree with
+    // ample publish capacity (worker_config()'s defaults), so the peek never trips and this
+    // exercises adaptive_eligible=true with likely_under_pressure=false throughout.
+    ASSERT_TRUE(pool.enqueue(columnar_payload({5, 42, 100}), /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published >= 2; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.processed, 1u);
+    EXPECT_EQ(stats.matched, 2u);
+    EXPECT_EQ(stats.published, 2u);
+    EXPECT_EQ(write_raw_calls.load(), 1);
+    EXPECT_NE(last_wire.find("PUB output.1 "), std::string::npos);
+}
+
+TEST(worker_pool, adaptive_gate_drop_prevents_publish_and_write) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    cfg.engine = sidecar::engine_type::pstree;
+    cfg.publish_max_inflight = 0;  // forces the peek (and the real check, identically) to reject
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(
+        cfg.attributes, cfg.output_prefix, worker_log(), sidecar::engine_type::pstree);
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::atomic<int> write_raw_calls{0};
+    conn->on_write_raw = [&](std::span<const char>) -> asio::awaitable<nats_asio::status> {
+        write_raw_calls.fetch_add(1);
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(columnar_payload({5, 42, 100}), /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().publish_tasks_dropped > 0; }, std::chrono::seconds(2)));
+    // Give the (absent) publish coroutine a moment it can't use - same pattern as
+    // publish_bytes_backpressure_drops_when_estimated_size_exceeds_cap above.
+    ioc.restart();
+    ioc.run_for(std::chrono::milliseconds(50));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.published, 0u);
+    EXPECT_EQ(stats.publish_inflight, 0u);
+    EXPECT_EQ(stats.publish_inflight_bytes, 0u);
+    EXPECT_EQ(write_raw_calls.load(), 0)
+        << "the adaptive gate must reject before deserialize_and_match_columnar()'s real match "
+           "ever runs, so no publish work should ever reach the connection";
+}
+
+TEST(worker_pool, adaptive_gate_drop_matched_and_processed_stats_reflect_count_pass) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    cfg.engine = sidecar::engine_type::pstree;
+    cfg.publish_max_inflight = 0;
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(
+        cfg.attributes, cfg.output_prefix, worker_log(), sidecar::engine_type::pstree);
+    subscriptions.subscribe("value > 10", "client-1");
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, nullptr, worker_log());
+    pool.start();
+    // Row 0 (5) doesn't match, rows 1/2 (42, 100) do - the count pass must report matched=2 here,
+    // the exact value deserialize_and_match_columnar() itself would have reported had it run -
+    // proving the gate-drop branch's stats aren't just left at zero or some placeholder.
+    ASSERT_TRUE(pool.enqueue(columnar_payload({5, 42, 100}), /*columnar=*/true));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().publish_tasks_dropped > 0; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    auto stats = pool.get_stats();
+    EXPECT_EQ(stats.processed, 1u)
+        << "processed must still increment on a gate-drop, same as the direct path's own drop "
+           "branch - this message genuinely was dequeued and attempted";
+    EXPECT_EQ(stats.matched, 2u)
+        << "matched must reflect the count pass's own exact row count, matching what the real "
+           "path would have reported for the same input";
+    EXPECT_EQ(stats.publish_tasks_dropped, 1u);
+}

@@ -273,6 +273,17 @@ if(SIDECAR_BUILD_BENCHMARKS)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 
+    # Isolated microbenchmark that validated the count-then-emit adaptive dispatch (see the
+    # README's own "Backpressure-adaptive count-then-emit matching for pstree" section) before
+    # any of it was implemented - fully self-contained (models GroupEntry locally, no sidecar_lib
+    # dependency), reusable for re-checking the crossover point if the real kept/dropped ratios
+    # this project measures ever shift meaningfully.
+    add_executable(countemit_bench benchmarks/countemit_bench.cpp)
+    target_compile_options(countemit_bench PRIVATE -O3 -march=native)
+    set_target_properties(countemit_bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
     # Demonstrates/cross-checks the list-valued-attribute blind spot (pstree has no
     # representation for list attributes at all) - see the .cpp's own comment.
     add_executable(diag_list_attr benchmarks/diag_list_attr.cpp)

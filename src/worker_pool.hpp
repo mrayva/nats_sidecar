@@ -162,6 +162,33 @@ private:
     void spawn_ack(nats_asio::ijs_subscription_sptr js_sub, nats_asio::js_message msg);
     void spawn_term(nats_asio::ijs_subscription_sptr js_sub, nats_asio::js_message msg);
 
+    // Below: the reserve-then-check-then-rollback-on-reject atomic dance worker_loop()'s direct
+    // path has always done inline, extracted into shared helpers so the adaptive count-path
+    // (see worker_loop()'s own comment) can never drift from it - same comparison, same atomics,
+    // same thresholds, on both call sites.
+
+    // Reserves one publish-task slot and `estimated_bytes` against the configured limits.
+    // Returns true (reserved - caller may proceed) or false (rejected - already rolled back both
+    // reservations; caller still bumps m_publish_tasks_dropped and `continue`s itself, matching
+    // this dance's pre-refactor inline shape).
+    bool try_reserve_publish_capacity(std::size_t estimated_bytes);
+
+    // True-up an already-reserved publish_inflight_bytes amount from a provisional (count-pass)
+    // estimate to the real one, via a single signed delta - NOT a second independent
+    // reservation: publish_inflight's own task-slot reservation happens exactly once per message
+    // regardless of path, and the eventual publish coroutine releases exactly one reservation's
+    // worth of bytes at completion via its own captured `reserved_bytes` - a second
+    // try_reserve_publish_capacity() call here would double-reserve and leak on release.
+    void adjust_reserved_publish_bytes(std::size_t old_estimate, std::size_t new_estimate);
+
+    // Releases an already-made reservation with no corresponding publish task ever spawned - the
+    // count-path "kept but the real match then found nothing after all" edge. Required, not
+    // optional: without it, repeated mispredicted-then-empty messages permanently leak
+    // publish_inflight/publish_inflight_bytes capacity. Distinct from the backpressure-drop
+    // rollback inside try_reserve_publish_capacity() - this one does NOT bump
+    // m_publish_tasks_dropped, since this message was never actually rejected by backpressure.
+    void release_reserved_publish_capacity(std::size_t estimated_bytes);
+
     asio::io_context& m_ioc;
     binary_format m_format;
     // Set once at construction from cfg.output_format (see that field's own comment) - unset
@@ -174,6 +201,15 @@ private:
     subscription_manager& m_sub_mgr;
     nats_asio::iconnection_sptr m_conn;
     std::shared_ptr<spdlog::logger> m_log;
+
+    // Set once at construction from cfg.engine - sidecar.cpp constructs m_sub_mgr and this pool
+    // from the SAME cfg, so this can never diverge from what subscription_manager's own live
+    // tree actually is (subscription_manager itself keeps its own copy private, with no public
+    // getter - see its own m_engine field's comment). Used only to gate worker_loop()'s adaptive
+    // count-then-emit dispatch to pstree specifically (the only engine matching_engine::
+    // supports_count() is true for) - a-tree/be-tree messages always take the direct,
+    // byte-for-byte-unchanged path regardless of this field.
+    engine_type m_engine;
 
     unsigned int m_thread_count;
     std::atomic<bool> m_running{false};

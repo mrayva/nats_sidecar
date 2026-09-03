@@ -2933,6 +2933,121 @@ access pattern - many distinct ids looked up once each over time, vs. one messag
 re-checking a huge shared id set - is actually the bottleneck at that fan-out level. Committed
 (`src/worker_pool.cpp`) on the strength of the real, low-variance `s`=1 result.
 
+## Backpressure-adaptive count-then-emit matching for pstree
+
+With the dedup-side hashtable costs cleared out (the two sections above), `PSTDynamic::matchEvent()`
+itself became the largest remaining item in the profile - 56% of total CPU self-time at K=8000/`s`=1,
+almost entirely the cold-memory-write cost of `push_back()`ing every match into a
+`std::vector<uint64_t>` (already `reserve()`'d - see `pst_dynamic.hpp`'s own `perf annotate` comment,
+no reallocation cost left). Separately, this document's own earlier K-scaling section already proved
+that at high fan-out, most matched rows never get published at all: `worker_pool.cpp`'s backpressure
+check drops ~94% of matched rows at `s`=1 and ~82% at `s`=20, ~0% at `s`=100. Critically, `matchEvent()`
+already runs - and pays its full write cost - for *every* row, *before* that check runs, because the
+check needs `matched_ids.size()` per row, which today only exists once the ids vector is already fully
+built. So for ~94%/82% of rows at `s`=1/`s`=20, the expensive vector write happens for nothing: built,
+then immediately discarded, unread.
+
+**Isolated validation first, as always.** A microbenchmark (`countemit_bench.cpp`) modeled splitting
+the candidate walk into a cheap COUNT-only pass (evaluate each candidate, just increment a counter, no
+vector write - feeds the backpressure decision) plus a second EMIT pass (evaluate again, this time
+writing ids) that only runs for rows surviving backpressure, against real-measured kept/dropped ratios:
+kept-fraction 6% (`s`=1-like): **-27.7% mean**; kept-fraction 17.4% (`s`=20-like): **-21.8% mean**;
+kept-fraction 99.9% (`s`=100-like): **+21.6%** - a real *regression*, since kept rows now pay for
+evaluating every candidate twice. That crossover is why the real design is adaptive, not unconditional:
+peek at current backpressure state before matching, and only take the two-phase path when the system
+already looks under pressure - otherwise use today's unchanged single-pass path, so low-pressure
+conditions never regress.
+
+**A design review caught a load-bearing bug before any of this was implemented.** `pstree_matching_engine`'s
+own `m_hasSyntheticClauses` flag (set once an OR'd/multi-clause subscription is ever inserted, and
+monotonic thereafter) is realistically `true` at K=8000 (~10% of this project's own benchmark
+subscriptions are OR'd, per `insert()`'s own comment) - a naive `search_count()` slow path that just
+called `matchEvent()`/`search()` and counted the result would have silently paid the exact cost this
+whole feature exists to eliminate, making it worth ~0% on the actual traffic shape it was built for.
+Fixed by giving `PSTDynamic` a genuine callback-based primitive (`matchEventEach()`) that visits
+matches one at a time without ever building a vector, and having `search_count()`'s own OR-clause
+dedup logic (the same `m_clause_to_sub` translation + `seen`-set dedup `search()` already has) run
+incrementally against that callback instead.
+
+**The `pstree` refactor itself caught a real bug before being committed.** Splitting `matchEvent()`
+into `scanCandidates()` (interning + candidate collection) and `walkCandidates()` (the per-candidate
+check, now callback-based) is a pure move with zero intended behavior change - but an early version
+made `internedEvent` a `scanCandidates()`-local variable, while the `indexed` span it returns holds
+raw pointers directly into it. Since `walkCandidates()` reads through `indexed` from the *caller's*
+frame, after `scanCandidates()` has already returned, every one of those pointers was left dangling
+the moment the function returned - a real, silent memory-corruption bug. Caught immediately: the
+existing `pstree` test suite failed with a nonsensical "matchValue type mismatch" error the moment it
+was built, before anything here was committed. Fixed by making `internedEvent` a caller-owned
+out-param too, exactly like `indexedStorage`/`indexed` already were - all three now share the calling
+frame's lifetime, through both `matchEvent()`'s existing use and the new `matchEventEach()`.
+
+**Architecture** (full detail in each file's own comments): `matching_engine.hpp` gains two new
+virtuals with safe defaults - `supports_count()` (false unless overridden) and `search_count()`
+(throws `matching_engine_error` unless overridden) - zero code changes to a-tree/be-tree, which
+inherit both defaults untouched. `pstree_matching_engine::search_count()` mirrors `search()`'s own
+fast-path/slow-path shape exactly, via `PSTDynamic::matchEventCount()`/`matchEventEach()`.
+`event_bridge.hpp`/`.cpp` gain `count_match_columnar_batch()`, a count-only sibling of
+`deserialize_and_match_columnar()` with the same format dispatch (Arrow included) but no
+`OutProtocol`/`serialize_row()` at all. Its `columnar_count_estimate::estimated_bytes` field uses
+`total_match_count * (payload.size()/row_count + 64)` - a uniform per-row average, confirmed (by
+reading both in full) to be the only cheap size proxy available, since neither `zerialize::ColumnarRows<V>`
+nor `ArrowColumnarRows` tracks any per-row byte range. This affects only the *accuracy* of the
+byte-based backpressure *estimate* on the count-only path - "estimated_bytes" was already documented
+as an approximation before this existed - never the decision logic, and never what ultimately
+publishes: a kept message's real ids/payloads always come from an unchanged, exact
+`deserialize_and_match_columnar()` call.
+
+`worker_pool.cpp` gains a new `m_engine` field (set from `cfg.engine` at construction - guaranteed to
+match `subscription_manager`'s own live tree, since `sidecar.cpp` constructs both from the same `cfg`)
+and three shared helpers (`try_reserve_publish_capacity()`/`adjust_reserved_publish_bytes()`/
+`release_reserved_publish_capacity()`) so the reserve/check/rollback atomic dance can never drift
+between the direct and adaptive call sites. `worker_loop()`'s dispatch: only `qm.columnar &&
+m_engine==pstree` is ever eligible; a non-mutating peek at current `publish_inflight`/
+`publish_inflight_bytes` decides whether to run the count-only pass first. A gate-reject means the real
+match never ran at all for that message - the actual win. A gate-accept (a misprediction) falls
+through to the unchanged, real `deserialize_and_match_columnar()` call, truing up the provisional
+reservation instead of reserving twice. Two correctness edges got dedicated handling rather than being
+left implicit: `m_matched`/`m_processed` stay path-independent (a gate-dropped message still counts as
+"processed"/"matched", exactly like the direct path's own drop branch already did - a gap caught and
+fixed before any test was written for it), and `release_reserved_publish_capacity()` exists specifically
+for the "kept but the real match then came back empty/malformed after all" edge, so a repeated
+misprediction can never leak reserved capacity. That specific edge is structurally very hard to trigger
+even deliberately (the count pass and the eventual real pass run against the *same* frozen tree
+snapshot under one `tree_guard`, so a disagreement between them would itself be a bug the count-parity
+tests below already guard against) - covered by code review and full-suite TSan coverage rather than a
+dedicated unit test forcing it.
+
+Given the mathematically-provable relationship between the peek's `current >= cap` threshold and the
+real check's `current + estimate > cap` threshold, "the peek predicts pressure" *implies* "the real
+check also rejects" for any message with a positive estimate on the bytes clause (and the two
+thresholds read the identical quantity on the task-count clause) - meaning the "predicted pressure but
+kept anyway" fallback is a genuine, race-dependent edge in real concurrent operation (a competing
+worker's publish coroutine releasing capacity between the peek and the count pass), not one
+constructible on demand in a controlled single-threaded test. `test_worker_pool.cpp`'s own new tests
+cover what *is* deterministic instead: normal end-to-end publish when pstree+columnar is adaptive-eligible
+but not under pressure, and the gate-drop branch's full observable contract (no publish, no write, but
+`processed`/`matched` stats reflect the count pass that genuinely ran).
+
+**Verified**: `pstree`'s own `ctest` suite green (12/12, new `test_pst_dynamic_count.cpp` differential-
+tests `matchEventCount()`/`matchEventEach()` against `matchEvent()` itself - fig3 fixtures, edge cases,
+and a randomized insert/delete/match stress loop). `sidecar_test` green under all three configs
+(328/328 - plain/ASan+UBSan/ThreadSanitizer; TSan specifically relevant for `search_count()`'s own
+`seen_count` thread_local scratch set, mirroring `search()`'s own earlier, real data-race fix).
+
+**Measured on the real pipeline** via `sidecar_pipeline_bench` + interleaved `perf stat -e cycles:u`
+(alternating start order, 8 pairs per selectivity): **`s`=1 is a real win - 7/8 favorable, mean -4.43%**
+- smaller than the isolated microbenchmark's -27.7% prediction, consistent with dilution from
+everything else in the real pipeline (same pattern as every other real-vs-isolated result in this
+document). **`s`=20 shows no clear signal** (mean +3.48%, 3/8 favorable, noisy) - unlike the isolated
+prediction; not yet understood in detail, plausibly because `s`=20's lower per-row fan-out means fewer
+messages accumulate enough `publish_inflight_bytes` to trip the peek at all, diluting any win with
+direct-path-only traffic. **`s`=100 shows no regression** (mean -0.35%, 4/8 favorable, noise) - this is
+the actual point of choosing *adaptive* over *unconditional*: the isolated microbenchmark predicted a
+real +21.6% regression at `s`=100-like kept fractions for an unconditional two-phase design, and the
+adaptive gate successfully avoids it by almost never engaging when the system isn't genuinely under
+pressure. Committed on the strength of the real `s`=1 result and the confirmed absence of an `s`=100
+regression; `s`=20's own lack of signal is reported honestly rather than smoothed over.
+
 ## License
 
 See LICENSE file.

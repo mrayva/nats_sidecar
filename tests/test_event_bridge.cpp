@@ -324,6 +324,108 @@ TEST(event_bridge_columnar, matches_multiple_rows_independently_across_all_suppo
         *snap, schema, sidecar::binary_format::beve, id);
 }
 
+// --- count_match_columnar_batch (the count-only sibling, pstree-only) ---
+
+namespace {
+
+template <typename Protocol>
+std::optional<sidecar::columnar_count_estimate> count_columnar_with(
+    const sidecar::matching_engine& tree, const sidecar::attribute_schema& schema,
+    sidecar::binary_format format, const zerialize::dyn::Value& payload,
+    std::shared_ptr<spdlog::logger> log) {
+    auto buf = zerialize::serialize<Protocol>(payload);
+    return sidecar::count_match_columnar_batch(
+        tree, schema, format, as_char_span(buf), std::move(log));
+}
+
+template <typename Protocol>
+void check_columnar_count_matches_real_path(
+    const sidecar::matching_engine& tree, const sidecar::attribute_schema& schema,
+    sidecar::binary_format format) {
+    // Same shape as check_columnar_multi_row_match: row 0 (5) doesn't match, rows 1/2 (42, 100)
+    // do - parity is checked against deserialize_and_match_columnar() itself, the real path,
+    // not a hand-computed expectation, so a future divergence between the two shows up directly.
+    auto payload = zerialize::dyn::map({
+        {"value", zerialize::dyn::array({5, 42, 100})},
+    });
+    auto real = match_columnar_with<Protocol>(tree, schema, format, payload, make_log());
+    auto count = count_columnar_with<Protocol>(tree, schema, format, payload, make_log());
+    ASSERT_TRUE(real.has_value());
+    ASSERT_TRUE(count.has_value());
+
+    std::size_t real_matched_rows = real->size();
+    std::size_t real_total_matches = 0;
+    for (auto& rm : *real) real_total_matches += rm.matched_ids.size();
+
+    EXPECT_EQ(count->matched_row_count, real_matched_rows);
+    EXPECT_EQ(count->total_match_count, real_total_matches);
+}
+
+} // namespace
+
+TEST(event_bridge_columnar, count_match_columnar_batch_matches_real_row_matches_across_all_supported_formats) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log(), sidecar::engine_type::pstree);
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
+    ASSERT_TRUE(snap->supports_count());
+
+    check_columnar_count_matches_real_path<zerialize::MsgPack>(*snap, schema, sidecar::binary_format::msgpack);
+    check_columnar_count_matches_real_path<zerialize::CBOR>(*snap, schema, sidecar::binary_format::cbor);
+    check_columnar_count_matches_real_path<zerialize::Flex>(*snap, schema, sidecar::binary_format::flexbuffers);
+    check_columnar_count_matches_real_path<zerialize::Zera>(*snap, schema, sidecar::binary_format::zera);
+    check_columnar_count_matches_real_path<zerialize::Ion>(*snap, schema, sidecar::binary_format::ion);
+    check_columnar_count_matches_real_path<zerialize::Beve>(*snap, schema, sidecar::binary_format::beve);
+}
+
+TEST(event_bridge_columnar, count_match_columnar_batch_malformed_returns_nullopt) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log(), sidecar::engine_type::pstree);
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
+
+    // Same malformed shape as malformed_shape_returns_nullopt below (a bare int instead of an
+    // array) - the count-only path must reject it the same way the real path does.
+    auto result = count_columnar_with<zerialize::MsgPack>(
+        *snap, schema, sidecar::binary_format::msgpack,
+        zerialize::dyn::map({{"value", 42}}), make_log());
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST(event_bridge_columnar, count_match_columnar_batch_estimated_bytes_uses_average_row_size_proxy) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log(), sidecar::engine_type::pstree);
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
+
+    // 3 rows, 2 of which match (42, 100) - deliberately uneven row sizes aren't directly
+    // controllable through this dyn::map fixture (every row shares one column layout), so this
+    // test instead locks in the FORMULA itself: total_match_count * (payload.size()/row_count +
+    // 64) - see columnar_count_estimate::estimated_bytes's own doc comment for why a uniform
+    // per-row average is the only cheap proxy available, and why that's fine (it only affects
+    // estimate accuracy, never the backpressure decision logic or what actually publishes).
+    auto payload = zerialize::dyn::map({
+        {"value", zerialize::dyn::array({5, 42, 100})},
+    });
+    auto buf = zerialize::serialize<zerialize::MsgPack>(payload);
+    auto span = as_char_span(buf);
+    auto count = sidecar::count_match_columnar_batch(
+        *snap, schema, sidecar::binary_format::msgpack, span, make_log());
+    ASSERT_TRUE(count.has_value());
+    ASSERT_EQ(count->matched_row_count, 2u);
+    ASSERT_EQ(count->total_match_count, 2u);
+
+    std::size_t expected_avg = span.size() / 3; // 3 rows in the batch (row_count), not matched_row_count
+    std::size_t expected_bytes = count->total_match_count * (expected_avg + 64);
+    EXPECT_EQ(count->estimated_bytes, expected_bytes);
+}
+
 TEST(event_bridge_columnar, empty_batch_returns_empty_result_not_malformed) {
     std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
     sidecar::attribute_schema schema(defs);

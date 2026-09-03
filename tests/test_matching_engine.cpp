@@ -554,3 +554,145 @@ TEST(matching_engine, pstree_search_results_identical_whether_or_not_synthetic_c
         }
     }
 }
+
+// search_count() fast path (no OR'd subscriptions - m_hasSyntheticClauses stays false, same
+// gating as search()'s own fast path above): confirms search_count() always agrees with
+// search().size(), the actual correctness contract - see matching_engine.hpp's own comment for
+// why this method exists at all (a caller that only needs the count, not the ids).
+TEST(matching_engine, pstree_search_count_matches_search_size_fast_path) {
+    std::vector<sidecar::attribute_def> attrs = {
+        {"trade_price",  sidecar::attribute_type::float_val},
+        {"trade_volume", sidecar::attribute_type::integer},
+        {"symbol",       sidecar::attribute_type::string},
+    };
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    engine->insert(1, "trade_price > 100.0");
+    engine->insert(2, "trade_volume > 1000");
+    engine->insert(3, "symbol = \"AAPL\"");
+    engine->insert(4, "trade_price > 500.0 and trade_volume > 2000");
+
+    ASSERT_TRUE(engine->supports_count());
+
+    for (auto [price, volume, symbol] :
+         {std::tuple{150.0, 500, "AAPL"}, std::tuple{600.0, 3000, "MSFT"},
+          std::tuple{1.0, 1, "GOOG"}}) {
+        auto count_sink = engine->make_event();
+        count_sink->with_float("trade_price", price);
+        count_sink->with_integer("trade_volume", volume);
+        count_sink->with_string("symbol", symbol);
+        std::size_t count = engine->search_count(*count_sink);
+
+        auto search_sink = engine->make_event();
+        search_sink->with_float("trade_price", price);
+        search_sink->with_integer("trade_volume", volume);
+        search_sink->with_string("symbol", symbol);
+        auto result = engine->search(*search_sink);
+
+        EXPECT_EQ(count, result.size())
+            << "search_count() disagreed with search().size() for price=" << price
+            << " volume=" << volume << " symbol=" << symbol;
+    }
+}
+
+// search_count() slow (OR-clause) path - the one that must NOT just call search()/matchEvent()
+// and count the result (see search_count()'s own comment in matching_engine.cpp for why that
+// would defeat the whole feature). Includes an event that hits TWO clauses of the SAME OR'd
+// subscription (sub 5 below matches via both its trade_price and trade_volume clauses at once) -
+// the actual dedup case search_count()'s seen_count set exists to get right.
+TEST(matching_engine, pstree_search_count_matches_search_size_with_or_subscriptions) {
+    std::vector<sidecar::attribute_def> attrs = {
+        {"trade_price",  sidecar::attribute_type::float_val},
+        {"trade_volume", sidecar::attribute_type::integer},
+        {"symbol",       sidecar::attribute_type::string},
+    };
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    engine->insert(1, "trade_price > 100.0");
+    engine->insert(2, "trade_price > 50.0 and trade_volume > 100");
+    engine->insert(3, "trade_price > 200.0 or trade_volume > 900");
+    engine->insert(4, "symbol = \"AAPL\" or trade_price < 10.0");
+    // Both clauses of sub 5 match the same event below (trade_price=250 > 150 AND
+    // trade_volume=950 > 700) - proves the dedup path collapses a double clause-match to one
+    // result, not two.
+    engine->insert(5, "trade_price > 150.0 or symbol = \"MSFT\" or trade_volume > 700");
+
+    for (auto [price, volume, symbol] :
+         {std::tuple{250.0, 950, "AAPL"}, std::tuple{1.0, 1, "GOOG"}, std::tuple{600.0, 50, "MSFT"}}) {
+        auto count_sink = engine->make_event();
+        count_sink->with_float("trade_price", price);
+        count_sink->with_integer("trade_volume", volume);
+        count_sink->with_string("symbol", symbol);
+        std::size_t count = engine->search_count(*count_sink);
+
+        auto search_sink = engine->make_event();
+        search_sink->with_float("trade_price", price);
+        search_sink->with_integer("trade_volume", volume);
+        search_sink->with_string("symbol", symbol);
+        auto result = engine->search(*search_sink);
+
+        EXPECT_EQ(count, result.size())
+            << "search_count() disagreed with search().size() for price=" << price
+            << " volume=" << volume << " symbol=" << symbol;
+    }
+}
+
+// Zero-risk contract for a-tree/be-tree: neither overrides supports_count()/search_count(), so
+// both inherit the base class's defaults - locks that in directly rather than relying on it
+// never being exercised by accident.
+TEST_P(matching_engine_test, search_count_unsupported_by_default) {
+    auto engine = sidecar::build_matching_engine(GetParam(), trade_attributes());
+    engine->insert(1, "trade_price > 100.0");
+    EXPECT_FALSE(engine->supports_count());
+
+    auto sink = engine->make_event();
+    sink->with_float("trade_price", 150.0);
+    sink->with_integer("trade_volume", 100);
+    sink->with_string("symbol", "AAPL");
+    sink->with_boolean("active", true);
+    sink->with_string_list("tags", {});
+    EXPECT_THROW(engine->search_count(*sink), sidecar::matching_engine_error);
+}
+
+// Mirrors pstree_concurrent_search_with_or_subscriptions_does_not_race above exactly, but calling
+// search_count() from every thread instead of search() - the actual regression guard for
+// search_count()'s own seen_count thread_local (see its own comment in matching_engine.cpp for
+// why it must stay thread_local, not a member, for the identical reason search()'s `seen` already
+// documents). Real purpose is running under ThreadSanitizer (build-sanitizer with
+// SIDECAR_SANITIZER=thread) - may not reliably reproduce a race on a plain build even if broken.
+TEST(matching_engine, pstree_search_count_concurrent_with_or_subscriptions_does_not_race) {
+    std::vector<sidecar::attribute_def> attrs = {
+        {"trade_price",  sidecar::attribute_type::float_val},
+        {"trade_volume", sidecar::attribute_type::integer},
+        {"symbol",       sidecar::attribute_type::string},
+    };
+    auto engine = sidecar::build_matching_engine(sidecar::engine_type::pstree, attrs);
+    engine->insert(1, "trade_price > 100.0");
+    engine->insert(2, "trade_price > 50.0 and trade_volume > 100");
+    engine->insert(3, "trade_price > 200.0 or trade_volume > 900");
+    engine->insert(4, "symbol = \"AAPL\" or trade_price < 10.0");
+    engine->insert(5, "trade_price > 150.0 or symbol = \"MSFT\" or trade_volume > 700");
+
+    auto count_one = [&engine](double price, int64_t volume, std::string_view symbol) {
+        auto sink = engine->make_event();
+        sink->with_float("trade_price", price);
+        sink->with_integer("trade_volume", volume);
+        sink->with_string("symbol", symbol);
+        return engine->search_count(*sink);
+    };
+
+    constexpr int kThreads = 8;
+    constexpr int kIterationsPerThread = 2000;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&count_one, t]() {
+            for (int i = 0; i < kIterationsPerThread; ++i) {
+                count_one(static_cast<double>((t * 37 + i) % 300), (t * 53 + i) % 1000,
+                          (i % 2 == 0) ? "AAPL" : "MSFT");
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    // Reaching here without crashing/hanging under TSan is the actual assertion; also confirm
+    // ordinary counting still works correctly afterward.
+    EXPECT_GE(count_one(250.0, 50, "AAPL"), std::size_t{1});
+}

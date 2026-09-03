@@ -229,6 +229,49 @@ std::optional<std::vector<uint64_t>> match_message(
     return match_message(tree, schema, reader, *event, log);
 }
 
+// Count-only sibling of match_message() above - calls matching_engine::search_count() instead
+// of search(), so no std::vector<uint64_t> of matched ids is ever built. Precondition:
+// tree.supports_count() must be true (only pstree does today) - a caller violating this gets
+// matching_engine_error thrown from search_count()'s own base-class default, which this function
+// folds into its usual nullopt/"row failed" return, same as any other row-level failure -
+// see count_match_columnar_batch()'s own comment for why a caller-side gating bug here fails
+// safe rather than silently miscounting. Deliberately does NOT record RDTSC match-timing cycles
+// the way match_message() does (see match_timing.hpp) - folding a cheap count-only pass into the
+// same avg_match_us stat as a real search() would quietly change what that stat measures
+// specifically under the high-pressure conditions this path exists for; left as an explicit,
+// separate follow-up rather than done as a side effect of this change.
+template <typename Reader>
+std::optional<std::size_t> count_message(
+    const matching_engine& tree,
+    const attribute_schema& schema,
+    Reader& reader,
+    event_sink& event,
+    const std::shared_ptr<spdlog::logger>& log)
+{
+    if (!populate_event(event, schema, reader, log)) {
+        return std::nullopt;
+    }
+
+    try {
+        return tree.search_count(event);
+    } catch (const std::exception& e) {
+        if (log) log->warn("event_bridge: matching engine search_count failed: {}", e.what());
+        return std::nullopt;
+    }
+}
+
+// Convenience overload, mirrors match_message()'s own: makes its own one-shot event_sink.
+template <typename Reader>
+std::optional<std::size_t> count_message(
+    const matching_engine& tree,
+    const attribute_schema& schema,
+    Reader& reader,
+    const std::shared_ptr<spdlog::logger>& log)
+{
+    auto event = tree.make_event();
+    return count_message(tree, schema, reader, *event, log);
+}
+
 // Top-level entry: deserialize raw bytes according to format, then match.
 std::optional<std::vector<uint64_t>> deserialize_and_match(
     const matching_engine& tree,
@@ -297,5 +340,54 @@ std::optional<std::vector<row_match>> deserialize_and_match_columnar(
     std::span<const char> payload,
     const std::shared_ptr<spdlog::logger>& log,
     std::optional<binary_format> output_format = std::nullopt);
+
+// Aggregate result of a count-only pass over a columnar batch, via count_match_columnar_batch()
+// below - deliberately NOT a per-row vector (unlike row_match): nothing downstream needs per-row
+// granularity past this sum, since this path never retains ids or payloads. A count-only pass and
+// the eventual real pass, if one ever happens, are two SEPARATE walks over the same raw bytes -
+// there is no way to "keep" a count-pass's populated event_sink around for later reuse (a batch's
+// rows all share ONE reused event_sink, repopulated in place row by row - see
+// match_columnar_batch()'s own comment in event_bridge.cpp - so by the time row N+1 has been
+// counted, row N's populated data is already gone).
+struct columnar_count_estimate {
+    // Number of rows with search_count() > 0 - mirrors row_match's own "only non-empty rows get
+    // an entry" convention, and lets a caller (worker_pool.cpp) feed its own `matched` stat the
+    // same value it would have gotten from the real path.
+    std::size_t matched_row_count = 0;
+    // Sum, across matched rows, of search_count()'s own real (exact) per-row count.
+    std::size_t total_match_count = 0;
+    // sum over matched rows of (that row's search_count() * (avg_row_payload_bytes + 64)), the
+    // same formula/+64-per-frame-overhead constant worker_pool's own real estimated_bytes
+    // calculation already uses for the direct path - just fed by avg_row_payload_bytes
+    // (payload.size() / row_count, a uniform per-row average) instead of each row's own real,
+    // exact serialize_row() size, which neither zerialize::ColumnarRows<V> nor ArrowColumnarRows
+    // can report without actually re-encoding the row (verified by reading both in full) - the
+    // exact cost a count-only pass exists to avoid paying for a row that may never get
+    // published. This affects ONLY the ACCURACY of the byte-based backpressure ESTIMATE on the
+    // count-only path - "estimated_bytes" was already documented as an approximation before this
+    // struct existed (see worker_pool.cpp's own comment on its direct-path computation) - it
+    // never changes the backpressure decision LOGIC (identical comparison/atomics/thresholds on
+    // both paths), and it never changes what ultimately publishes: once a message is confirmed
+    // kept, its real ids/payloads always come from an unchanged, exact
+    // deserialize_and_match_columnar() call, never from this estimate.
+    std::size_t estimated_bytes = 0;
+};
+
+// Count-only sibling of deserialize_and_match_columnar() above: same format dispatch (including
+// the Arrow special case) and the same malformed/nullopt vs. well-formed contract, but calls
+// matching_engine::search_count() per row instead of search(), and never calls serialize_row() at
+// all - no OutProtocol/output_format needed here (unlike deserialize_and_match_columnar), since
+// this path never re-encodes a row. Precondition: tree.supports_count() must be true - a caller
+// (worker_pool.cpp) is expected to have already checked this (via the engine_type it knows it
+// configured) before calling; violating it surfaces as matching_engine_error from
+// search_count()'s own base-class default, caught here like any other row-match failure and
+// folded into the usual nullopt/"poison batch" return - a caller-side gating bug here fails safe
+// (the caller falls back to its own unchanged direct path) rather than silently miscounting.
+std::optional<columnar_count_estimate> count_match_columnar_batch(
+    const matching_engine& tree,
+    const attribute_schema& schema,
+    binary_format format,
+    std::span<const char> payload,
+    const std::shared_ptr<spdlog::logger>& log);
 
 } // namespace sidecar

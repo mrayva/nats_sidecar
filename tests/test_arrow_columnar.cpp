@@ -587,6 +587,39 @@ TEST(event_bridge_arrow, arrow_input_msgpack_output_matches_and_decodes) {
     EXPECT_EQ(row1["value"].asInt64(), 100);
 }
 
+// count_match_columnar_batch() parity against the real path, specifically for Arrow input - the
+// actual format the real-pipeline benchmark this whole feature was built for uses. Confirms the
+// count-only path's Arrow dispatch (count_match_columnar_batch()'s own `format == arrow` branch
+// in event_bridge.cpp) agrees with deserialize_and_match_columnar()'s Arrow branch, not just the
+// generic zerialize-format dispatch already covered in test_event_bridge.cpp.
+TEST(event_bridge_arrow, count_match_columnar_batch_arrow_input) {
+    std::vector<sidecar::attribute_def> defs = {{"value", sidecar::attribute_type::integer}};
+    sidecar::attribute_schema schema(defs);
+    sidecar::subscription_manager mgr(defs, "test.output", make_log(), sidecar::engine_type::pstree);
+    mgr.subscribe("value > 10", "client-1");
+    auto snap = mgr.acquire_tree();
+    ASSERT_TRUE(snap);
+    ASSERT_TRUE(snap->supports_count());
+
+    // Same row 0 (5, no match) / rows 1,2 (42, 100, match) shape as the msgpack-output test above.
+    auto stream = build_arrow_ipc_stream({"value"}, {int64_array({5, 42, 100})});
+
+    auto real = sidecar::deserialize_and_match_columnar(
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log(),
+        sidecar::binary_format::msgpack);
+    ASSERT_TRUE(real.has_value());
+
+    auto count = sidecar::count_match_columnar_batch(
+        *snap, schema, sidecar::binary_format::arrow, as_span(stream), make_log());
+    ASSERT_TRUE(count.has_value());
+
+    std::size_t real_total_matches = 0;
+    for (auto& rm : *real) real_total_matches += rm.matched_ids.size();
+
+    EXPECT_EQ(count->matched_row_count, real->size());
+    EXPECT_EQ(count->total_match_count, real_total_matches);
+}
+
 // Regression test for a real bug found via manual end-to-end testing (not hand-picked): a
 // MATCHED Arrow row containing a decimal column, republished to a non-arrow output_format, used
 // to throw "write_value: unsupported source type" from zerialize::write_value() (translate.hpp)

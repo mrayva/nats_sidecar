@@ -76,7 +76,7 @@ worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
                          nats_asio::iconnection_sptr conn,
                          std::shared_ptr<spdlog::logger> log)
     : m_ioc(ioc), m_format(cfg.format), m_output_format(cfg.output_format), m_schema(schema),
-      m_sub_mgr(sub_mgr), m_conn(std::move(conn)), m_log(std::move(log)),
+      m_sub_mgr(sub_mgr), m_conn(std::move(conn)), m_log(std::move(log)), m_engine(cfg.engine),
       m_thread_count(cfg.worker_threads > 0 ? cfg.worker_threads
                                             : std::thread::hardware_concurrency()),
       m_queue_max_messages(cfg.input_queue_max_messages),
@@ -182,6 +182,36 @@ void worker_pool::spawn_term(nats_asio::ijs_subscription_sptr js_sub, nats_asio:
         asio::detached);
 }
 
+bool worker_pool::try_reserve_publish_capacity(std::size_t estimated_bytes) {
+    const auto previous_inflight = m_publish_counters->publish_inflight.fetch_add(
+        1, std::memory_order_acq_rel);
+    const auto previous_inflight_bytes = m_publish_counters->publish_inflight_bytes.fetch_add(
+        estimated_bytes, std::memory_order_acq_rel);
+    if (previous_inflight >= m_publish_max_inflight ||
+        previous_inflight_bytes + estimated_bytes > m_publish_max_inflight_bytes) {
+        m_publish_counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
+        m_publish_counters->publish_inflight_bytes.fetch_sub(
+            estimated_bytes, std::memory_order_acq_rel);
+        return false;
+    }
+    return true;
+}
+
+void worker_pool::adjust_reserved_publish_bytes(std::size_t old_estimate, std::size_t new_estimate) {
+    if (new_estimate > old_estimate) {
+        m_publish_counters->publish_inflight_bytes.fetch_add(
+            new_estimate - old_estimate, std::memory_order_acq_rel);
+    } else if (new_estimate < old_estimate) {
+        m_publish_counters->publish_inflight_bytes.fetch_sub(
+            old_estimate - new_estimate, std::memory_order_acq_rel);
+    }
+}
+
+void worker_pool::release_reserved_publish_capacity(std::size_t estimated_bytes) {
+    m_publish_counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
+    m_publish_counters->publish_inflight_bytes.fetch_sub(estimated_bytes, std::memory_order_acq_rel);
+}
+
 std::size_t worker_pool::queue_depth() const {
     return m_queued_messages.load(std::memory_order_relaxed);
 }
@@ -258,6 +288,28 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         // entries row_matches holds.
         std::optional<std::vector<row_match>> row_matches;
 
+        // Backpressure-adaptive dispatch (columnar + pstree only - see m_engine's own comment):
+        // cheap, lock-free peek at CURRENT publish_inflight/publish_inflight_bytes, taken before
+        // acquiring the tree at all. This is a heuristic ("would the real gate likely reject
+        // something roughly this size right now"), not a commitment - the real, authoritative
+        // decision is still the identical fetch_add-based check in try_reserve_publish_capacity()
+        // below, on whichever path reaches it. When the peek says "probably fine" (the common
+        // case, and the ONLY case for a-tree/be-tree or row-mode), everything below behaves
+        // exactly as it did before this change - byte-for-byte the same code path.
+        const bool adaptive_eligible = qm.columnar && (m_engine == engine_type::pstree);
+        bool likely_under_pressure = false;
+        if (adaptive_eligible) {
+            auto peek_inflight = m_publish_counters->publish_inflight.load(std::memory_order_acquire);
+            auto peek_bytes = m_publish_counters->publish_inflight_bytes.load(std::memory_order_acquire);
+            likely_under_pressure = (peek_inflight >= m_publish_max_inflight) ||
+                                     (peek_bytes >= m_publish_max_inflight_bytes);
+        }
+
+        bool dropped_by_adaptive_gate = false;
+        bool already_reserved = false;
+        std::size_t reserved_bytes = 0;
+        std::size_t adaptive_matched_row_count = 0;
+
         {
             // Synchronous, lock-protected read access to the current live tree. tree_guard's
             // shared_lock must not survive past this block - never held across the
@@ -275,19 +327,76 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                 continue;
             }
 
-            if (qm.columnar) {
-                row_matches = deserialize_and_match_columnar(
-                    *tree_guard, m_schema, m_format, payload_span, m_log, m_output_format);
-            } else {
-                auto matches = deserialize_and_match(
+            if (adaptive_eligible && likely_under_pressure) {
+                // Count-only pass: get each row's match COUNT without ever materializing which
+                // ids matched - see event_bridge.hpp's count_match_columnar_batch() for why this
+                // is cheaper than the real match specifically for a message likely to be
+                // dropped anyway. Runs against the SAME tree_guard snapshot a real match would
+                // use below (no writer can intervene between this and a fallback real pass -
+                // both see identical frozen state), so a "kept" verdict here and the real
+                // match's own row count can never structurally disagree.
+                auto count_est = count_match_columnar_batch(
                     *tree_guard, m_schema, m_format, payload_span, m_log);
-                if (matches) {
-                    row_matches.emplace();
-                    if (!matches->empty()) {
-                        row_matches->push_back({std::move(*matches), std::move(qm.payload)});
+                if (count_est) {
+                    adaptive_matched_row_count = count_est->matched_row_count;
+                    if (!try_reserve_publish_capacity(count_est->estimated_bytes)) {
+                        // WIN: the real match (deserialize_and_match_columnar(), matchEvent()'s
+                        // own expensive push_back-heavy walk) never ran at all for this message.
+                        dropped_by_adaptive_gate = true;
+                    } else {
+                        // Misprediction: the peek looked like pressure, but this specific
+                        // message's own real estimate fits after all. Fall through to the real,
+                        // unchanged match below - already_reserved/reserved_bytes let the
+                        // backpressure block further down true up this provisional reservation
+                        // instead of reserving a second time.
+                        already_reserved = true;
+                        reserved_bytes = count_est->estimated_bytes;
+                        row_matches = deserialize_and_match_columnar(
+                            *tree_guard, m_schema, m_format, payload_span, m_log, m_output_format);
+                    }
+                }
+                // count_est == nullopt (malformed batch): row_matches stays nullopt, falls
+                // through to the direct path below exactly as if adaptive dispatch had never
+                // run - one shared malformed-input handler, not duplicated here.
+            }
+
+            if (!dropped_by_adaptive_gate && !already_reserved && !row_matches) {
+                // Direct path: byte-for-byte today's code, unconditionally reached whenever the
+                // adaptive branch above didn't run or didn't decide anything (not under
+                // pressure, wrong engine, row-mode, or its own count pass came back malformed).
+                if (qm.columnar) {
+                    row_matches = deserialize_and_match_columnar(
+                        *tree_guard, m_schema, m_format, payload_span, m_log, m_output_format);
+                } else {
+                    auto matches = deserialize_and_match(
+                        *tree_guard, m_schema, m_format, payload_span, m_log);
+                    if (matches) {
+                        row_matches.emplace();
+                        if (!matches->empty()) {
+                            row_matches->push_back({std::move(*matches), std::move(qm.payload)});
+                        }
                     }
                 }
             }
+        }
+
+        if (dropped_by_adaptive_gate) {
+            // Stat parity with the direct path below: m_processed increments unconditionally
+            // once this message has been dequeued and attempted (true here too - the count pass
+            // genuinely ran), regardless of what happens after; m_matched already increments on
+            // the direct path's own drop branch before ITS backpressure check runs (a message
+            // dropped by backpressure still counts as "matched" in stats) - the count-pass's
+            // exact matched_row_count (not the approximated estimated_bytes) preserves that same
+            // observable meaning here, specifically under the high-pressure conditions where
+            // this branch fires most. match_timing stays untouched here deliberately (see
+            // count_message()'s own comment in event_bridge.hpp for why folding a cheap
+            // count-only pass into avg_match_us would be misleading) - only a real search() call
+            // ever feeds that stat.
+            m_processed.fetch_add(1, std::memory_order_relaxed);
+            m_publish_tasks_dropped.fetch_add(1, std::memory_order_relaxed);
+            m_matched.fetch_add(adaptive_matched_row_count, std::memory_order_relaxed);
+            qm.payload.clear();
+            continue;
         }
 
         {
@@ -307,6 +416,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
             // this is a real, visible "permanently gave up" signal (shows
             // up in js_get_consumer_info's stats) rather than a silent drop.
             m_match_failures.fetch_add(1, std::memory_order_relaxed);
+            if (already_reserved) release_reserved_publish_capacity(reserved_bytes);
             if (qm.js_msg) spawn_term(qm.js_sub, std::move(*qm.js_msg));
             qm.payload.clear();
             continue;
@@ -317,6 +427,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
             // now. Otherwise every non-matching message (most real traffic,
             // for any given filter) would sit unacked until ack_wait and
             // redeliver forever for no reason.
+            if (already_reserved) release_reserved_publish_capacity(reserved_bytes);
             if (qm.js_msg) spawn_ack(qm.js_sub, std::move(*qm.js_msg));
             qm.payload.clear();
             continue;
@@ -348,15 +459,14 @@ void worker_pool::worker_loop(unsigned int worker_id) {
             estimated_bytes += rm.matched_ids.size() * (rm.payload.size() + 64);
         }
 
-        const auto previous_inflight = m_publish_counters->publish_inflight.fetch_add(
-            1, std::memory_order_acq_rel);
-        const auto previous_inflight_bytes = m_publish_counters->publish_inflight_bytes.fetch_add(
-            estimated_bytes, std::memory_order_acq_rel);
-        if (previous_inflight >= m_publish_max_inflight ||
-            previous_inflight_bytes + estimated_bytes > m_publish_max_inflight_bytes) {
-            m_publish_counters->publish_inflight.fetch_sub(1, std::memory_order_acq_rel);
-            m_publish_counters->publish_inflight_bytes.fetch_sub(
-                estimated_bytes, std::memory_order_acq_rel);
+        if (already_reserved) {
+            // True-up the count-pass's provisional reservation to the real value - NOT a second
+            // independent reservation (see adjust_reserved_publish_bytes()'s own comment for why
+            // that would double-reserve/leak). publish_inflight's own task-slot reservation
+            // already happened exactly once, above, in try_reserve_publish_capacity().
+            adjust_reserved_publish_bytes(reserved_bytes, estimated_bytes);
+            reserved_bytes = estimated_bytes;
+        } else if (!try_reserve_publish_capacity(estimated_bytes)) {
             m_publish_tasks_dropped.fetch_add(1, std::memory_order_relaxed);
             // Backpressure at the inflight-publish-task/byte limit: leave
             // any js_msg unacked (do not ack, do not term) so ack_wait
@@ -365,6 +475,8 @@ void worker_pool::worker_loop(unsigned int worker_id) {
             // mode had no equivalent of.
             qm.payload.clear();
             continue;
+        } else {
+            reserved_bytes = estimated_bytes;
         }
 
         // Capture what we need for the publish coroutine. counters is a
@@ -413,7 +525,12 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         auto counters = m_publish_counters;
         auto backpressure_timeout = m_publish_backpressure_timeout;
         auto chunk_bytes = m_publish_chunk_bytes;
-        auto reserved_bytes = estimated_bytes;
+        // reserved_bytes already holds the right value here - set above, either directly (the
+        // direct/non-adaptive path) or trued-up from the count-pass's provisional estimate (the
+        // adaptive "kept" path) - see this function's own comment there for why a second
+        // assignment from estimated_bytes here would be wrong on the adaptive path specifically
+        // (estimated_bytes and reserved_bytes are identical by construction in both cases, but
+        // reserved_bytes is the one that actually reflects what was reserved against the atomics).
         auto js_sub = qm.js_sub;
         auto js_msg = std::move(qm.js_msg);
 

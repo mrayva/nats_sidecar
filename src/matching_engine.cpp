@@ -784,6 +784,53 @@ public:
     // nothing this flag would unlock that reset() doesn't already give a caller regardless.
     bool reuses_events() const override { return true; }
 
+    bool supports_count() const override { return true; }
+
+    // Count-only sibling of search() above - same two shapes (direct-id fast path / OR-clause
+    // translation+dedup slow path), but never builds a std::vector<uint64_t> on either one. This
+    // is the entire point of the exercise: PSTDynamic::matchEvent()'s own push_back() into its
+    // result vector is the dominant real cost this whole feature exists to let a caller skip
+    // (see event_bridge.hpp's count_match_columnar_batch() for why) - calling matchEvent()/
+    // search() here and just counting the result would silently reintroduce exactly that cost.
+    std::size_t search_count(event_sink& event) const override {
+        auto& sink = static_cast<pstree_event_sink&>(event);
+        try {
+            if (!m_hasSyntheticClauses) {
+                // Fast path, mirrors search()'s own: no OR'd subscription has ever been
+                // inserted, so every id PSTDynamic would emit is already a real, undeduped
+                // subscription id - matchEventCount() alone is already the final count.
+                std::size_t count = m_pstd.matchEventCount(sink.native());
+                sink.reset();
+                return count;
+            }
+            // Slow (OR-clause) path: replicates search()'s own m_clause_to_sub translation +
+            // seen-set dedup, but incrementally via matchEventEach() - NOT by calling
+            // matchEvent()/search() and counting the result (see this method's own comment
+            // above for why that would defeat the purpose). `seen_count` is its own,
+            // separately-named thread_local (not shared with search()'s own `seen`, even
+            // though nothing in today's call pattern ever nests the two on one thread) - same
+            // thread_local-not-a-member discipline search()'s own `seen` already established,
+            // for the identical real-data-race reason documented on that field.
+            static thread_local std::unordered_set<uint64_t> seen_count;
+            seen_count.clear();
+            std::size_t count = 0;
+            m_pstd.matchEventEach(sink.native(), [&](std::uint64_t clauseId) {
+                if ((clauseId & kSyntheticIdBit) == 0) {
+                    ++count;
+                    return;
+                }
+                auto it = m_clause_to_sub.find(clauseId);
+                uint64_t subId = (it != m_clause_to_sub.end()) ? it->second : clauseId;
+                if (seen_count.insert(subId).second) ++count;
+            });
+            sink.reset();
+            return count;
+        } catch (const std::exception& e) {
+            sink.reset();
+            throw matching_engine_error(e.what());
+        }
+    }
+
 private:
     // Declaration order matters here: members initialize in this order, and m_parsing_tree's
     // own initializer (below) passes m_unused_indices by reference into build_betree() - it

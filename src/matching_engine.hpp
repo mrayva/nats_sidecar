@@ -147,6 +147,27 @@ public:
     // be-tree C API this codebase doesn't have yet - a separate, riskier
     // lever, not attempted here. Defaults false for any other engine.
     virtual bool reuses_events() const { return false; }
+
+    // Whether search_count() below is really implemented for this engine (not the base-class
+    // default, which throws). Checked once by worker_pool.cpp (via the engine_type it already
+    // knows it configured) before ever calling search_count() - see that method's own comment
+    // for why the default throws rather than returning 0: a caller-side gating bug (calling
+    // search_count() against an engine that doesn't support it) must fail loudly, not be
+    // silently indistinguishable from "genuinely zero matches". Defaults false for every engine
+    // but pstree.
+    virtual bool supports_count() const { return false; }
+
+    // Counts matches for `event` without materializing which ids matched - a cheaper
+    // alternative to search() for a caller that only needs the COUNT right now (e.g. to decide
+    // whether a message is even going to survive backpressure before paying for the real
+    // match - see event_bridge.hpp's count_match_columnar_batch() for the actual caller and
+    // worker_pool.cpp's adaptive dispatch for why this exists at all). Only ever called after
+    // supports_count() has been confirmed true for this engine; the base-class default throws
+    // rather than silently returning 0, matching this file's existing convention for
+    // "unsupported by this engine" (see event_sink::with_string_list()/with_integer_list()).
+    virtual std::size_t search_count(event_sink& /*event*/) const {
+        throw matching_engine_error("search_count() not supported by this engine");
+    }
 };
 
 // Builds a fresh matching_engine for the given engine type and attribute
