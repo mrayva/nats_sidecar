@@ -2677,6 +2677,27 @@ attempts: fixing *what kind of operation* was redundant (many small appends inst
 composed write) paid off; fixing *which algorithm* computed an individual value did not - a useful
 data point for the next hot-symbol chase on this codebase.
 
+**The `matchEvent()` vector-reserve lead paid off too.** Restructured into two passes over the
+same tree walk (`matchPoint()` itself is not repeated - doubling that real tree traversal would
+cost more than the `push_back()`s it saves): a first pass collects every candidate group pointer
+plus a running upper bound on the total candidate count (`ids.size()`, already known per group, no
+extra work), then the result vector is `reserve()`'d to that bound before the real per-candidate
+check runs, so it never reallocates mid-scan (pstree@3093b3f, pin bumped here). Verified: pstree's
+own full suite green (plain, ASan+UBSan, and a manual ThreadSanitizer run of its concurrent stress
+test), `sidecar_test` green under all three configs against the bumped pin, output unchanged
+(candidateGroups preserves original iteration order).
+
+Benchmarked the same way as the two reverted `to_string` attempts, at three selectivity points
+instead of one this time, since a fix that only pays off at an extreme, unrealistic selectivity
+wouldn't be worth much on its own: **8/8** pairs at `s`=1/K=8000 (near-total overlap) mean **-9.1%**
+fewer cycles, `s`=20 (the high end of this project's own realistic 1/20-1/100 selectivity range)
+mean **-3.9%** (3/4 pairs favorable, noisier), and `s`=100 (the low end of that range) essentially a
+wash at **-0.3%** (2/4 favorable, 2/4 not - within noise). A real, fan-out-scaling win: substantial
+at extreme overlap, a real but smaller win across the realistic range, never a clear loss anywhere
+tested. Unlike the two `to_string` attempts, this is the first of the three "obvious hot symbol"
+leads from this investigation that held up as a genuine win under the same rigor that sank the
+other two.
+
 ## License
 
 See LICENSE file.
