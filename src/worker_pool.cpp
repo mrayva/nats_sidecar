@@ -1,5 +1,6 @@
 #include "worker_pool.hpp"
 #include <asio/co_spawn.hpp>
+#include <fmt/compile.h>
 #include <fmt/format.h>
 #include <asio/detached.hpp>
 #include <asio/redirect_error.hpp>
@@ -14,7 +15,7 @@ namespace sidecar {
 namespace {
 void append_pub_frame(std::string& wire, const std::string& subject,
                       std::span<const char> payload) {
-    fmt::format_to(std::back_inserter(wire), "PUB {} {}\r\n", subject, payload.size());
+    fmt::format_to(std::back_inserter(wire), FMT_COMPILE("PUB {} {}\r\n"), subject, payload.size());
     wire.append(payload.data(), payload.size());
     wire += "\r\n";
 }

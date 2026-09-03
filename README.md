@@ -2698,6 +2698,27 @@ tested. Unlike the two `to_string` attempts, this is the first of the three "obv
 leads from this investigation that held up as a genuine win under the same rigor that sank the
 other two.
 
+**A follow-up profile after both real fixes landed found `fmt`'s own machinery as the new
+second-biggest cost.** With `memmove`/`to_string` gone and `matchEvent` reserve()'d, a fresh `perf`
+profile at `s`=1/K=8000 (now 90,543 rows/s, up from the original 81,593) showed `matchEvent` at
+41.3% and `fmt::detail::parse_format_string` + `copy_noinline` + `container_buffer::grow` +
+`vformat_to` together at **~40%** - `fmt`'s own runtime format-string parsing and buffer-growth
+machinery, replacing the eliminated costs almost proportionally. `parse_format_string` alone
+(18.5%) suggested the literal `"PUB {} {}\r\n"`/`"{}.{}"` format strings were being re-parsed at
+runtime on every call rather than at compile time.
+
+Wrapping both format strings in `FMT_COMPILE(...)` (`<fmt/compile.h>`, already available - fmt
+12.2.0 here) parses and checks them once at compile time instead. Full `sidecar_test` suite green
+(plain/ASan+UBSan/ThreadSanitizer), byte-identical output. Measured impact was real but far more
+modest than the symbol's raw 18.5% share suggested: **11/12** interleaved `perf stat -e cycles:u`
+pairs across `s`=1 and `s`=20 favored `FMT_COMPILE` (mean -1.9% and -1.3% respectively) - a small,
+consistent win, not the double-digit reduction a naive read of the flat profile would predict
+(some of that 18.5% was very likely inlined formatting/copy work misattributed to
+`parse_format_string`'s own debug-info symbol, a known hazard of reading `perf`'s flat percentages
+too literally on heavily-templated, aggressively-inlined library code). `container_buffer::grow`
+itself (6%) is untouched by this change - it's a buffer-growth cost, not a parsing one - and
+remains an open, not-yet-tried lead if `fmt`'s own hot path gets revisited again.
+
 ## License
 
 See LICENSE file.
