@@ -11,7 +11,7 @@ namespace sidecar {
 sidecar_engine::sidecar_engine(asio::io_context& ioc, const config& cfg,
                                std::shared_ptr<spdlog::logger> log)
     : m_ioc(ioc), m_cfg(cfg), m_log(std::move(log)),
-      m_sub_mgr(cfg.attributes, cfg.output_prefix, m_log, cfg.engine),
+      m_sub_mgr(cfg.attributes, cfg.output_prefix, m_log, cfg.engine, cfg.output_updates_prefix),
       m_schema(cfg.attributes)
 {}
 
@@ -56,6 +56,17 @@ asio::awaitable<void> sidecar_engine::start(nats_asio::iconnection_sptr conn) {
         if (!co_await ensure_input_stream(c)) {
             m_log->error("Failed to provision input stream '{}' (connection '{}'); "
                         "refusing unsafe startup", c.stream, c.name);
+            m_ioc.stop();
+            co_return;
+        }
+    }
+
+    // Durable JetStream output (opt-in - see config::output_stream_enabled's own comment). Any
+    // deployment that doesn't set this issues zero new NATS traffic here.
+    if (m_cfg.output_stream_enabled) {
+        if (!co_await ensure_output_stream()) {
+            m_log->error("Failed to provision output stream '{}'; refusing unsafe startup",
+                        m_cfg.output_stream_name);
             m_ioc.stop();
             co_return;
         }
@@ -385,6 +396,123 @@ asio::awaitable<bool> sidecar_engine::create_input_stream(
     co_return true;
 }
 
+asio::awaitable<bool> sidecar_engine::ensure_output_stream() {
+    constexpr auto timeout = std::chrono::seconds(5);
+
+    const std::string info_subject = "$JS.API.STREAM.INFO." + m_cfg.output_stream_name;
+    const std::string empty_payload = "{}";
+    auto [info_reply, info_status] = co_await m_conn->request(
+        info_subject,
+        std::span<const char>(empty_payload.data(), empty_payload.size()),
+        timeout);
+
+    if (info_status.failed()) {
+        m_log->error("Failed to inspect output stream '{}': {}",
+                     m_cfg.output_stream_name, info_status.error());
+        co_return false;
+    }
+
+    nlohmann::json info;
+    bool missing = false;
+    try {
+        info = nlohmann::json::parse(
+            std::string_view(info_reply.payload.data(), info_reply.payload.size()));
+        missing = info.contains("error") && info["error"].value("code", 0) == 404;
+    } catch (const std::exception& e) {
+        m_log->error("Invalid output stream info response: {}", e.what());
+        co_return false;
+    }
+
+    if (!missing) co_return validate_existing_output_stream(info);
+    co_return co_await create_output_stream(timeout);
+}
+
+bool sidecar_engine::validate_existing_output_stream(const nlohmann::json& info) const {
+    if (info.contains("error") || !info.contains("config")) {
+        auto description = info.contains("error")
+            ? info["error"].value("description", "stream info failed")
+            : std::string("missing stream config");
+        m_log->error("Failed to inspect output stream '{}': {}",
+                     m_cfg.output_stream_name, description);
+        return false;
+    }
+
+    const auto& stream_cfg = info["config"];
+    const auto retention = stream_cfg.value("retention", std::string{});
+    const auto subjects = stream_cfg.value("subjects", std::vector<std::string>{});
+    const std::string expected_subject = m_cfg.output_updates_prefix + ".>";
+
+    // "limits" retention, NOT "workqueue" - deliberately different from the input stream. The
+    // output stream has an unbounded number of independent per-client durable consumers, each
+    // replaying the same messages on its own schedule; "workqueue" retention deletes a message
+    // once ANY one consumer acks it, which would silently break catch-up for every other client
+    // still behind. "limits" (age/byte-bound, ack-independent) is the only correct choice here -
+    // see config::output_stream_max_age_seconds/output_stream_max_bytes's own comments.
+    if (retention != "limits") {
+        m_log->error(
+            "Output stream '{}' has retention='{}', expected 'limits' - refusing to use a "
+            "stream that would delete messages on ack (breaking catch-up for other consumers)",
+            m_cfg.output_stream_name, retention);
+        return false;
+    }
+
+    if (std::find(subjects.begin(), subjects.end(), expected_subject) == subjects.end()) {
+        m_log->error(
+            "Output stream '{}' does not capture expected subject '{}' (stream subjects: {})",
+            m_cfg.output_stream_name, expected_subject,
+            subjects.empty() ? "<none>" : subjects.front());
+        return false;
+    }
+
+    m_log->info("Validated JetStream output stream '{}' (subject '{}', retention=limits)",
+               m_cfg.output_stream_name, expected_subject);
+    return true;
+}
+
+asio::awaitable<bool> sidecar_engine::create_output_stream(std::chrono::milliseconds timeout) {
+    nlohmann::json stream_config = {
+        {"name", m_cfg.output_stream_name},
+        {"subjects", std::vector<std::string>{m_cfg.output_updates_prefix + ".>"}},
+        {"retention", "limits"},
+        {"storage", m_cfg.output_stream_storage},
+        {"max_msgs", -1},
+        {"max_bytes", static_cast<int64_t>(m_cfg.output_stream_max_bytes)},
+        {"max_age", static_cast<int64_t>(m_cfg.output_stream_max_age_seconds) * 1'000'000'000LL},
+        {"max_msg_size", -1},
+        {"discard", "old"},
+        {"num_replicas", 1}
+    };
+    std::string payload_str = stream_config.dump();
+    auto [create_reply, create_status] = co_await m_conn->request(
+        "$JS.API.STREAM.CREATE." + m_cfg.output_stream_name,
+        std::span<const char>(payload_str.data(), payload_str.size()), timeout);
+    if (create_status.failed()) {
+        m_log->error("Failed to create output stream '{}': {}",
+                     m_cfg.output_stream_name, create_status.error());
+        co_return false;
+    }
+
+    try {
+        auto response = nlohmann::json::parse(
+            std::string_view(create_reply.payload.data(), create_reply.payload.size()));
+        if (response.contains("error")) {
+            m_log->error("Failed to create output stream '{}': {}",
+                        m_cfg.output_stream_name,
+                        response["error"].value("description", "unknown error"));
+            co_return false;
+        }
+    } catch (const std::exception& e) {
+        m_log->error("Invalid output stream creation response: {}", e.what());
+        co_return false;
+    }
+
+    m_log->info("Created JetStream output stream '{}' (subject '{}.>' , retention=limits, "
+               "max_age={}s, max_bytes={})",
+               m_cfg.output_stream_name, m_cfg.output_updates_prefix,
+               m_cfg.output_stream_max_age_seconds, m_cfg.output_stream_max_bytes);
+    co_return true;
+}
+
 asio::awaitable<nats_asio::ijs_subscription_sptr> sidecar_engine::subscribe_to_inputs_jetstream(
     input_connection conn) {
     nats_asio::js_consumer_config js_cfg;
@@ -543,6 +671,22 @@ asio::awaitable<void> sidecar_engine::on_subscribe_request(
             {"lease_key", lease_key},
             {"lease_ttl_seconds", m_cfg.lease_ttl_seconds}
         };
+        // Durable JetStream output (opt-in - see config::output_stream_enabled's own comment).
+        // updates_topic is where matches sourced from a `mode: js` input connection get
+        // published (see worker_pool.cpp's routing logic) - flush-sourced matches keep going to
+        // `topic` above regardless. output_stream_durable_name is a hash of lease_key, NOT
+        // lease_key itself: lease_key's "<id>.<client_id>" shape is safe as a KV key (dots are
+        // fine there) but NOT as a JetStream consumer name (must be a single subject token, no
+        // '.') - found by the end-to-end verification for this feature actually trying to create
+        // one, not assumed safe. subscription_registry::registry_key() already exists for exactly
+        // this "turn an arbitrary string into a NATS-name-safe token" need (originally built for
+        // expression hashing) - reused here rather than inventing a second hashing scheme. Still
+        // deterministic and reconnect-stable, since it's a pure function of lease_key.
+        if (m_cfg.output_stream_enabled) {
+            reply["updates_topic"] = m_cfg.output_updates_prefix + "." + std::to_string(sub_id);
+            reply["output_stream"] = m_cfg.output_stream_name;
+            reply["output_stream_durable_name"] = subscription_registry::registry_key(lease_key);
+        }
         reply_str = reply.dump();
 
     } catch (const matching_engine_error& e) {

@@ -77,6 +77,17 @@ sidecar::config jetstream_config() {
     return cfg;
 }
 
+sidecar::config output_stream_config() {
+    sidecar::config cfg = sample_config();
+    cfg.output_stream_enabled = true;
+    cfg.output_updates_prefix = "sensor.filtered.updates";
+    cfg.output_stream_name = "sensor-output";
+    cfg.output_stream_storage = "file";
+    cfg.output_stream_max_age_seconds = 3600;
+    cfg.output_stream_max_bytes = 1024 * 1024;
+    return cfg;
+}
+
 } // namespace
 
 namespace sidecar {
@@ -155,6 +166,10 @@ struct sidecar_engine_test_access {
 
     static asio::awaitable<bool> ensure_input_stream(sidecar::sidecar_engine& engine) {
         return ensure_input_stream(engine, only_connection(engine));
+    }
+
+    static asio::awaitable<bool> ensure_output_stream(sidecar::sidecar_engine& engine) {
+        return engine.ensure_output_stream();
     }
 
     // Returns the new js_sub directly (rather than pushing into
@@ -420,6 +435,42 @@ TEST(sidecar_engine, on_subscribe_request_valid_returns_subscription_details) {
     EXPECT_EQ(reply.at("lease_key").get<std::string>(), "1.client-1");
     EXPECT_EQ(reply.at("lease_ttl_seconds").get<uint32_t>(), 60u);
     EXPECT_EQ(sidecar::sidecar_engine_test_access::sub_mgr(engine).active_count(), 1u);
+}
+
+// Durable JetStream output (config::output_stream_enabled) - additive to the response above,
+// never a replacement for it. Disabled-by-default is covered by the test just above this one
+// (sample_config() leaves output_stream_enabled false, and its assertions never look for these
+// fields) - this test is the enabled-path counterpart.
+TEST(sidecar_engine, on_subscribe_request_includes_updates_topic_when_output_stream_enabled) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, output_stream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    std::string captured_reply;
+    conn->on_publish = [&](std::string_view,
+                           std::span<const char> payload) -> asio::awaitable<nats_asio::status> {
+        captured_reply.assign(payload.data(), payload.size());
+        co_return nats_asio::status{};
+    };
+
+    auto payload = json_payload({{"expression", "temperature > 30.0"}, {"client_id", "client-1"}});
+    ASSERT_TRUE(run_void_to_completion(
+        ioc, sidecar::sidecar_engine_test_access::on_subscribe_request(
+                 engine, std::string("_INBOX.reply"), std::move(payload))));
+
+    auto reply = nlohmann::json::parse(captured_reply);
+    EXPECT_EQ(reply.at("topic").get<std::string>(), "sensor.filtered.1");
+    EXPECT_EQ(reply.at("updates_topic").get<std::string>(), "sensor.filtered.updates.1");
+    EXPECT_EQ(reply.at("output_stream").get<std::string>(), "sensor-output");
+    // NOT lease_key verbatim - "1.client-1" is a valid KV key but not a valid JetStream consumer
+    // name (must be a single subject token, no '.') - see sidecar.cpp's own comment for how this
+    // was actually found (the end-to-end verification script tried to create a real consumer with
+    // it and it silently failed). Deterministic hash instead, reusing subscription_registry's own
+    // "turn an arbitrary string into a NATS-name-safe token" utility.
+    EXPECT_EQ(reply.at("output_stream_durable_name").get<std::string>(),
+             sidecar::subscription_registry::registry_key(reply.at("lease_key").get<std::string>()));
+    EXPECT_EQ(reply.at("output_stream_durable_name").get<std::string>().find('.'), std::string::npos);
 }
 
 // Direct successor of test_subscription_manager.cpp's now-removed
@@ -1096,6 +1147,99 @@ TEST(sidecar_engine, ensure_input_stream_refuses_stream_missing_configured_subje
 
     EXPECT_FALSE(run_to_completion<bool>(
         ioc, sidecar::sidecar_engine_test_access::ensure_input_stream(engine)));
+}
+
+// --- Durable JetStream output: ensure_output_stream() ---
+
+TEST(sidecar_engine, ensure_output_stream_creates_stream_when_missing) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, output_stream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.sensor-output") {
+            co_return std::pair{json_message({{"error", {{"code", 404}}}}), nats_asio::status{}};
+        }
+        if (subject == "$JS.API.STREAM.CREATE.sensor-output") {
+            co_return std::pair{json_message(nlohmann::json::object()), nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_TRUE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_output_stream(engine)));
+}
+
+TEST(sidecar_engine, ensure_output_stream_accepts_existing_stream_with_matching_config) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, output_stream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.sensor-output") {
+            co_return std::pair{
+                json_message({{"config", {{"retention", "limits"},
+                                          {"subjects", {"sensor.filtered.updates.>"}}}}}),
+                nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_TRUE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_output_stream(engine)));
+}
+
+TEST(sidecar_engine, ensure_output_stream_refuses_workqueue_retention) {
+    // The output stream deliberately uses "limits" retention, NOT "workqueue" like the input
+    // stream - an unbounded number of independent per-client durable consumers each replay the
+    // same messages on their own schedule, and workqueue retention deletes a message once ANY
+    // one of them acks it, which would silently break catch-up for every other client still
+    // behind. This is the one dimension the output stream must get right that the input stream
+    // doesn't need to check (that one wants exactly workqueue - see
+    // ensure_input_stream_refuses_mismatched_retention above, the inverse check).
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, output_stream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.sensor-output") {
+            co_return std::pair{
+                json_message({{"config", {{"retention", "workqueue"},
+                                          {"subjects", {"sensor.filtered.updates.>"}}}}}),
+                nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_FALSE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_output_stream(engine)));
+}
+
+TEST(sidecar_engine, ensure_output_stream_refuses_stream_missing_configured_subject) {
+    asio::io_context ioc(1);
+    sidecar::sidecar_engine engine(ioc, output_stream_config(), make_log());
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    sidecar::sidecar_engine_test_access::inject_dependencies(engine, conn);
+
+    conn->on_request = [](std::string_view subject, std::span<const char>, std::chrono::milliseconds)
+        -> asio::awaitable<std::pair<nats_asio::message, nats_asio::status>> {
+        if (subject == "$JS.API.STREAM.INFO.sensor-output") {
+            co_return std::pair{
+                json_message({{"config", {{"retention", "limits"},
+                                          {"subjects", {"some.other.subject.>"}}}}}),
+                nats_asio::status{}};
+        }
+        co_return std::pair{nats_asio::message{}, nats_asio::status(nats_asio::error_code::not_found)};
+    };
+
+    EXPECT_FALSE(run_to_completion<bool>(
+        ioc, sidecar::sidecar_engine_test_access::ensure_output_stream(engine)));
 }
 
 // --- JetStream-consumer mode: subscribe_to_inputs_jetstream() ---

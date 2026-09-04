@@ -64,6 +64,12 @@ cxxopts::Options build_cli_options() {
         ("publish-backpressure-timeout-ms", "NATS publish backpressure timeout", cxxopts::value<uint32_t>())
         ("publish-chunk-bytes", "Max bytes buffered before flushing a partial publish write", cxxopts::value<std::size_t>())
         ("publish-max-inflight-bytes", "Max aggregate bytes reserved across all in-flight publish tasks", cxxopts::value<std::size_t>())
+        ("output-stream-enabled", "Enable durable JetStream output for js-mode-input-sourced matches", cxxopts::value<bool>())
+        ("output-updates-prefix", "Subject prefix for the durable/updates output channel (default: <output-prefix>.updates)", cxxopts::value<std::string>())
+        ("output-stream-name", "JetStream stream name backing the durable output channel", cxxopts::value<std::string>())
+        ("output-stream-storage", "Durable output stream storage (file|memory)", cxxopts::value<std::string>())
+        ("output-stream-max-age", "Durable output stream max age in seconds", cxxopts::value<uint32_t>())
+        ("output-stream-max-bytes", "Durable output stream max bytes", cxxopts::value<uint64_t>())
         ("tls-cert", "TLS certificate path", cxxopts::value<std::string>())
         ("tls-key", "TLS key path", cxxopts::value<std::string>())
         ("tls-ca", "TLS CA certificate path", cxxopts::value<std::string>())
@@ -127,6 +133,12 @@ std::optional<std::string> apply_cli_overrides(config& cfg, const cxxopts::Parse
     if (result.count("publish-backpressure-timeout-ms")) cfg.publish_backpressure_timeout_ms = result["publish-backpressure-timeout-ms"].as<uint32_t>();
     if (result.count("publish-chunk-bytes")) cfg.publish_chunk_bytes = result["publish-chunk-bytes"].as<std::size_t>();
     if (result.count("publish-max-inflight-bytes")) cfg.publish_max_inflight_bytes = result["publish-max-inflight-bytes"].as<std::size_t>();
+    if (result.count("output-stream-enabled")) cfg.output_stream_enabled = result["output-stream-enabled"].as<bool>();
+    if (result.count("output-updates-prefix")) cfg.output_updates_prefix = result["output-updates-prefix"].as<std::string>();
+    if (result.count("output-stream-name"))    cfg.output_stream_name = result["output-stream-name"].as<std::string>();
+    if (result.count("output-stream-storage")) cfg.output_stream_storage = result["output-stream-storage"].as<std::string>();
+    if (result.count("output-stream-max-age")) cfg.output_stream_max_age_seconds = result["output-stream-max-age"].as<uint32_t>();
+    if (result.count("output-stream-max-bytes")) cfg.output_stream_max_bytes = result["output-stream-max-bytes"].as<uint64_t>();
     if (result.count("tls-cert"))             cfg.tls_cert = result["tls-cert"].as<std::string>();
     if (result.count("tls-key"))              cfg.tls_key = result["tls-key"].as<std::string>();
     if (result.count("tls-ca"))               cfg.tls_ca = result["tls-ca"].as<std::string>();
@@ -229,6 +241,13 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
             "(got {} input subjects: {}) - there is no unambiguous default to pick among them",
             total_subjects, fmt::join(all_subjects, ", "));
     }
+    // Default output_updates_prefix from the now-resolved output_prefix - same "compute once at
+    // startup, never re-derived" treatment output_prefix itself gets above. Harmless to compute
+    // even when output_stream_enabled is false (config.hpp's own comment: only read when true).
+    if (cfg.output_updates_prefix.empty()) {
+        cfg.output_updates_prefix = cfg.output_prefix + ".updates";
+    }
+
     if (cfg.attributes.empty()) {
         return "At least one attribute is required (via config file or --attr)";
     }
@@ -257,6 +276,11 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
         cfg.publish_backpressure_timeout_ms == 0 || cfg.publish_chunk_bytes == 0 ||
         cfg.publish_max_inflight_bytes == 0) {
         return "Lease TTL and all queue/publication limits must be greater than zero";
+    }
+    if (cfg.output_stream_enabled &&
+        (cfg.output_stream_max_age_seconds == 0 || cfg.output_stream_max_bytes == 0)) {
+        return "output_stream_max_age_seconds and output_stream_max_bytes must be greater than "
+               "zero when output_stream_enabled is true";
     }
 
     // Per-connection JetStream durable-consumer validation:

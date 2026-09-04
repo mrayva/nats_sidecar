@@ -25,6 +25,31 @@ engine: atree             # atree | betree
 # Output: matched messages published to <output_prefix>.<BE-ID>
 output_prefix: "sensor.filtered"
 
+# Durable JetStream output (opt-in, off by default - zero behavior change and zero new NATS/
+# JetStream traffic unless enabled). Real use case: one deployment runs BOTH a `mode: core`
+# input connection (periodic full-table "flush" republishes, already tolerant of at-most-once
+# since the whole table resends soon) and a `mode: js` input connection (genuinely incremental
+# updates that must not be lost) - see "Multiple input connections" below. With this enabled, a
+# matched row sourced from the js-mode connection routes to a SEPARATE, durable subject instead
+# of the always-on core/flush subject above, so clients can create their own durable JetStream
+# consumer to catch up on missed updates, while flush-sourced matches keep going out exactly as
+# before regardless. A deployment using `mode: js` input purely for ingestion durability -
+# unrelated to this feature - is unaffected unless it also opts in here.
+# output_stream_enabled: true
+# output_updates_prefix: "sensor.filtered.updates"  # default: "<output_prefix>.updates" if unset
+# output_stream_name: "sidecar-output"
+# output_stream_storage: "file"          # "file" (real durability) | "memory" (isolation testing only)
+# output_stream_max_age_seconds: 3600    # bounded catch-up window
+# output_stream_max_bytes: 1073741824    # hard cap alongside the age limit (1GiB)
+#
+# Deliberately "limits" retention (age/byte-bound, ack-independent), not "workqueue" like the
+# input stream: an unbounded number of independent per-client durable consumers each replay the
+# same messages on their own schedule, and workqueue retention deletes a message once ANY one of
+# them acks it - which would silently break catch-up for every other client still behind. See
+# README.md's "Durable JetStream output" section for the full design and a real bug this exact
+# design decision was checked against empirically (a naive durable-consumer-name choice that
+# looked fine on paper but wasn't a valid JetStream name at all).
+
 # Subscription management endpoints
 subscribe_subject: "sidecar.subscribe"
 unsubscribe_subject: "sidecar.unsubscribe"

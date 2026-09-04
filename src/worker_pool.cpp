@@ -84,7 +84,8 @@ worker_pool::worker_pool(asio::io_context& ioc, const config& cfg,
       m_publish_max_inflight(cfg.publish_max_inflight),
       m_publish_backpressure_timeout(cfg.publish_backpressure_timeout_ms),
       m_publish_chunk_bytes(cfg.publish_chunk_bytes),
-      m_publish_max_inflight_bytes(cfg.publish_max_inflight_bytes)
+      m_publish_max_inflight_bytes(cfg.publish_max_inflight_bytes),
+      m_output_stream_enabled(cfg.output_stream_enabled)
 {
     if (m_thread_count == 0) m_thread_count = 1;
 }
@@ -496,6 +497,14 @@ void worker_pool::worker_loop(unsigned int worker_id) {
         // to just the ids this message actually matched (typically small), not every active
         // subscription - unlike the old tree_snapshot::output_subjects map, which was rebuilt in
         // full on every single subscribe/unsubscribe.
+        // Source-routed output: a row arriving via a js-mode input connection
+        // (qm.js_msg set - see queued_message's own comment and the two enqueue() overloads,
+        // worker_pool.cpp's own core-vs-js split) routes to the durable/updates channel instead
+        // of the always-on core/flush channel, but ONLY when output_stream_enabled is true - a
+        // deployment using js-mode input purely for ingestion durability (unrelated to this
+        // feature) sees every row published exactly as before. One message's rows share one
+        // source, so this is a single branch per message, not per-subscription work.
+        const bool via_updates = m_output_stream_enabled && qm.js_msg.has_value();
         std::unordered_map<uint64_t, std::string> output_subjects;
         ++dedup_current_generation;
         for (const auto& rm : *row_matches) {
@@ -507,7 +516,7 @@ void worker_pool::worker_loop(unsigned int worker_id) {
                 } else if (output_subjects.count(sub_id)) {
                     continue;
                 }
-                if (auto subj = m_sub_mgr.output_subject(sub_id)) {
+                if (auto subj = m_sub_mgr.output_subject(sub_id, via_updates)) {
                     output_subjects.emplace(sub_id, std::move(*subj));
                 }
             }

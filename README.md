@@ -707,6 +707,78 @@ why, rather than assume:
 guarantees; use the durable-consumer flags when losing data is unacceptable and ~2.6-2.9x lower
 throughput is an acceptable price for a real, verified loss-proof mode.
 
+## Durable JetStream output: source-routed catch-up delivery for subscribing clients
+
+The section above is about *input* durability - the sidecar not losing a message on the way in.
+This one is about *output* durability - a subscribing client not missing a match because it was
+offline, opt-in via `output_stream_enabled` (default off, zero behavior change either way).
+
+**The real scenario this targets**: a deployment runs both a `mode: core` input connection
+(periodic full-table "flush" republishes - already tolerant of at-most-once, since the whole
+table resends soon) and a `mode: js` input connection (genuinely incremental updates that must
+not be lost). Today, both kinds of matched row go out the same way: a plain core-NATS `PUB` to
+`<output_prefix>.<id>`, no durability, no catch-up. With `output_stream_enabled: true`, **routing
+becomes source-based**: a row that arrived via the js-mode connection publishes to a *separate*
+subject, `<output_updates_prefix>.<id>`, which a wide JetStream stream (`output_stream_name`)
+passively captures - flush-sourced rows keep going to the original `<output_prefix>.<id>`
+unchanged, regardless of whether the feature is on. A client subscribes to **both**: a plain `SUB`
+on `topic` for flush data, and its own durable JetStream consumer (filter_subject: `updates_topic`,
+against stream: `output_stream`) for update data it can replay after being offline.
+
+```json
+// sidecar.subscribe response, output_stream_enabled: true
+{
+  "id": 42,
+  "topic": "sensor.filtered.42",
+  "updates_topic": "sensor.filtered.updates.42",
+  "output_stream": "sidecar-output",
+  "output_stream_durable_name": "f498bb047416d06a",
+  "lease_bucket": "sidecar-leases", "lease_key": "42.my-client", "lease_ttl_seconds": 3600
+}
+```
+
+**Why routing is per-row-source, not a per-client opt-in on one shared subject**: subscriptions
+are deduplicated per-expression across clients (see "Expression deduplication" above) - two
+different clients with the same expression share one id/topic. A per-client durability choice on
+that *shared* subject wouldn't compose (what happens when one sharing client wants durability and
+another doesn't?); per-row-source routing sidesteps this entirely, since it's a property of the
+*data*, not of any one subscriber.
+
+**Why the output stream uses `retention: "limits"`, not `"workqueue"` like the input stream**: the
+input stream has exactly one consumer group by design (ack-based cleanup is safe there because
+there's only ever one logical consumer). The output stream has an unbounded number of independent
+per-client durable consumers, each replaying the same messages on its own schedule - `workqueue`
+retention deletes a message once *any one* of them acks it, which would silently break catch-up
+for every other client still behind. `limits` (age/byte-bound via `output_stream_max_age_seconds`/
+`output_stream_max_bytes`, ack-independent) is the only correct choice.
+
+**A real bug found by the end-to-end verification for this feature, not by inspection**:
+`output_stream_durable_name` was originally going to reuse `lease_key` verbatim (`"<id>.<client_
+id>"`) - a fine KV key, but JetStream consumer names must be a single subject token, and the `.`
+silently broke consumer creation (the request just timed out - wrong subject shape, no responder,
+no error surfaced). Fixed by hashing it through `subscription_registry`'s existing FNV-1a
+`registry_key()` utility (originally built for expression hashing, reused here for the same "make
+this NATS-name-safe" reason) instead of inventing a second scheme.
+
+**What this does NOT fix**: if the sidecar itself drops a publish under its own backpressure
+(the existing `publish_tasks_dropped`/`publish_failures` counters, unrelated to this feature), that
+row never reaches `nats-server` at all, so it's absent from the durable stream too - same as it's
+already absent from every live subscriber today. This closes "the client was offline," not "the
+sidecar itself was overloaded." A real fix for that second gap would need per-row confirmed-publish
+(`js_publish()`-with-ack) before treating a row as handled, which conflicts with the existing
+batched-write publish path (many subscribers' frames concatenated into one `write_raw()` per
+chunk - see the memory-bounding work referenced above) and wasn't attempted here.
+
+**Verified end-to-end** (`tests/output_stream_check.py`), not assumed from the JetStream docs
+alone: a js-sourced matching row was published with **no consumer attached yet**, then a real
+durable JetStream consumer was created afterward (`filter_subject: updates_topic, deliver_policy:
+all`) and confirmed to still receive that earlier message - genuine catch-up, not just live
+pass-through. Also confirmed: a core-sourced row still lands on the unchanged `topic`; the
+disabled-by-default path issues zero stream `INFO`/`CREATE` calls and an unchanged subscribe
+response; and removing a subscription (the same path a TTL expiry ultimately calls) stops matching
+on **both** channels together, since they're fed by one shared matching-tree entry, not two
+independent per-channel lifecycles.
+
 ## Operational note: cycling a whole table through core-mode connections
 
 A real use case motivating multiple input connections (see "Multiple input connections" above):

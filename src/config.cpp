@@ -256,6 +256,16 @@ config load_config(const std::string& path) {
     if (auto n = root["publish_chunk_bytes"])      cfg.publish_chunk_bytes = n.as<std::size_t>();
     if (auto n = root["publish_max_inflight_bytes"]) cfg.publish_max_inflight_bytes = n.as<std::size_t>();
 
+    // Durable JetStream output (opt-in, off by default - see config.hpp's own comment)
+    if (auto n = root["output_stream_enabled"])      cfg.output_stream_enabled = n.as<bool>();
+    if (auto n = root["output_updates_prefix"])      cfg.output_updates_prefix = n.as<std::string>();
+    if (auto n = root["output_stream_name"])         cfg.output_stream_name = n.as<std::string>();
+    if (auto n = root["output_stream_storage"])      cfg.output_stream_storage = n.as<std::string>();
+    if (auto n = root["output_stream_max_age_seconds"]) {
+        cfg.output_stream_max_age_seconds = n.as<uint32_t>();
+    }
+    if (auto n = root["output_stream_max_bytes"])    cfg.output_stream_max_bytes = n.as<uint64_t>();
+
     return cfg;
 }
 

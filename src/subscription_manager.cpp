@@ -33,10 +33,12 @@ subscription_manager::subscription_manager(
     const std::vector<attribute_def>& attributes,
     const std::string& output_prefix,
     std::shared_ptr<spdlog::logger> log,
-    engine_type engine)
+    engine_type engine,
+    const std::string& output_updates_prefix)
     : m_log(std::move(log)),
       m_attributes(attributes),
       m_output_prefix(output_prefix),
+      m_output_updates_prefix(output_updates_prefix),
       m_engine(engine),
       m_tree(build_matching_engine(m_engine, m_attributes))
 {
@@ -254,10 +256,12 @@ subscription_manager::tree_read_guard subscription_manager::acquire_tree() const
     return tree_read_guard(std::move(lock), m_tree.get());
 }
 
-std::optional<std::string> subscription_manager::output_subject(uint64_t id) const {
+std::optional<std::string> subscription_manager::output_subject(uint64_t id,
+                                                                 bool use_updates_prefix) const {
     std::shared_lock lock(m_mutex);
     if (find_locked(id) == nullptr) return std::nullopt;
-    return fmt::format(FMT_COMPILE("{}.{}"), m_output_prefix, id);
+    const std::string& prefix = use_updates_prefix ? m_output_updates_prefix : m_output_prefix;
+    return fmt::format(FMT_COMPILE("{}.{}"), prefix, id);
 }
 
 std::size_t subscription_manager::active_count() const {

@@ -44,15 +44,20 @@ public:
     asio::awaitable<std::pair<uint64_t, nats_asio::status>>
     resolve_id(const std::string& expression);
 
+    // Stable 64-bit FNV-1a hash of `s`, hex-encoded (16 chars, alphanumeric only) - originally
+    // built for expression->registry-key hashing (NATS subject/KV-key syntax forbids whitespace,
+    // '.', '*', '>', and other characters that appear routinely in boolean expressions), now also
+    // reused by sidecar.cpp's on_subscribe_request() to turn lease_key ("<id>.<client_id>", safe
+    // for a KV key but NOT safe as a JetStream stream/consumer name - those must be a single
+    // subject token, no '.') into a name a client can safely pass as durable_name when creating
+    // its own durable JetStream consumer for the output_stream_enabled feature. Public because of
+    // that second, unrelated-to-the-registry call site - not otherwise part of this class's own
+    // public contract.
+    static std::string registry_key(const std::string& s);
+
 private:
     bool validate_existing_bucket(const nlohmann::json& info) const;
     asio::awaitable<bool> create_bucket(std::chrono::milliseconds timeout);
-
-    // Stable 64-bit FNV-1a hash of `expression`, hex-encoded - NATS
-    // subject/KV-key syntax forbids whitespace, '.', '*', '>', and other
-    // characters that appear routinely in boolean expressions, so the key
-    // can't be the expression text itself.
-    static std::string registry_key(const std::string& expression);
 
     nats_asio::iconnection_sptr m_conn;
     std::string m_bucket;

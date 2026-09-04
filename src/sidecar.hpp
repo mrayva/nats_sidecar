@@ -73,6 +73,17 @@ private:
     bool validate_existing_input_stream(const input_connection& conn, const nlohmann::json& info) const;
     asio::awaitable<bool> create_input_stream(const input_connection& conn, std::chrono::milliseconds timeout);
 
+    // Durable JetStream OUTPUT stream (opt-in via config::output_stream_enabled) - same
+    // INFO-then-create-or-validate idiom as ensure_input_stream() above, with one deliberate
+    // difference: retention "limits", not "workqueue" (see validate_existing_output_stream()'s
+    // own comment for why). Captures config::output_updates_prefix + ".>" only - the always-on
+    // core/flush channel (config::output_prefix) is never captured by this stream. Called from
+    // start() only when output_stream_enabled is true; every other deployment sees zero new NATS
+    // traffic from this at all.
+    asio::awaitable<bool> ensure_output_stream();
+    bool validate_existing_output_stream(const nlohmann::json& info) const;
+    asio::awaitable<bool> create_output_stream(std::chrono::milliseconds timeout);
+
     // Subscribes via a durable JetStream push consumer instead of a plain
     // queue-group subscribe. Returns the new subscription on success
     // (nullptr on failure, having already logged and stopped the ioc).

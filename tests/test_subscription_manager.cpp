@@ -184,6 +184,35 @@ TEST(subscription_manager, restores_stable_id_and_advances_sequence) {
     EXPECT_EQ(mgr.subscribe("severity = 5", "client-3"), 43u);
 }
 
+// output_subject()'s use_updates_prefix parameter (worker_pool.cpp's own source-routing logic) -
+// default (false) is unchanged from every other test in this file that never passes it; this
+// covers the true branch, plus that a still-active id resolves via BOTH prefixes independently
+// (they aren't mutually exclusive - a single subscription can be dispatched to either channel
+// depending on which input connection a given matched row came from).
+TEST(subscription_manager, output_subject_use_updates_prefix_selects_updates_channel) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::atree, "test.updates");
+
+    uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
+
+    EXPECT_EQ(mgr.output_subject(id).value(), "test.output." + std::to_string(id));
+    EXPECT_EQ(mgr.output_subject(id, true).value(), "test.updates." + std::to_string(id));
+    EXPECT_EQ(mgr.output_subject(id, false).value(), "test.output." + std::to_string(id));
+}
+
+TEST(subscription_manager, output_subject_updates_prefix_absent_after_remove) {
+    sidecar::subscription_manager mgr(sample_attributes(), "test.output", make_log(),
+                                      sidecar::engine_type::atree, "test.updates");
+
+    uint64_t id = mgr.subscribe("temperature > 30.0", "client-1");
+    ASSERT_TRUE(mgr.output_subject(id, true).has_value());
+
+    mgr.remove_lease(id, "client-1");
+
+    EXPECT_FALSE(mgr.output_subject(id, true).has_value());
+    EXPECT_FALSE(mgr.output_subject(id, false).has_value());
+}
+
 // Regression guard for the O(K^2) bulk-subscribe cost this class was redesigned to eliminate:
 // subscribe() used to rebuild the whole matching tree from scratch (re-parsing every prior
 // expression) on every single call, so the Nth subscribe cost O(N). With true incremental

@@ -222,6 +222,13 @@ private:
     std::size_t m_publish_chunk_bytes;
     std::size_t m_publish_max_inflight_bytes;
 
+    // Gates output routing (see worker_loop()'s own comment where this is used): when false (the
+    // default), every matched row publishes to subscription_manager::output_subject()'s default
+    // (core/flush) prefix regardless of source - zero behavior change for a deployment that
+    // hasn't opted into durable output. When true, a row sourced from a js-mode input connection
+    // (queued_message::js_msg set) routes to the updates/durable prefix instead.
+    bool m_output_stream_enabled;
+
     moodycamel::BlockingConcurrentQueue<queued_message> m_queue;
     std::vector<std::thread> m_threads;
     std::mutex m_enqueue_mutex;

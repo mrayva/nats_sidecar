@@ -50,10 +50,14 @@ struct subscription_summary {
 // not an accident.
 class subscription_manager {
 public:
+    // `output_updates_prefix` empty (the default) is fine whenever output_stream_enabled is false
+    // (see m_output_updates_prefix's own comment) - only a real deployment with the durable
+    // output feature turned on needs to pass a non-empty value here.
     subscription_manager(const std::vector<attribute_def>& attributes,
                          const std::string& output_prefix,
                          std::shared_ptr<spdlog::logger> log,
-                         engine_type engine = engine_type::atree);
+                         engine_type engine = engine_type::atree,
+                         const std::string& output_updates_prefix = "");
 
     // Subscribe with a boolean expression. Returns the subscription ID
     // (new or existing). Throws matching_engine_error on invalid expression.
@@ -105,7 +109,14 @@ public:
     // otherwise (e.g. removed between a worker's search() and this call - already an expected,
     // silently-handled case at every call site, not a new failure mode). Cheap: a brief
     // shared_lock plus an O(1) map lookup, safe to call synchronously from a worker thread.
-    std::optional<std::string> output_subject(uint64_t id) const;
+    //
+    // `use_updates_prefix`: false (default) returns "<output_prefix>.<id>", the always-on
+    // core/flush channel, unchanged from before this parameter existed. true returns
+    // "<output_updates_prefix>.<id>" instead - the durable-JetStream-backed channel for
+    // js-mode-input-sourced matches (see worker_pool.cpp's routing logic, gated on
+    // config::output_stream_enabled AND queued_message::js_msg - this method itself doesn't know
+    // or care which; it just builds whichever string the caller asked for).
+    std::optional<std::string> output_subject(uint64_t id, bool use_updates_prefix = false) const;
 
     // Stats
     std::size_t active_count() const;
@@ -178,6 +189,11 @@ private:
     // one at startup.
     std::vector<attribute_def> m_attributes;
     std::string m_output_prefix;
+    // Empty when output_stream_enabled is false (the default) - output_subject()'s
+    // use_updates_prefix=true path is simply never called in that case (worker_pool.cpp's own
+    // routing logic gates on config::output_stream_enabled before ever passing true here), so an
+    // empty prefix here never actually gets used to build a real subject.
+    std::string m_output_updates_prefix;
     engine_type m_engine;
 
     // The one live matching tree, mutated in place via true incremental insert() calls -

@@ -280,6 +280,100 @@ TEST(worker_pool, publishes_matched_message_via_connection) {
     EXPECT_NE(last_wire.find("PUB output.1 "), std::string::npos);
 }
 
+// --- Source-routed output (config::output_stream_enabled) ---
+// A row sourced from a js-mode input connection (js_msg present) routes to the durable/updates
+// prefix instead of the always-on core/flush prefix, but ONLY when output_stream_enabled is
+// true - the hard backward-compatibility guarantee for every deployment that hasn't opted in.
+
+TEST(worker_pool, js_sourced_match_routes_to_updates_prefix_when_output_stream_enabled) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    cfg.output_stream_enabled = true;
+    cfg.output_updates_prefix = "updates";
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log(),
+                                                sidecar::engine_type::atree,
+                                                cfg.output_updates_prefix);
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::string last_wire;
+    conn->on_write_raw = [&](std::span<const char> data) -> asio::awaitable<nats_asio::status> {
+        last_wire.assign(data.data(), data.size());
+        co_return nats_asio::status{};
+    };
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(7, matching_payload(42)), js_sub));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published > 0; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    EXPECT_NE(last_wire.find("PUB updates.1 "), std::string::npos);
+    EXPECT_EQ(last_wire.find("PUB output.1 "), std::string::npos);
+}
+
+TEST(worker_pool, js_sourced_match_routes_to_core_prefix_when_output_stream_disabled) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();  // output_stream_enabled defaults to false
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log());
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::string last_wire;
+    conn->on_write_raw = [&](std::span<const char> data) -> asio::awaitable<nats_asio::status> {
+        last_wire.assign(data.data(), data.size());
+        co_return nats_asio::status{};
+    };
+    auto js_sub = std::make_shared<sidecar_test::fake_js_subscription>();
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(42), js_message_with(7, matching_payload(42)), js_sub));
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published > 0; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    // A deployment using js-mode input purely for ingestion durability (unrelated to this
+    // feature) sees a js-sourced row published exactly as a core-sourced one would be.
+    EXPECT_NE(last_wire.find("PUB output.1 "), std::string::npos);
+}
+
+TEST(worker_pool, core_sourced_match_always_routes_to_core_prefix_even_when_output_stream_enabled) {
+    asio::io_context ioc(1);
+    auto cfg = worker_config();
+    cfg.output_stream_enabled = true;
+    cfg.output_updates_prefix = "updates";
+    sidecar::attribute_schema schema(cfg.attributes);
+    sidecar::subscription_manager subscriptions(cfg.attributes, cfg.output_prefix, worker_log(),
+                                                sidecar::engine_type::atree,
+                                                cfg.output_updates_prefix);
+    subscriptions.subscribe("value > 10", "client-1");
+
+    auto conn = std::make_shared<sidecar_test::fake_connection>();
+    std::string last_wire;
+    conn->on_write_raw = [&](std::span<const char> data) -> asio::awaitable<nats_asio::status> {
+        last_wire.assign(data.data(), data.size());
+        co_return nats_asio::status{};
+    };
+
+    sidecar::worker_pool pool(ioc, cfg, schema, subscriptions, conn, worker_log());
+    pool.start();
+    ASSERT_TRUE(pool.enqueue(matching_payload(42)));  // plain core-mode enqueue, no js_msg
+
+    ASSERT_TRUE(drive_until(
+        ioc, [&] { return pool.get_stats().published > 0; }, std::chrono::seconds(2)));
+    pool.stop();
+
+    EXPECT_NE(last_wire.find("PUB output.1 "), std::string::npos);
+    EXPECT_EQ(last_wire.find("PUB updates.1 "), std::string::npos);
+}
+
 TEST(worker_pool, does_not_publish_when_message_does_not_match) {
     asio::io_context ioc(1);
     auto cfg = worker_config();

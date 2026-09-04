@@ -241,6 +241,36 @@ struct config {
     // input_queue_max_bytes already use.
     std::size_t publish_max_inflight_bytes = 64ULL * 1024 * 1024;
 
+    // Durable JetStream output, for matched rows that arrived via a `mode: js` input connection
+    // (see input_connection::jetstream()) - source-routed alongside the always-on core/flush
+    // output above, NOT a replacement for it and NOT implied by input js-mode alone (a deployment
+    // may already use js-mode input purely for ingestion durability, unrelated to this feature -
+    // the two stay decoupled). Off by default: zero behavior change, zero new NATS/JetStream
+    // traffic, for any deployment that doesn't opt in. See worker_pool.cpp's routing logic
+    // (queued_message::js_msg already tells it which input connection a row came from) and
+    // sidecar.cpp's ensure_output_stream() for how this gets provisioned.
+    bool output_stream_enabled = false;
+
+    // Subject prefix for the durable/updates channel, parallel to output_prefix (which keeps its
+    // existing meaning: the always-on core/flush channel). Empty (the default) means
+    // "<output_prefix>.updates", computed once at startup by finalize_and_validate_config() -
+    // only meaningful, and only read, when output_stream_enabled is true.
+    std::string output_updates_prefix;
+
+    std::string output_stream_name = "sidecar-output";
+    // "file" (default, real durability) or "memory" (throughput-isolation tool only - loses
+    // everything on nats-server restart/crash) - same convention as input_connection::
+    // stream_storage.
+    std::string output_stream_storage = "file";
+    // Bounded catch-up window (age) and hard safety cap (bytes) - deliberately `retention:
+    // "limits"` (age/byte-bound, ack-independent), NOT `"workqueue"` like the input stream: the
+    // output-updates stream has an unbounded number of independent per-client consumers each
+    // replaying the same messages on their own schedule, and workqueue retention deletes a
+    // message once ANY one of them acks it - which would silently break catch-up for every other
+    // client still behind. See ensure_output_stream()'s own comment in sidecar.cpp.
+    uint32_t output_stream_max_age_seconds = 3600;
+    uint64_t output_stream_max_bytes = 1ULL * 1024 * 1024 * 1024;
+
     // Returns `connections` verbatim if non-empty; otherwise synthesizes
     // exactly one connection (name "default", mode "js" if input_stream is
     // set else "core") from the legacy flat fields above, reproducing the
