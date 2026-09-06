@@ -123,13 +123,13 @@ TEST(cli, apply_cli_overrides_applies_engine) {
     EXPECT_EQ(cfg.engine, sidecar::engine_type::betree);
 }
 
-TEST(cli, apply_cli_overrides_engine_defaults_to_atree_when_unset) {
+TEST(cli, apply_cli_overrides_engine_defaults_to_pstree_when_unset) {
     auto options = sidecar::build_cli_options();
     auto result = parse_args(options, {"--input-subject", "sensor.data"});
 
     sidecar::config cfg;
     ASSERT_FALSE(sidecar::apply_cli_overrides(cfg, result).has_value());
-    EXPECT_EQ(cfg.engine, sidecar::engine_type::atree);
+    EXPECT_EQ(cfg.engine, sidecar::engine_type::pstree);
 }
 
 TEST(cli, apply_cli_overrides_invalid_engine_returns_error) {
@@ -192,6 +192,7 @@ TEST(cli, apply_cli_overrides_attr_invalid_type_returns_error) {
 TEST(cli, finalize_and_validate_config_defaults_output_prefix_to_input_subject) {
     sidecar::config cfg;
     cfg.input_subjects = {"sensor.data"};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
     EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
@@ -201,6 +202,7 @@ TEST(cli, finalize_and_validate_config_defaults_output_prefix_to_input_subject) 
 TEST(cli, finalize_and_validate_config_keeps_explicit_output_prefix) {
     sidecar::config cfg;
     cfg.input_subjects = {"sensor.data"};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.output_prefix = "sensor.filtered";
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
@@ -230,6 +232,7 @@ TEST(cli, finalize_and_validate_config_multiple_subjects_require_explicit_output
 TEST(cli, finalize_and_validate_config_multiple_subjects_with_explicit_output_prefix_succeeds) {
     sidecar::config cfg;
     cfg.input_subjects = {"sensor.data", "sensor.data.backup"};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.output_prefix = "sensor.filtered";
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
@@ -271,6 +274,7 @@ TEST(cli, finalize_and_validate_config_zero_publish_max_inflight_errors) {
 TEST(cli, finalize_and_validate_config_accepts_valid_config) {
     sidecar::config cfg;
     cfg.input_subjects = {"sensor.data"};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
     EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
@@ -325,7 +329,7 @@ TEST(cli, finalize_and_validate_config_rejects_arrow_with_non_columnar_connectio
     EXPECT_NE(err->find("arrow"), std::string::npos);
 }
 
-TEST(cli, finalize_and_validate_config_rejects_arrow_without_output_format) {
+TEST(cli, finalize_and_validate_config_arrow_without_output_format_defaults_to_msgpack) {
     sidecar::config cfg;
     sidecar::input_connection a;
     a.name = "a";
@@ -336,9 +340,9 @@ TEST(cli, finalize_and_validate_config_rejects_arrow_without_output_format) {
     cfg.format = sidecar::binary_format::arrow;
     cfg.attributes = {{"value", sidecar::attribute_type::integer}};
 
-    auto err = sidecar::finalize_and_validate_config(cfg);
-    ASSERT_TRUE(err.has_value());
-    EXPECT_NE(err->find("output_format"), std::string::npos);
+    EXPECT_FALSE(sidecar::finalize_and_validate_config(cfg).has_value());
+    ASSERT_TRUE(cfg.output_format.has_value());
+    EXPECT_EQ(*cfg.output_format, sidecar::binary_format::msgpack);
 }
 
 TEST(cli, finalize_and_validate_config_rejects_arrow_output_format) {
@@ -450,6 +454,7 @@ TEST(cli, finalize_and_validate_config_duplicate_stream_across_connections_error
     b.consumer_durable_name = "b-durable";
     b.consumer_deliver_subject = "b.deliver";
     cfg.connections = {a, b};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.output_prefix = "matched";
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
@@ -472,6 +477,7 @@ TEST(cli, finalize_and_validate_config_duplicate_durable_name_across_connections
     b.stream = "STREAM_B";
     b.consumer_deliver_subject = "b.deliver";
     cfg.connections = {a, b};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.output_prefix = "matched";
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
@@ -494,6 +500,7 @@ TEST(cli, finalize_and_validate_config_duplicate_deliver_subject_across_connecti
     b.stream = "STREAM_B";
     b.consumer_durable_name = "b-durable";
     cfg.connections = {a, b};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.output_prefix = "matched";
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
@@ -513,6 +520,7 @@ TEST(cli, finalize_and_validate_config_overlapping_subjects_across_connections_e
     b.mode = "core";
     b.subjects = {"shared.subject"};
     cfg.connections = {a, b};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.output_prefix = "matched";
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 
@@ -535,6 +543,7 @@ TEST(cli, finalize_and_validate_config_accepts_valid_mixed_mode_connections) {
     b.mode = "core";
     b.subjects = {"telemetry.in"};
     cfg.connections = {a, b};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.output_prefix = "matched";
     cfg.attributes = {{"temperature", sidecar::attribute_type::float_val}};
 

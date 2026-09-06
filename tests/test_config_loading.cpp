@@ -55,7 +55,7 @@ attributes:
     // Defaults untouched by the file
     EXPECT_EQ(cfg.nats_address, "127.0.0.1");
     EXPECT_EQ(cfg.nats_port, 4222);
-    EXPECT_EQ(cfg.format, sidecar::binary_format::msgpack);
+    EXPECT_EQ(cfg.format, sidecar::binary_format::arrow);
     EXPECT_EQ(cfg.lease_bucket, "sidecar-leases");
     EXPECT_EQ(cfg.lease_ttl_seconds, 3600u);
     EXPECT_EQ(cfg.registry_bucket, "sidecar-subscriptions");
@@ -120,7 +120,7 @@ attributes:
     EXPECT_EQ(cfg.attributes[1].type, sidecar::attribute_type::string_list);
 }
 
-TEST(config_loading, defaults_engine_to_atree) {
+TEST(config_loading, defaults_engine_to_pstree) {
     temp_yaml_file file(R"(
 input_subjects: [sensor.data]
 attributes:
@@ -129,7 +129,7 @@ attributes:
 )");
 
     auto cfg = sidecar::load_config(file.path());
-    EXPECT_EQ(cfg.engine, sidecar::engine_type::atree);
+    EXPECT_EQ(cfg.engine, sidecar::engine_type::pstree);
 }
 
 TEST(config_loading, parses_engine_betree) {

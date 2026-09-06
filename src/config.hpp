@@ -133,23 +133,29 @@ struct config {
     uint32_t consumer_ack_wait_seconds = 30;
     std::string input_stream_storage = "file";
 
-    binary_format format = binary_format::msgpack;
+    // Defaults to arrow - the production shape (columnar batches straight
+    // from pg_arrow's rows_to_arrow()). This REQUIRES every connection to
+    // set columnar: true (see finalize_and_validate_config()); a plain
+    // row-mode deployment must set format explicitly to one of the other 7
+    // values instead.
+    binary_format format = binary_format::arrow;
 
     // Republish format for matched rows, decoupled from the input `format`
-    // above. Unset (the default) means "same as `format`" - zero behavior
-    // change for every config that doesn't set this. Process-wide, not
-    // per-connection, matching `format` itself.
+    // above. Unset defaults to msgpack when format == binary_format::arrow
+    // (Arrow has no sensible single-row encoder - a one-row RecordBatch is
+    // almost all fixed overhead, the same reason pg_arrow's own
+    // rows_to_arrow() has no single-row counterpart - so *some* concrete
+    // encoder must be picked, and msgpack is it unless overridden). For
+    // every other input format, unset instead means "same as `format`" -
+    // zero behavior change for every config that doesn't set this. Either
+    // way, process-wide, not per-connection, matching `format` itself.
     //
-    // v1 scope: only meaningful (and required) when format == binary_format
-    // ::arrow, since Arrow has no sensible single-row encoder (a one-row
-    // RecordBatch is almost all fixed overhead - the same reason pg_arrow's
-    // own rows_to_arrow() has no single-row counterpart). For every other
-    // format, if set at all it must equal `format` - full cross-format
-    // translation among the non-arrow formats is deliberately not built yet
-    // (see finalize_and_validate_config()). Only meaningful for columnar
-    // connections - row mode has no re-encode step to decouple (see
-    // event_bridge.cpp's row-mode dispatch, which rejects binary_format::
-    // arrow outright).
+    // For non-arrow formats, if set at all it must equal `format` - full
+    // cross-format translation among the non-arrow formats is deliberately
+    // not built yet (see finalize_and_validate_config()). Only meaningful
+    // for columnar connections - row mode has no re-encode step to decouple
+    // (see event_bridge.cpp's row-mode dispatch, which rejects
+    // binary_format::arrow outright).
     std::optional<binary_format> output_format;
 
     // Output - matched messages published to <output_prefix>.<BE-ID>,
@@ -191,8 +197,10 @@ struct config {
     // Boolean-expression attribute schema
     std::vector<attribute_def> attributes;
 
-    // Matching engine backing subscription_manager
-    engine_type engine = engine_type::atree;
+    // Matching engine backing subscription_manager - pstree is the fastest
+    // of the three at essentially every tested workload shape (see
+    // README.md's pstree performance investigation), and the default here.
+    engine_type engine = engine_type::pstree;
 
     // Operational
     int stats_interval_seconds = 10;

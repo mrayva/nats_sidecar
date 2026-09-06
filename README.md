@@ -76,9 +76,9 @@ the legacy single-connection config shape - they're rejected if the config file 
 | `-a, --address HOST` | NATS server address |
 | `-p, --port PORT` | NATS server port |
 | `-i, --input-subject SUBJ` | Input NATS subject (repeatable: `-i a -i b` for multiple inputs) |
-| `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`, `arrow`) |
-| `--output-format FMT` | Republish format for columnar batches, if different from `--format` (see "Arrow columnar input") |
-| `--engine ENGINE` | Matching engine (`atree`, `betree`, `pstree`); defaults to `atree` |
+| `-f, --format FMT` | Binary format (`msgpack`, `cbor`, `flexbuffers`, `zera`, `ion`, `bson`, `beve`, `arrow`); defaults to `arrow` (requires `columnar: true` on every connection - see "Arrow columnar input") |
+| `--output-format FMT` | Republish format for columnar batches, if different from `--format`; defaults to `msgpack` when `--format arrow` (see "Arrow columnar input") |
+| `--engine ENGINE` | Matching engine (`atree`, `betree`, `pstree`); defaults to `pstree` |
 | `--output-prefix PREFIX` | Output subject prefix (defaults to input subject) |
 | `--queue-group GROUP` | Input queue group for load balancing (plain, non-durable mode) |
 | `--input-stream NAME` | JetStream stream name for the durable-consumer input mode (see below); enables it when set, alongside the four flags below |
@@ -204,10 +204,14 @@ nats_port: 4222
 # connections" below for running several independently-configured inputs
 # (mixing durable and best-effort mode) in one process.
 input_subjects: ["sensor.data"]
+# The built-in default is `format: arrow` + `engine: pstree` (columnar batches straight from
+# pg_arrow's rows_to_arrow(), see "Arrow columnar input" below) - this quickstart overrides
+# format to msgpack instead, since it's the simplest row-mode shape to get running first.
 format: msgpack          # msgpack | cbor | flexbuffers | zera | ion | bson | beve | arrow
-# output_format: msgpack  # optional; required (and must differ from `format`) when format: arrow
-                           # - see "Arrow columnar input" below. Unset means "same as format".
-engine: atree             # atree | betree | pstree
+# output_format: msgpack  # optional; must differ from `format` when format: arrow (defaults to
+                           # msgpack in that case) - see "Arrow columnar input" below. Unset
+                           # otherwise means "same as format".
+engine: pstree             # atree | betree | pstree (default)
 
 # Output: matched messages published to <output_prefix>.<subscription_id>,
 # shared by every input connection - a client's subscribed expression
@@ -344,7 +348,9 @@ Two things worth knowing before enabling it:
 
 ### Arrow columnar input
 
-`format: arrow` consumes [Apache Arrow](https://arrow.apache.org/) IPC stream batches - the exact
+`format: arrow` is `config::format`'s own default (paired with `engine: pstree`'s own default -
+this is the sidecar's recommended, production-shape starting point, not merely one option among
+eight). It consumes [Apache Arrow](https://arrow.apache.org/) IPC stream batches - the exact
 bytes produced by the [`pg_arrow`](https://github.com/mrayva/pg_arrow) Postgres extension's
 `rows_to_arrow(anyarray) -> bytea`, one `RecordBatch` per message. It's a distinct code path from
 the other 7 formats (`src/arrow_columnar_rows.hpp`), not routed through `zerialize`, since Arrow's
@@ -356,10 +362,11 @@ Arrow input has two hard constraints, both enforced at startup with a clear erro
 - **Columnar-only.** Every connection must set `columnar: true` when `format: arrow` - there is no
   row-mode Arrow reader (a one-row `RecordBatch` is nearly all fixed overhead, the same reason
   `pg_arrow` itself has no `row_to_arrow`).
-- **Read-only, so `output_format` is required.** Arrow has no practical single-row encoder, so
-  matched rows can't be republished as Arrow - `output_format` must be set to a *different*
-  non-arrow format (e.g. `output_format: msgpack`) telling the sidecar what to re-encode matches
-  as. `output_format: arrow` is rejected.
+- **Read-only, so `output_format` must resolve to something else.** Arrow has no practical
+  single-row encoder, so matched rows can't be republished as Arrow - `output_format` must be a
+  *different* non-arrow format telling the sidecar what to re-encode matches as. Left unset, it
+  defaults to `msgpack` (also `config::output_format`'s own default for this case); set it
+  explicitly to pick a different one. `output_format: arrow` is rejected either way.
 
 For every other (non-arrow) `format`, `output_format` - if set at all - must equal `format`;
 cross-format translation among the 6 non-arrow formats is not yet supported (`output_format` exists

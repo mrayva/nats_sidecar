@@ -56,6 +56,13 @@ public:
     subscription_manager(const std::vector<attribute_def>& attributes,
                          const std::string& output_prefix,
                          std::shared_ptr<spdlog::logger> log,
+                         // atree, not pstree: pstree structurally rejects list-attribute
+                         // operators (one of/none of/all of) and bare "is null"-only
+                         // subscriptions (see README's pstree limitations) - this default is a
+                         // "broadest expression syntax, engine choice doesn't matter" convenience
+                         // for callers (mostly tests) that don't care which engine backs them,
+                         // not config::engine's own default (see that field's own comment for
+                         // the sidecar's actual, user-facing default, which is pstree).
                          engine_type engine = engine_type::atree,
                          const std::string& output_updates_prefix = "");
 

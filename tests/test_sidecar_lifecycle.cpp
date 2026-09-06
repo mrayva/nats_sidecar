@@ -30,6 +30,7 @@ auto make_log() {
 sidecar::config sample_config() {
     sidecar::config cfg;
     cfg.input_subjects = {"sensor.data"};
+    cfg.format = sidecar::binary_format::msgpack;
     cfg.output_prefix = "sensor.filtered";
     cfg.stats_interval_seconds = 3600;
     cfg.lease_bucket = "test-leases";
@@ -55,7 +56,8 @@ nats_asio::message json_message(const nlohmann::json& body) {
 }
 
 // sample_config()'s one attribute ("temperature", float) is msgpack-encoded
-// (cfg.format defaults to binary_format::msgpack) - a JSON-text payload
+// (sample_config() sets cfg.format explicitly - config::format's own built-in default is now
+// binary_format::arrow) - a JSON-text payload
 // (json_payload above) is invalid msgpack and would hit the
 // malformed-payload/term() path instead of legitimately matching or not
 // matching, which isn't what a "message reaches worker_pool" test wants.

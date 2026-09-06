@@ -40,6 +40,7 @@ connections:
     consumer_durable_name: updates-durable
     consumer_deliver_subject: updates.deliver
 output_prefix: sensor.filtered
+format: msgpack
 output_stream_enabled: true
 output_updates_prefix: sensor.filtered.updates
 output_stream_name: sidecar-output
@@ -60,6 +61,7 @@ connections:
     consumer_durable_name: updates-durable
     consumer_deliver_subject: updates.deliver
 output_prefix: sensor.filtered
+format: msgpack
 attributes:
   - name: value
     type: integer

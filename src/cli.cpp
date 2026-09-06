@@ -331,7 +331,7 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
     // all (event_bridge.cpp rejects it outright there) and no single-row
     // encoder (a one-row RecordBatch is almost all fixed overhead, the same
     // reason pg_arrow's own rows_to_arrow() has no per-row counterpart) -
-    // every connection must be columnar, and output_format must be set to a
+    // every connection must be columnar, and output_format must resolve to a
     // different, non-arrow format. Checked as "any non-columnar connection"
     // rather than "no columnar connection", the inverse of the bson check
     // above, since format is process-wide but columnar is per-connection.
@@ -343,9 +343,11 @@ std::optional<std::string> finalize_and_validate_config(config& cfg) {
                     "columnar: true (Arrow has no row-mode reader)", c.name);
             }
         }
+        // Unset output_format defaults to msgpack rather than erroring - format=arrow is
+        // now config::format's own default, so a zero-config columnar deployment needs a
+        // concrete republish encoder without being forced to state one explicitly.
         if (!cfg.output_format) {
-            return "output_format is required when format=arrow (Arrow has no single-row "
-                   "encoder - pick a republish format, e.g. output_format: msgpack)";
+            cfg.output_format = binary_format::msgpack;
         }
         if (*cfg.output_format == binary_format::arrow) {
             return "output_format cannot be arrow (Arrow is read-only - has no encoder)";
