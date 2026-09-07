@@ -57,12 +57,16 @@ public:
                          const std::string& output_prefix,
                          std::shared_ptr<spdlog::logger> log,
                          // atree, not pstree: pstree structurally rejects list-attribute
-                         // operators (one of/none of/all of) and bare "is null"-only
-                         // subscriptions (see README's pstree limitations) - this default is a
-                         // "broadest expression syntax, engine choice doesn't matter" convenience
-                         // for callers (mostly tests) that don't care which engine backs them,
-                         // not config::engine's own default (see that field's own comment for
-                         // the sidecar's actual, user-facing default, which is pstree).
+                         // operators (one of/none of/all of - see README's pstree limitations) -
+                         // this default is a "broadest expression syntax, engine choice doesn't
+                         // matter" convenience for callers (mostly tests) that don't care which
+                         // engine backs them, not config::engine's own default (see that field's
+                         // own comment for the sidecar's actual, user-facing default, which is
+                         // pstree). Bare "is null"-only subscriptions used to be a second reason
+                         // (pstree rejected those outright too) - no longer true as of the
+                         // per-attribute side-list fix (pstree@138a2f3, see README's own updated
+                         // pstree limitations bullet) - list-valued attributes remain the one
+                         // real reason this stays atree instead of matching config::engine.
                          engine_type engine = engine_type::atree,
                          const std::string& output_updates_prefix = "");
 

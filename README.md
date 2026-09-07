@@ -479,21 +479,25 @@ pure conjunction of predicates with no AND/OR/NOT combinators at all; each DNF c
 own PSTDynamic subscription, and `pstree_matching_engine::search()` deduplicates a subscription
 matched via more than one of its own OR'd clauses back down to a single result.
 
-Two real, structural limitations (not omissions - PSTDynamic's own predicate-space-index design has
-no way to represent either):
+One real, structural limitation (not an omission - PSTDynamic's own predicate-space-index design
+has no way to represent it):
 
 - **No list-valued attributes** (`string_list` / `integer_list`) - an event attribute in
   PSTDynamic's model is always a single value, never a list. Referencing one (`one of`/`none of`/
   `all of`/`is empty`/`is not empty`, or any comparison against a list-typed attribute) is rejected
   at subscribe time with a clear error.
-- **`X is null` can't be indexed if it's the subscription's only usable predicate.** PSTDynamic
-  picks one predicate per subscription (the "access predicate") to index into a per-dimension tree;
-  `is null` can never be chosen for that role, since "this attribute was absent" has no
-  representable position in a value-ordered index (`MatchEvent` only ever consults a dimension's
-  tree for events that *do* have that attribute). A subscription with at least one other,
-  indexable predicate alongside `is null` works fine; `"X is null"` alone (or every branch of an
-  `or` reducing to bare `is null` checks) is rejected at subscribe time. `is not null` has no such
-  problem - it's always indexable (as an unselective "matches every leaf" fallback).
+
+`X is null` used to be a second such limitation - a subscription whose ONLY usable predicate was
+bare `is null` (with no other, indexable predicate alongside it) was rejected at subscribe time,
+since PSTDynamic picks one predicate per subscription (the "access predicate") to index into a
+per-dimension tree, and "this attribute was absent" has no representable position in a
+value-ordered index. **Fixed as of `pstree@138a2f3`**: PSTDynamic now routes a subscription whose
+every predicate is `is null` to a small side-list instead, keyed by one of its own attributes and
+checked directly against whichever event attributes are absent from a given event - see
+`mrayva/pstree`'s own README ("`kIsNull`/`kIsNotNull`" section) for the mechanism. `"X is null"`
+alone, `X is null and Y is null`, and every branch of an `or` reducing to bare `is null` checks all
+work correctly now, on any engine. `is not null` never had this problem either way - it's always
+indexable (as an unselective "matches every leaf" fallback).
 - String attributes are compared only up to a fixed prefix length (`kPstreeStringMaxLen`, 32 bytes,
   in `matching_engine.cpp`) - PS-Tree's string encoding is a fixed-depth tree, one level per byte
   position, not a variable-length comparison. Two distinct strings sharing a 32-byte prefix are

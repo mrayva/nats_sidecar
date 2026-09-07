@@ -160,16 +160,19 @@ std::vector<diff_case> differential_cases() {
         {"not_in_false","count not in (1, 2, 3)", {.count = 2},  false},
 
         // --- is null / is not null ---
-        // is_null is excluded from pstree: with no other predicate in the subscription to
-        // fall back to, "name is null" is its own (only, therefore best) access predicate -
-        // and kIsNull can never be one (see pstree_dialect.hpp/pst_dynamic.hpp's own
-        // comments: there is structurally no way to index "this dimension was absent",
-        // since MatchEvent only ever consults a dimension's tree for events that DO have
-        // it) - PSTDynamic::insertSubscription() throws for exactly this reason.
-        // is_not_null has no such problem (it CAN be an access predicate, just an
-        // unselective one - "matches every leaf" - see the same comments) so it stays in.
-        {"is_null_true",      "name is null",     {}, true, false},
-        {"is_null_false",     "name is null",     {.name = std::string("AAPL")}, false, false},
+        // is_null used to be excluded from pstree: with no other predicate in the
+        // subscription to fall back to, "name is null" was its own (only, therefore best)
+        // access predicate, and kIsNull could never be one (there is structurally no way to
+        // index "this dimension was absent" IN A TREE, since MatchEvent only ever consults a
+        // dimension's tree for events that DO have it) - PSTDynamic::insertSubscription()
+        // used to throw for exactly this reason. Fixed as of pstree@138a2f3: a subscription
+        // whose every predicate is kIsNull is now routed to a small per-attribute side-list
+        // instead of being rejected (see pstree's own README/pst_dynamic.hpp comments) - now
+        // included for pstree too, like every other case here.
+        // is_not_null never had this problem (it CAN be an access predicate, just an
+        // unselective one - "matches every leaf" - see the same comments).
+        {"is_null_true",      "name is null",     {}, true},
+        {"is_null_false",     "name is null",     {.name = std::string("AAPL")}, false},
         {"is_not_null_true",  "name is not null", {.name = std::string("AAPL")}, true},
         {"is_not_null_false", "name is not null", {}, false},
 
